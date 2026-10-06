@@ -1,0 +1,560 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ruling Prototype</title>
+<!-- PROTOTYPE (throwaway) for ticket 22 "How the human rules". Not production. -->
+<style>
+  :root { --bg:#fbfaf7; --fg:#1d1d1b; --dim:#77746c; --line:#e3e0d8; --accent:#2f5bd3; --warn:#b5651d; --red:#b3261e; --ok:#2e7d32; --term:#16181d; --termfg:#d7dae0; --card:#ffffff; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg:#141518; --fg:#e7e5df; --dim:#9a978f; --line:#2b2d33; --accent:#7d9cff; --warn:#e3a35b; --red:#ff7a70; --ok:#7cc884; --term:#0c0d10; --termfg:#d7dae0; --card:#1c1d22; } }
+  :root[data-theme="dark"] { --bg:#141518; --fg:#e7e5df; --dim:#9a978f; --line:#2b2d33; --accent:#7d9cff; --warn:#e3a35b; --red:#ff7a70; --ok:#7cc884; --term:#0c0d10; --termfg:#d7dae0; --card:#1c1d22; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui, -apple-system, sans-serif; }
+  main { max-width:1180px; margin:0 auto; padding:24px 16px 64px; }
+  h1 { font-size:22px; margin:0 0 4px; } h2 { font-size:15px; margin:0 0 8px; text-transform:uppercase; letter-spacing:.04em; color:var(--dim); }
+  p.lede { margin:0 0 16px; color:var(--dim); max-width:80ch; }
+  .grid { display:grid; grid-template-columns: minmax(0, 560px) minmax(0,1fr); gap:20px; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; margin-bottom:16px; }
+  pre.term { background:var(--term); color:var(--termfg); font:13px/1.35 ui-monospace, Menlo, monospace; padding:10px 12px; border-radius:8px; margin:0; overflow-x:auto; white-space:pre; min-height:120px; }
+  .mini { min-height:auto; margin-top:8px; }
+  .t-dim { color:#8a8f99; } .t-warn { color:#e3a35b; } .t-red { color:#ff7a70; } .t-sel { background:#2a3550; } .t-ok { color:#7cc884; } .t-acc { color:#9fb4ff; } .t-box { color:#ffd479; }
+  button { font:inherit; font-size:14px; padding:6px 10px; border-radius:7px; border:1px solid var(--line); background:var(--bg); color:var(--fg); cursor:pointer; margin:0 6px 6px 0; }
+  button:hover { border-color:var(--accent); }
+  button.key { font-family: ui-monospace, Menlo, monospace; min-width:2.2em; }
+  button.next { background:var(--accent); color:#fff; border-color:var(--accent); }
+  button:disabled { opacity:.45; cursor:default; }
+  .tabs button.on { border-color:var(--accent); color:var(--accent); font-weight:600; }
+  .row { display:flex; flex-wrap:wrap; align-items:center; gap:4px 0; }
+  .lbl { font-size:12px; color:var(--dim); margin:8px 0 4px; }
+  select { font:inherit; font-size:14px; padding:4px 6px; border-radius:6px; border:1px solid var(--line); background:var(--bg); color:var(--fg); }
+  .pol { display:grid; grid-template-columns: 1fr auto; gap:6px 10px; align-items:center; font-size:14px; }
+  .events { font:12px/1.45 ui-monospace, Menlo, monospace; max-height:260px; overflow:auto; }
+  .events div { padding:1px 0; border-bottom:1px dashed var(--line); word-break:break-word; }
+  .events .ruled { color:var(--accent); font-weight:600; }
+  .changed { background: color-mix(in srgb, var(--accent) 12%, transparent); border-radius:6px; padding:6px 8px; font-size:14px; margin-bottom:10px; }
+  table.m { border-collapse:collapse; width:100%; font-size:14px; } table.m td { padding:3px 6px; border-bottom:1px solid var(--line); } table.m td:last-child { text-align:right; font-family:ui-monospace,Menlo,monospace; }
+  .steps ol { margin:6px 0 0; padding-left:20px; } .steps li { margin:4px 0; } .steps li.done { color:var(--dim); text-decoration:line-through; }
+  .inbox div { font:12px/1.45 ui-monospace, Menlo, monospace; padding:4px 0; border-bottom:1px dashed var(--line); }
+  .note { font-size:13px; color:var(--dim); }
+</style>
+</head>
+<body>
+<main>
+  <h1>How the human rules: prototype</h1>
+  <p class="lede"><b>Question.</b> When the Watcher and the Worker disagree, how does the human have the final say? Ruling on a NEEDS YOU Escalation (a pane key, the next prompt, or both), joining a Debate that is still running, what the Worker is told, and which <code>ruled</code> event the metrics need (H2 helpful, H3 Escalation precision, H4 Challenge precision). Scenario: unproductive repetition, the 5th <code>@reviewbot review</code> round. Every run starts at 12:50: the Worker has defended Challenge c2 once and the Watcher's rebuttal (2/2) waits for the Worker to go idle. The rules on the right are <i>proposals to react to</i>; switch them and replay.</p>
+
+  <div class="grid">
+    <section>
+      <div class="card">
+        <h2>Pane (Board, 64 columns)</h2>
+        <pre class="term" id="board"></pre>
+        <div class="lbl">Mini mode (one line, e.g. Claude mod band or tmux status)</div>
+        <pre class="term mini" id="mini"></pre>
+      </div>
+      <div class="card">
+        <h2>Pane keys (on the selected item)</h2>
+        <div class="row" id="select"></div>
+        <div class="row" id="keys"></div>
+        <p class="note">Lowercase rules for this session. Uppercase also keeps it as a <b>Standing ruling</b> for later sessions on this repo. <code>u</code> undoes a ruling the Watcher inferred from your prompt.</p>
+      </div>
+      <div class="card">
+        <h2>Things that happen (the world)</h2>
+        <div class="row" id="world"></div>
+        <div class="lbl">Your next prompt to the Worker (what it says, as the Watcher reads it at the turn-end wake)</div>
+        <div class="row" id="prompts"></div>
+      </div>
+    </section>
+
+    <section>
+      <div class="card">
+        <h2>Guided walkthroughs</h2>
+        <div class="row tabs" id="tabs"></div>
+        <div class="steps" id="steps"></div>
+      </div>
+      <div class="card">
+        <h2>Rules being tried</h2>
+        <div class="pol" id="policy"></div>
+      </div>
+      <div class="card">
+        <h2>What just changed</h2>
+        <div class="changed" id="changed">Nothing yet.</div>
+        <h2>Sent to the Worker</h2>
+        <div class="inbox" id="inbox"></div>
+      </div>
+      <div class="card">
+        <h2>Metrics from this run</h2>
+        <table class="m" id="metrics"></table>
+        <p class="note">Single session, so n &lt; 20; shown as raw fractions only to see which events feed which ratio.</p>
+      </div>
+      <div class="card">
+        <h2>Session event log</h2>
+        <div class="events" id="events"></div>
+      </div>
+    </section>
+  </div>
+</main>
+
+<script>
+// ================= pure module: ruling state model (no DOM) =================
+const Ruling = (() => {
+  const fmt = m => `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
+  const C2_ESC = {
+    title: 'Debate unresolved: 5th review round, nothing new (c2)',
+    lines: ['Watcher: stop re-requesting; reviewbot never approves (COMMENTED x4), ask human',
+            'Worker:  only reviewbot can approve; branch protection blocks merge otherwise'],
+  };
+
+  function initial(policy) {
+    return {
+      clock: 770, policy,
+      status: { state: 'watching', spend: 1.66, ceiling: 5 },
+      concerns: {
+        c1: { id: 'c1', sev: 'note', focus: 'tests', head: 'Retry change in client.ts:57 has no test', state: 'closed', end: 'resolved (fixed)', shown: true },
+        c2: { id: 'c2', sev: 'warn', focus: 'approach', head: '5th review round, 0 new findings since round 1; edits are cosmetic', state: 'debate', end: null, shown: true, challenged: true },
+        c3: { id: 'c3', sev: 'note', focus: 'security', head: 'Debug log prints full webhook payload (webhook.ts:33)', state: 'closed', end: 'dismissed', shown: true },
+      },
+      debates: {
+        c2: {
+          exchange: 1, pending: 'rebuttal', outcome: null,
+          log: [['11:00', 'Challenge queued', 'approach-level · evidence ✓'],
+                ['12:05', 'Challenge 1/2 sent', 'Stop block'],
+                ['12:50', 'Worker defends', 'required check pending; another round may flip it'],
+                ['12:50', 'rebuttal pending', 'Worker idle']],
+        },
+      },
+      escalations: [],
+      inbox: [],
+      rulings: policy.capNearlyFull ? Array.from({ length: 30 }, (_, i) => ({ id: `r${i + 1}`, focus: 'older', head: `earlier ruling ${i + 1}`, verdict: 'dismissed', reason: null, date: '2026-09-30' })) : [],
+      rulingCap: 30,
+      events: [],
+      ticker: [],
+      selected: 'c2',
+      lastInferred: null,
+      ended: false,
+    };
+  }
+
+  const clone = s => JSON.parse(JSON.stringify(s));
+  const now = s => fmt(s.clock);
+  const ev = (s, e) => s.events.push({ t: now(s), ...e });
+  const tick = (s, line) => { s.ticker.push(`${now(s)} ${line}`); s.ticker = s.ticker.slice(-2); };
+  const openEsc = s => s.escalations.filter(e => e.state === 'needs');
+
+  // the item the pane keys act on
+  function target(s) {
+    const esc = s.escalations.find(e => e.id === s.selected && e.state === 'needs');
+    if (esc) return { kind: esc.kind === 'blocked' ? 'blocked' : 'escalation', esc, concern: esc.concern && s.concerns[esc.concern] };
+    const c = s.concerns[s.selected];
+    if (c && c.state === 'debate') return { kind: 'debate', concern: c };
+    if (c && c.state === 'open') return { kind: 'concern', concern: c };
+    return { kind: 'none' };
+  }
+
+  function legalKeys(s) {
+    if (s.ended) return [];
+    const t = target(s);
+    if (t.kind === 'escalation' || t.kind === 'debate') return ['y', 'n', 'd', 'Y', 'N', 'D'];
+    if (t.kind === 'blocked') return ['d'];
+    if (t.kind === 'concern') return ['d', 'D'];
+    return [];
+  }
+
+  function remember(s, c, verdict, reason) {
+    if (s.rulings.length >= s.rulingCap) {
+      tick(s, `remember refused: ${s.rulingCap} Standing rulings held; prune with r → x`);
+      ev(s, { k: 'human', op: 'remember-refused', id: c.id, cap: s.rulingCap });
+      return false;
+    }
+    const r = { id: `r${s.rulings.length + 1}`, focus: c.focus, head: c.head, verdict, reason: reason || null, date: '2026-10-06' };
+    s.rulings.push(r);
+    ev(s, { k: 'human', op: 'ruling remembered', ruling: r.id, source: verdict === 'dismissed' ? 'dismiss' : 'ruling', concern: c.id });
+    return true;
+  }
+
+  function tellWorker(s, c, verdict) {
+    if (verdict !== 'watcher' || s.policy.tellWorker === 'none') return;
+    s.inbox.push({ t: now(s), state: 'queued until Worker idle', text:
+      `[pair-watcher · Ruling ${c.id} · from the human] The human sides with the Watcher on Challenge ${c.id}: ` +
+      `stop re-requesting reviewbot; it never approves. Change course; no verdict line needed.` });
+    ev(s, { k: 'challenge', op: 'ruling queued', id: c.id, route: 'normal delivery (idle only)' });
+  }
+
+  // one place that closes a Debate or Escalation on the human's say
+  function rule(s, { concern, esc, verdict, via, remembered, stage }) {
+    const c = concern;
+    const d = s.debates[c.id];
+    if (d && !d.outcome) {
+      d.outcome = verdict === 'dismissed' ? 'withdrawn (human dismissed)' : `human sided with ${verdict === 'watcher' ? 'Watcher' : 'Worker'}`;
+      if (d.pending) { d.log.push([now(s), `${d.pending} cancelled`, 'human ruled']); d.pending = null; }
+      d.log.push([now(s), d.outcome, via]);
+    }
+    c.state = 'closed';
+    c.end = esc ? `escalated → ${verdictText(verdict)}` : verdictText(verdict);
+    if (esc) { esc.state = 'ruled'; esc.ruled = { verdict, via, t: now(s) }; }
+    const shownFor = esc ? s.clock - esc.raisedAt : null;
+    ev(s, {
+      k: esc ? 'escalation' : 'debate', op: 'ruled', id: esc ? esc.id : c.id, concern: c.id, focus: c.focus,
+      stage, verdict, via, remembered: !!remembered, told_worker: verdict === 'watcher' && s.policy.tellWorker !== 'none',
+      ...(shownFor !== null ? { after_min: shownFor } : {}),
+    });
+    tellWorker(s, c, verdict);
+    if (remembered) remember(s, c, verdict);
+  }
+
+  const verdictText = v => v === 'watcher' ? 'you sided with Watcher' : v === 'worker' ? 'you sided with Worker' : 'you dismissed it';
+
+  function reduce(prev, a) {
+    const s = clone(prev);
+    if (s.ended && a.type !== 'select') { s.ticker = s.ticker.slice(-1); tick(s, 'session has ended'); return s; }
+    if (a.type !== 'select' && a.type !== 'key' && a.type !== 'undo') s.clock += 5;
+    const c2 = s.concerns.c2, d2 = s.debates.c2;
+
+    switch (a.type) {
+      case 'select': s.selected = a.id; break;
+
+      case 'rebuttalSent': {
+        if (d2.pending !== 'rebuttal') { tick(s, 'no rebuttal waiting'); break; }
+        d2.log.push([now(s), 'rebuttal 2/2 sent', 'Stop block · new ground: COMMENTED x4, never APPROVED']);
+        d2.exchange = 2; d2.pending = 'verdict';
+        ev(s, { k: 'challenge', op: 'delivered', id: 'c2', n: 2, route: 'Stop block' });
+        break;
+      }
+      case 'workerDefends': {
+        if (d2.pending !== 'verdict' || d2.exchange !== 2) { tick(s, 'Worker has nothing to answer yet'); break; }
+        d2.log.push([now(s), 'Worker defends 2/2', 'only reviewbot can approve; branch protection']);
+        d2.pending = null; d2.outcome = 'unresolved';
+        d2.log.push([now(s), 'unresolved → Escalation', 'warn ≥ escalate_unresolved']);
+        c2.state = 'escalated';
+        s.escalations.push({ id: 'e1', concern: 'c2', kind: 'debate', ...C2_ESC, state: 'needs', raisedAt: s.clock, ruled: null });
+        s.selected = 'e1';
+        ev(s, { k: 'debate', id: 'c2', outcome: 'unresolved', escalate: true });
+        ev(s, { k: 'escalation', op: 'raised', id: 'e1', concern: 'c2', kind: 'debate' });
+        ev(s, { k: 'escalation', op: 'notified', id: 'e1' });
+        tick(s, '▲ notified: Debate unresolved (c2)');
+        break;
+      }
+      case 'workerConcedes': {
+        if (d2.pending !== 'verdict') { tick(s, 'Worker has nothing to answer yet'); break; }
+        d2.log.push([now(s), 'Worker concedes', 'stops requesting rounds']);
+        d2.pending = null; d2.outcome = 'worker concedes';
+        c2.state = 'closed'; c2.end = 'worker conceded (awaiting fix)';
+        ev(s, { k: 'debate', id: 'c2', outcome: 'worker concedes' });
+        break;
+      }
+      case 'humanPrompt': {
+        ev(s, { k: 'human', op: 'prompt', text: a.text });
+        if (d2.pending === 'rebuttal' || d2.pending === 'verdict') d2.log.push([now(s), 'held', 'human turn goes first']);
+        // the turn-end wake reads the prompt
+        if (s.policy.promptRules === 'never' || a.intent === 'unrelated') {
+          if (openEsc(s).length && a.intent !== 'unrelated') tick(s, 'prompt not read as a ruling (rule: keys only)');
+          break;
+        }
+        const verdict = a.intent === 'sides-watcher' ? 'watcher' : 'worker';
+        const esc = openEsc(s).find(e => e.kind === 'debate');
+        if (esc) {
+          rule(s, { concern: s.concerns[esc.concern], esc, verdict, via: 'prompt (inferred)', stage: 'escalation' });
+          s.lastInferred = { escId: esc.id, concern: esc.concern };
+          tick(s, `${esc.concern} Escalation ruled by your prompt: ${verdictText(verdict)} · u undo`);
+        } else if (c2.state === 'debate' && s.policy.promptRules === 'infer-all') {
+          rule(s, { concern: c2, esc: null, verdict, via: 'prompt (inferred)', stage: `debate ${d2.exchange}/2` });
+          s.lastInferred = { escId: null, concern: 'c2' };
+          tick(s, `c2 Debate ended by your prompt: ${verdictText(verdict)} · u undo`);
+        } else if (c2.state === 'debate') {
+          d2.log.push([now(s), 'prompt read as evidence', a.intent === 'sides-watcher' ? 'Worker switches → worker concedes' : 'Watcher re-checks rebuttal']);
+          if (a.intent === 'sides-watcher') { d2.outcome = 'worker concedes'; d2.pending = null; c2.state = 'closed'; c2.end = 'worker conceded (your prompt changed course)'; ev(s, { k: 'debate', id: 'c2', outcome: 'worker concedes', why: 'human turn switched approach' }); }
+        }
+        break;
+      }
+      case 'undo': {
+        const li = s.lastInferred;
+        if (!li) { tick(s, 'nothing to undo'); break; }
+        const c = s.concerns[li.concern];
+        if (li.escId) {
+          const esc = s.escalations.find(e => e.id === li.escId);
+          esc.state = 'needs'; esc.ruled = null; c.state = 'escalated'; c.end = null; s.selected = esc.id;
+        } else { const d = s.debates[c.id]; d.outcome = null; d.pending = 'rebuttal'; d.log.push([now(s), 'inferred ruling undone', 'Debate resumes']); c.state = 'debate'; c.end = null; s.selected = c.id; }
+        s.inbox = s.inbox.filter(m => !(m.text.includes(`Ruling ${c.id}`) && m.state.startsWith('queued')));
+        ev(s, { k: 'escalation', op: 'ruling undone', id: li.escId || c.id, via: 'u' });
+        tick(s, `inferred ruling on ${c.id} undone; back in ${li.escId ? 'NEEDS YOU' : 'IN DEBATE'}`);
+        s.lastInferred = null;
+        break;
+      }
+      case 'workerTurnEnds': {
+        for (const m of s.inbox) if (m.state.startsWith('queued')) { m.state = `delivered ${now(s)} (Stop block)`; ev(s, { k: 'challenge', op: 'ruling delivered', route: 'Stop block' }); }
+        if (d2.pending === 'rebuttal' && c2.state === 'debate') tick(s, 'turn ended: rebuttal can go now (press "Rebuttal goes out")');
+        break;
+      }
+      case 'concernResolves': {
+        if (c2.state === 'closed') { tick(s, 'c2 already closed'); break; }
+        if (d2 && !d2.outcome) { d2.outcome = 'withdrawn'; d2.pending = null; d2.log.push([now(s), 'withdrawn', 'Concern no longer applies']); ev(s, { k: 'debate', id: 'c2', outcome: 'withdrawn' }); }
+        const esc = openEsc(s).find(e => e.concern === 'c2');
+        if (esc) { esc.state = 'stale'; ev(s, { k: 'escalation', op: 'closed-stale', id: esc.id, why: 'Worker stopped re-requesting on its own' }); tick(s, 'e1 closed: no longer applies (Worker stopped on its own)'); }
+        c2.state = 'closed'; c2.end = esc ? 'escalated → no longer applies' : 'resolved (Worker stopped on its own)';
+        ev(s, { k: 'concern', op: 'resolve', id: 'c2', why: 'no longer applies' });
+        break;
+      }
+      case 'workerBlocked': {
+        if (s.escalations.some(e => e.id === 'b1')) { tick(s, 'already blocked'); break; }
+        s.escalations.push({ id: 'b1', kind: 'blocked', title: 'Worker blocked: Allow Bash: gh pr merge 412 --admin --squash?',
+          lines: ['Watcher (opinion): --admin bypasses branch protection (the c2 Debate)'], state: 'needs', raisedAt: s.clock, ruled: null });
+        s.selected = 'b1';
+        ev(s, { k: 'escalation', op: 'raised', id: 'b1', kind: 'blocked' });
+        ev(s, { k: 'escalation', op: 'notified', id: 'b1' });
+        tick(s, '▲ notified: Worker blocked');
+        break;
+      }
+      case 'dialogAnswered': {
+        const esc = s.escalations.find(e => e.id === 'b1' && e.state === 'needs');
+        if (!esc) { tick(s, 'no blocked question open'); break; }
+        esc.state = 'ruled'; esc.ruled = { verdict: `answered: ${a.answer}`, via: 'Worker dialog', t: now(s) };
+        ev(s, { k: 'escalation', op: 'ruled', id: 'b1', stage: 'blocked', verdict: 'answered', answer: a.answer, via: 'Worker dialog', after_min: s.clock - esc.raisedAt });
+        tick(s, `b1 closed: you answered "${a.answer}" in the Worker`);
+        break;
+      }
+      case 'sessionEnds': {
+        for (const e of openEsc(s)) { e.state = 'unruled'; ev(s, { k: 'escalation', op: 'unruled', id: e.id, why: 'session ended, never ruled' }); }
+        if (d2 && !d2.outcome) { d2.outcome = 'withdrawn'; d2.pending = null; d2.log.push([now(s), 'withdrawn', 'session ended']); ev(s, { k: 'debate', id: 'c2', outcome: 'withdrawn', why: 'session ended' }); }
+        ev(s, { k: 'session', op: 'end' });
+        s.ended = true; tick(s, 'session ended');
+        break;
+      }
+
+      case 'key': {
+        if (!legalKeys(s).includes(a.key)) { tick(s, `${a.key} does nothing here`); break; }
+        const t = target(s);
+        const remembered = a.key === a.key.toUpperCase();
+        const k = a.key.toLowerCase();
+        if (t.kind === 'blocked') {
+          t.esc.state = 'ruled'; t.esc.ruled = { verdict: 'dismissed', via: 'key d', t: now(s) };
+          ev(s, { k: 'escalation', op: 'ruled', id: t.esc.id, stage: 'blocked', verdict: 'dismissed', via: 'key d', after_min: s.clock - t.esc.raisedAt });
+          tick(s, 'b1 dismissed from the pane (Worker still waits on its dialog)');
+          break;
+        }
+        if (t.kind === 'concern') {
+          t.concern.state = 'closed'; t.concern.end = 'dismissed';
+          ev(s, { k: 'human', op: 'dismiss', id: t.concern.id });
+          if (remembered) remember(s, t.concern, 'dismissed');
+          break;
+        }
+        const verdict = k === 'y' ? 'watcher' : k === 'n' ? 'worker' : 'dismissed';
+        if (t.kind === 'escalation') rule(s, { concern: t.concern, esc: t.esc, verdict, via: `key ${a.key}`, remembered, stage: 'escalation' });
+        else rule(s, { concern: t.concern, esc: null, verdict, via: `key ${a.key}`, remembered, stage: `debate ${s.debates[t.concern.id].exchange}/2` });
+        const refused = s.events.at(-1).op === 'remember-refused';
+        if (!refused) tick(s, `${t.concern.id} ${verdictText(verdict)}${remembered ? ' · kept as Standing ruling' : ''}`);
+        s.lastInferred = null;
+        break;
+      }
+    }
+    return s;
+  }
+
+  // metrics derived from the event log only (Metrics mechanism: no counters)
+  function metrics(s) {
+    const E = s.events;
+    const notified = E.filter(e => e.k === 'escalation' && e.op === 'notified').map(e => e.id);
+    const ruledEsc = E.filter(e => e.k === 'escalation' && e.op === 'ruled');
+    const undone = new Set(E.filter(e => e.op === 'ruling undone').map(e => e.id));
+    const lastRuling = id => [...ruledEsc].reverse().find(e => e.id === id);
+    const acted = notified.filter(id => {
+      const r = lastRuling(id); if (!r) return false;
+      if (undone.has(id) && E.lastIndexOf(r) < E.findLastIndex(e => e.op === 'ruling undone' && e.id === id)) return false;
+      if (r.verdict === 'watcher' || r.verdict === 'worker') return true;
+      if (r.verdict === 'answered') return s.policy.blockedInH3 === 'answered-counts';
+      return false;
+    });
+    const stale = E.filter(e => e.op === 'closed-stale').map(e => e.id);
+    const unruled = E.filter(e => e.op === 'unruled').map(e => e.id);
+    let denomIds = notified.filter(id => !(s.policy.blockedInH3 === 'exclude' && id === 'b1'));
+    if (s.policy.unruledInH3 === 'exclude') denomIds = denomIds.filter(id => !unruled.includes(id) && !stale.includes(id));
+    const h3n = acted.filter(id => denomIds.includes(id)).length;
+    const ruledAll = E.filter(e => e.op === 'ruled' && !undone.has(e.id));
+    const sidedWatcher = ruledAll.filter(e => e.verdict === 'watcher').length;
+    const sidedWorker = ruledAll.filter(e => e.verdict === 'worker').length;
+    const dismissed = ruledAll.filter(e => e.verdict === 'dismissed').length;
+    const workerConceded = E.some(e => e.k === 'debate' && e.outcome === 'worker concedes');
+    return [
+      ['H3 Escalation precision (ruled with a side ÷ Escalations shown)', `${h3n}/${denomIds.length}`],
+      ['   escalations unruled at session end / closed stale', `${unruled.length} / ${stale.length}`],
+      ['H2 helpful credit: rulings for the Watcher', `${sidedWatcher}`],
+      ['H4 Challenge precision credit (c2): sided with Watcher, or worker conceded + fixed', sidedWatcher ? '1/1' : workerConceded ? '1/1 if later fixed' : '0/1'],
+      ['Rulings for the Worker / dismissed by the human', `${sidedWorker} / ${dismissed}`],
+      ['Standing rulings held', `${s.rulings.length}/${s.rulingCap}`],
+    ];
+  }
+
+  return { initial, reduce, legalKeys, target, metrics, fmt };
+})();
+
+// ================= page shell =================
+const POLICY_OPTS = {
+  promptRules: { label: 'Does your next prompt count as a ruling?', opts: [
+    ['infer-esc', 'Yes for a NEEDS YOU Escalation (inferred, u to undo)'],
+    ['infer-all', 'Yes, also ends a live Debate'],
+    ['never', 'No: only pane keys rule']] },
+  tellWorker: { label: 'When you side with the Watcher, is the Worker told?', opts: [
+    ['queue', 'Yes: a Ruling message, idle-only delivery'],
+    ['none', 'No: you prompt it yourself']] },
+  unruledInH3: { label: 'Never-ruled / stale Escalations in H3', opts: [
+    ['count', 'Count as shown, not acted'],
+    ['exclude', 'Leave out of H3']] },
+  blockedInH3: { label: 'Blocked Escalations in H3', opts: [
+    ['exclude', 'Leave out (answering the dialog says nothing about the ping)'],
+    ['answered-counts', 'Answered after the ping = acted']] },
+  capNearlyFull: { label: 'Standing ruling store', opts: [[false, 'Room left (cap 30)'], [true, 'Full: 30 of 30 held']] },
+};
+let policy = { promptRules: 'infer-esc', tellWorker: 'queue', unruledInH3: 'count', blockedInH3: 'exclude', capNearlyFull: false };
+let state = Ruling.initial(policy);
+let lastLabel = null;
+
+const PROMPTS = [
+  ['"reviewbot is broken, I\'ll merge it myself. Draft the squash message"', 'sides-watcher'],
+  ['"keep requesting reviews until it approves"', 'sides-worker'],
+  ['"also bump the version in package.json"', 'unrelated'],
+];
+const WORLD = [
+  ['Rebuttal goes out (Worker idle)', { type: 'rebuttalSent' }],
+  ['Worker defends again', { type: 'workerDefends' }],
+  ['Worker concedes', { type: 'workerConcedes' }],
+  ['Worker turn ends', { type: 'workerTurnEnds' }],
+  ['Worker stops on its own (c2 no longer applies)', { type: 'concernResolves' }],
+  ['Worker blocked: gh pr merge --admin?', { type: 'workerBlocked' }],
+  ['You answer the dialog: deny', { type: 'dialogAnswered', answer: 'deny' }],
+  ['Session ends', { type: 'sessionEnds' }],
+];
+const KEYS = { y: 'side with Watcher', n: 'side with Worker', d: 'dismiss', Y: 'Watcher + remember', N: 'Worker + remember', D: 'dismiss + remember' };
+
+const WALKS = [
+  { name: 'Rule from the pane', what: 'The Debate runs out and lands in NEEDS YOU with a notification. You press y. Watch: the Escalation leaves NEEDS YOU, one ruled event with via "key y", and (if the rule is on) a Ruling message queued for the Worker, delivered only when it goes idle.',
+    steps: [['Rebuttal goes out', { type: 'rebuttalSent' }], ['Worker defends again → Escalation', { type: 'workerDefends' }], ['Press y on e1', { type: 'key', key: 'y' }], ['Worker turn ends (Ruling delivered)', { type: 'workerTurnEnds' }]] },
+  { name: 'Your prompt is the ruling', what: 'You never touch the pane; you just tell the Worker what to do. The turn-end wake reads your prompt as siding with the Watcher and closes e1, marked "(inferred)", with u to undo. Switch "Does your next prompt count" to "No" and replay: e1 stays.',
+    steps: [['Rebuttal goes out', { type: 'rebuttalSent' }], ['Worker defends again → Escalation', { type: 'workerDefends' }], ['You prompt: reviewbot is broken, I\'ll merge myself', { type: 'humanPrompt', text: PROMPTS[0][0], intent: 'sides-watcher' }]] },
+  { name: 'Wrong guess, undo', what: 'The Watcher reads your prompt as siding with the Worker, but you meant something else. u reopens e1 and logs the correction, so H3 is not credited by a guess.',
+    steps: [['Rebuttal goes out', { type: 'rebuttalSent' }], ['Worker defends again → Escalation', { type: 'workerDefends' }], ['You prompt: keep requesting reviews', { type: 'humanPrompt', text: PROMPTS[1][0], intent: 'sides-worker' }], ['Press u', { type: 'undo' }]] },
+  { name: 'Ignore it', what: 'The Escalation notifies, you keep working on something else. Nothing nags; e1 stays boxed in NEEDS YOU. At session end it is logged unruled. Flip "Never-ruled in H3" to see the metric change.',
+    steps: [['Rebuttal goes out', { type: 'rebuttalSent' }], ['Worker defends again → Escalation', { type: 'workerDefends' }], ['You prompt: bump the version', { type: 'humanPrompt', text: PROMPTS[2][0], intent: 'unrelated' }], ['Worker turn ends', { type: 'workerTurnEnds' }], ['Session ends', { type: 'sessionEnds' }]] },
+  { name: 'Join a live Debate', what: 'The rebuttal is still waiting. You already know the Worker is right (say branch protection really needs reviewbot). n on c2 ends the Debate: the waiting rebuttal is cancelled, no Escalation, no notification, nothing sent to the Worker.',
+    steps: [['Press n on c2 (IN DEBATE)', { type: 'key', key: 'n' }], ['Worker turn ends', { type: 'workerTurnEnds' }]] },
+  { name: 'Side with Watcher mid-Debate, remember', what: 'Y on c2: the Debate ends "human sided with Watcher", a Ruling message is queued for the Worker, and a Standing ruling is kept for later sessions (rulings 1 in the header). Set the ruling store to "At cap" and replay to see remember refused.',
+    steps: [['Press Y on c2', { type: 'key', key: 'Y' }], ['Worker turn ends', { type: 'workerTurnEnds' }]] },
+  { name: 'Blocked Escalation', what: 'The Worker asks to merge with --admin. The blocked Escalation notifies; you answer the permission dialog in the Worker. The answer closes b1. Try y on b1 instead: refused, the pane cannot answer for you.',
+    steps: [['Worker blocked', { type: 'workerBlocked' }], ['Press y on b1 (should be refused)', { type: 'key', key: 'y' }], ['You answer the dialog: deny', { type: 'dialogAnswered', answer: 'deny' }]] },
+  { name: 'Concern goes away first', what: 'The Escalation is up, but the Worker stops re-requesting on its own before you look. e1 closes "no longer applies"; nothing to rule.',
+    steps: [['Rebuttal goes out', { type: 'rebuttalSent' }], ['Worker defends again → Escalation', { type: 'workerDefends' }], ['Worker stops on its own', { type: 'concernResolves' }]] },
+];
+let walk = 0, stepIx = 0;
+
+function dispatch(a, label) {
+  const before = state;
+  state = Ruling.reduce(state, a);
+  lastLabel = label;
+  const newEv = state.events.slice(before.events.length);
+  document.getElementById('changed').innerHTML = `<b>${esc(label)}</b><br>` + (newEv.length ? newEv.map(e => esc(`${e.k} ${e.op || e.outcome || ''} ${e.id || ''}`)).join(' · ') : esc(state.ticker.at(-1) || 'no event'));
+  render();
+}
+
+// --- Board render (64 cols) ---
+const W = 64;
+const pad = (s, n) => s.length >= n ? s.slice(0, n - 1) + '…' : s + ' '.repeat(n - s.length);
+const esc = s => String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+function header(title, hint) { const left = `${title} `; const right = hint ? ` ${hint}` : ''; return { text: left + '─'.repeat(Math.max(2, W - left.length - right.length)) + right, hintLen: right.length }; }
+function wrap(text, width, indent) { const out = []; let line = ''; for (const w of text.split(' ')) { if ((line + ' ' + w).trim().length > width) { out.push(line); line = ' '.repeat(indent) + w; } else line = line ? line + ' ' + w : w; } if (line) out.push(line); return out; }
+
+function boardLines(s) {
+  const L = [];
+  const push = (t, cls) => L.push({ t, cls });
+  const pushHead = (title, hint) => { const h = header(title, hint); L.push({ t: h.text, cls: '', hint: h.hintLen }); };
+  const fields = [`$${s.status.spend.toFixed(2)}/$${s.status.ceiling}`, 'gpt-6.1-sol', 'Companion'];
+  if (s.rulings.length) fields.push(`rulings ${s.rulings.length}`);
+  push(`● ${s.ended ? 'session ended' : 'watching'} · ${fields.join(' · ')}`, 't-ok');
+  push(`  wakes ··■··■■ · last ${Ruling.fmt(s.clock)}`, 't-dim');
+  const needs = s.escalations.filter(e => e.state === 'needs');
+  if (needs.length) {
+    pushHead(`NEEDS YOU ${needs.length}`, needs.some(e => e.kind === 'debate') ? 'y Watcher · n Worker · d' : 'answer in Worker · d');
+    for (const e of needs) {
+      const sel = s.selected === e.id;
+      push(`${sel ? '›' : ' '}┌ ${pad(e.title, W - 5)}┐`, sel ? 't-box t-sel' : 't-box');
+      for (const ln of e.lines) push(` │ ${pad(ln, W - 5)}│`, 't-box');
+      push(` └${'─'.repeat(W - 4)}┘`, 't-box');
+    }
+  }
+  const deb = Object.values(s.concerns).filter(c => c.state === 'debate');
+  if (deb.length) {
+    pushHead(`IN DEBATE ${deb.length}`, 'y · n · d  ⏎ log');
+    for (const c of deb) {
+      const sel = s.selected === c.id;
+      wrap(`${sel ? '›' : ' '} ${c.id} ${c.sev} [${c.focus}] ${c.head}`, W, 7).forEach((ln, i) => push(ln, (sel ? 't-sel ' : '') + (i === 0 && c.sev === 'warn' ? 't-warn' : '')));
+      const log = s.debates[c.id].log;
+      if (log.length > 2) push(`  … ${log.length - 2} earlier [⏎]`, 't-dim');
+      for (const [t, e, r] of log.slice(-2)) push(`  ${t} ${pad(e, 19)}${pad(r, W - 27)}`, '');
+    }
+  }
+  const open = Object.values(s.concerns).filter(c => c.state === 'open');
+  if (open.length) { pushHead(`OPEN ${open.length}`, 'd · P'); for (const c of open) push(`  ${c.id} ${c.sev} ${c.head}`, ''); }
+  const closed = Object.values(s.concerns).filter(c => c.state === 'closed' || c.state === 'escalated');
+  const closedEsc = s.escalations.filter(e => e.state !== 'needs');
+  pushHead(`CLOSED ${closed.length + closedEsc.filter(e => e.kind === 'blocked').length}`, 'c');
+  for (const c of closed) push(`  ${c.id} ${pad(c.head, 30)} ${pad(c.end || c.state, W - 36)}`, 't-dim');
+  for (const e of closedEsc) push(`  ${e.id} ${pad(e.kind === 'blocked' ? 'blocked: gh pr merge --admin' : 'Escalation', 30)} ${pad(e.state === 'ruled' ? `${e.ruled.verdict} · ${e.ruled.via}` : e.state === 'stale' ? 'no longer applies' : 'never ruled', W - 36)}`, 't-dim');
+  push('', '');
+  for (const t of s.ticker) push(pad(t, W), t.includes('refused') || t.includes('does nothing') ? 't-red' : 't-dim');
+  return L;
+}
+
+function miniLine(s) {
+  const needs = s.escalations.filter(e => e.state === 'needs');
+  if (needs.length) { const e = needs[0]; return { t: `▲ NEEDS YOU ${e.title}${e.kind === 'debate' ? '  [y/n/d]' : '  [answer in Worker]'}`, cls: 't-box' }; }
+  const deb = Object.values(s.concerns).filter(c => c.state === 'debate');
+  if (deb.length) { const d = s.debates[deb[0].id]; return { t: `◆ in debate ${deb[0].id} · ${d.pending ? d.pending + ' pending' : 'waiting'} · ${deb[0].head}`, cls: 't-warn' }; }
+  return { t: `● watching · silent since ${Ruling.fmt(s.clock)} · ${Object.values(s.concerns).filter(c => c.state === 'open').length} open${s.rulings.length ? ` · rulings ${s.rulings.length}` : ''}`, cls: 't-ok' };
+}
+
+function render() {
+  document.getElementById('board').innerHTML = boardLines(state).map(l => {
+    if (l.hint) { const a = l.t.slice(0, l.t.length - l.hint), b = l.t.slice(l.t.length - l.hint); return `<span>${esc(a)}</span><span class="t-dim">${esc(b)}</span>`; }
+    return `<span class="${l.cls}">${esc(l.t)}</span>`;
+  }).join('\n');
+  const m = miniLine(state); document.getElementById('mini').innerHTML = `<span class="${m.cls}">${esc(pad(m.t, W))}</span>`;
+
+  const sel = document.getElementById('select'); sel.innerHTML = '<span class="lbl" style="margin:0 8px 6px 0">Select (j/k):</span>';
+  const items = [...state.escalations.filter(e => e.state === 'needs').map(e => e.id), ...Object.values(state.concerns).filter(c => c.state === 'debate' || c.state === 'open').map(c => c.id)];
+  for (const id of items) { const b = document.createElement('button'); b.textContent = id; if (state.selected === id) b.className = 'next'; b.onclick = () => dispatch({ type: 'select', id }, `select ${id}`); sel.appendChild(b); }
+  if (!items.length) sel.insertAdjacentHTML('beforeend', '<span class="note">nothing selectable</span>');
+
+  const keys = document.getElementById('keys'); keys.innerHTML = '';
+  const legal = Ruling.legalKeys(state);
+  for (const [k, what] of Object.entries(KEYS)) { const b = document.createElement('button'); b.className = 'key'; b.textContent = k; b.title = what; b.onclick = () => dispatch({ type: 'key', key: k }, `press ${k} (${what}) on ${state.selected}`); if (!legal.includes(k)) b.style.opacity = .45; keys.appendChild(b); keys.insertAdjacentHTML('beforeend', `<span class="note" style="margin:0 10px 6px -2px">${what}</span>`); }
+  const u = document.createElement('button'); u.className = 'key'; u.textContent = 'u'; u.onclick = () => dispatch({ type: 'undo' }, 'press u (undo inferred ruling)'); if (!state.lastInferred) u.style.opacity = .45; keys.appendChild(u); keys.insertAdjacentHTML('beforeend', '<span class="note">undo inferred</span>');
+
+  const world = document.getElementById('world'); world.innerHTML = '';
+  for (const [label, a] of WORLD) { const b = document.createElement('button'); b.textContent = label; b.onclick = () => dispatch(a, label); world.appendChild(b); }
+  const prompts = document.getElementById('prompts'); prompts.innerHTML = '';
+  for (const [text, intent] of PROMPTS) { const b = document.createElement('button'); b.textContent = text; b.onclick = () => dispatch({ type: 'humanPrompt', text, intent }, `you prompt ${text}`); prompts.appendChild(b); }
+
+  const tabs = document.getElementById('tabs'); tabs.innerHTML = '';
+  WALKS.forEach((w, i) => { const b = document.createElement('button'); b.textContent = w.name; if (i === walk) b.className = 'on'; b.onclick = () => startWalk(i); tabs.appendChild(b); });
+  const W0 = WALKS[walk];
+  document.getElementById('steps').innerHTML = `<p style="margin:8px 0 0">${esc(W0.what)}</p><ol>${W0.steps.map((st, i) => `<li class="${i < stepIx ? 'done' : ''}">${i === stepIx ? `<button class="next" onclick="nextStep()">${esc(st[0])}</button>` : esc(st[0])}</li>`).join('')}</ol>` + `<button onclick="startWalk(${walk})">Restart this walkthrough</button>`;
+
+  const pol = document.getElementById('policy'); pol.innerHTML = '';
+  for (const [key, spec] of Object.entries(POLICY_OPTS)) {
+    pol.insertAdjacentHTML('beforeend', `<label for="p-${key}">${esc(spec.label)}</label>`);
+    const s = document.createElement('select'); s.id = `p-${key}`;
+    for (const [v, l] of spec.opts) { const o = document.createElement('option'); o.value = String(v); o.textContent = l; if (String(policy[key]) === String(v)) o.selected = true; s.appendChild(o); }
+    s.onchange = () => { policy = { ...policy, [key]: s.value === 'true' ? true : s.value === 'false' ? false : s.value }; startWalk(walk); };
+    pol.appendChild(s);
+  }
+
+  document.getElementById('inbox').innerHTML = state.inbox.length ? state.inbox.map(m => `<div><b>${esc(m.t)} · ${esc(m.state)}</b><br>${esc(m.text)}</div>`).join('') : '<span class="note">Nothing. The Debate close-out sends nothing back unless a rule above says so.</span>';
+  document.getElementById('metrics').innerHTML = Ruling.metrics(state).map(([k, v]) => `<tr><td>${esc(k)}</td><td>${esc(v)}</td></tr>`).join('');
+  document.getElementById('events').innerHTML = state.events.map(e => `<div class="${e.op === 'ruled' ? 'ruled' : ''}">${esc(JSON.stringify(e))}</div>`).join('') || '<span class="note">No events yet in this run.</span>';
+}
+
+function startWalk(i) { walk = i; stepIx = 0; state = Ruling.initial(policy); document.getElementById('changed').textContent = 'Reset to 12:50: rebuttal waiting for Worker idle.'; render(); }
+function nextStep() { const st = WALKS[walk].steps[stepIx]; if (!st) return; stepIx++; dispatch(st[1], st[0]); }
+
+render();
+</script>
+</body>
+</html>

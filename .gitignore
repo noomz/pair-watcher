@@ -1,0 +1,31 @@
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Rust build output (T1 onward)
+/target/
+
+# Node (prototypes, adapters)
+node_modules/
+
+# Agent tool state
+.omc/
+.claude/settings.local.json
+
+# Secrets never committed
+.env
+.env.*
+credentials
+
+# Private decision trail (maintainer's checkout only); prototypes are public
+/.scratch/*
+!/.scratch/pair-watcher/
+/.scratch/pair-watcher/*
+!/.scratch/pair-watcher/prototypes/
+/evidence/
+/.planning/
+
+# Early-access Claude Code mod types (generated, never redistributed)
+.claude-plugin/types/
