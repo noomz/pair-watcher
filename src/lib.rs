@@ -9,3 +9,4 @@ pub mod mailbox;
 pub mod outbox;
 pub mod problem;
 pub mod repo;
+pub mod tailer;
