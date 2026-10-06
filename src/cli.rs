@@ -4,12 +4,10 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::config::{self, Sources};
-use crate::focus::{self, FocusSource};
+use crate::focus::FocusSource;
 use crate::home::Home;
-use crate::hook;
 use crate::problem::{Problem, tilde};
-use crate::repo;
+use crate::{config, hook, run, supervisor};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -29,7 +27,7 @@ pub enum Command {
     /// Attach a pane to a running session
     Attach { session: String },
     /// Open the standalone pane
-    Pane,
+    Pane(SessionArg),
     /// Hook entry point (pure append, fail-silent)
     Hook {
         event: String,
@@ -122,6 +120,13 @@ pub enum Command {
     Telemetry { action: TelemetryAction },
     /// Apply retention and the store cap
     Prune,
+    /// Per-session supervisor, started detached by `run`
+    #[command(hide = true)]
+    Supervise {
+        session: String,
+        #[arg(long)]
+        worker_pid: i32,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -258,8 +263,12 @@ pub fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Command::Config { action: ConfigAction::Show { origin } } => config_show(origin),
-        Command::Run(_) | Command::Attach { .. } | Command::Focus { .. } => later("T4"),
-        Command::Pane | Command::Mute { .. } | Command::Nochallenge(_) | Command::Pause(_) => later("T12"),
+        Command::Run(args) => run::run(&args.flag_layer(), &args.focus, &args.worker),
+        // Approval is per file hash, read by every session in the repo; `--session` names none.
+        Command::Focus { action: FocusAction::Approve { name, .. } } => run::focus_approve(&name),
+        Command::Supervise { session, worker_pid } => supervise(&session, worker_pid),
+        Command::Attach { .. } => later("T15"),
+        Command::Pane(_) | Command::Mute { .. } | Command::Nochallenge(_) | Command::Pause(_) => later("T12"),
         Command::Rule { .. } | Command::Undo(_) | Command::Keep(_) => later("T13"),
         Command::Rulings { .. } => later("T14"),
         Command::Install { .. } | Command::Uninstall { .. } | Command::Auth | Command::Doctor => later("T16"),
@@ -287,15 +296,12 @@ fn config_show(origin: bool) -> ExitCode {
     if let Err(e) = home.ensure_layout() {
         return fail(&format!("{}: {e}", tilde(home.root())));
     }
-    let repo = std::env::current_dir().ok().and_then(|d| repo::discover(&d));
-    let env = |var: &str| std::env::var(var).ok();
-    let sources = Sources { home: &home, repo: repo.as_ref(), env: &env, flags: &[] };
-    let resolved = match config::resolve(&sources) {
-        Ok(r) => r,
-        Err(unreadable) => return fail(&unreadable.to_string()),
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => return fail(&e.to_string()),
     };
-    let focuses = match focus::resolve(&home, repo.as_ref(), &resolved, &[]) {
-        Ok(f) => f,
+    let run::Loaded { resolved, focuses, .. } = match run::load(&home, &cwd, &[], &[]) {
+        Ok(l) => l,
         Err(unreadable) => return fail(&unreadable.to_string()),
     };
 
@@ -331,6 +337,14 @@ fn config_show(origin: bool) -> ExitCode {
         eprintln!("{p}");
     }
     ExitCode::SUCCESS
+}
+
+fn supervise(session: &str, worker_pid: i32) -> ExitCode {
+    let result = Home::from_env().and_then(|home| supervisor::supervise(&home, session, worker_pid));
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => fail(&format!("supervise {session}: {e}")),
+    }
 }
 
 fn fail(msg: &str) -> ExitCode {

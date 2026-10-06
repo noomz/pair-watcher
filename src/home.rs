@@ -1,8 +1,8 @@
 //! `~/.pair-watcher/` layout, mode 0700 (I2, C8).
 
 use std::fs::{self, DirBuilder};
-use std::io;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::io::{self, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 const SUBDIRS: [&str; 6] = ["adapters", "bin", "focus", "prefilter", "repos", "sessions"];
@@ -45,6 +45,10 @@ impl Home {
         self.root.join("focus")
     }
 
+    pub fn adapters_dir(&self) -> PathBuf {
+        self.root.join("adapters")
+    }
+
     pub fn sessions_dir(&self) -> PathBuf {
         self.root.join("sessions")
     }
@@ -58,4 +62,12 @@ impl Home {
     pub fn repo_config(&self, root_commit: &str) -> PathBuf {
         self.root.join("repos").join(format!("{root_commit}.toml"))
     }
+}
+
+/// Writes a 0600 file via rename, so a reader (harness, hook, human) never sees half of it.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    let mut file = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+    file.write_all(bytes)?;
+    fs::rename(&tmp, path)
 }

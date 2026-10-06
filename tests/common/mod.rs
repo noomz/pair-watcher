@@ -2,7 +2,8 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 
 use pair_watcher::config::{self, Resolved, Sources};
 use pair_watcher::focus::{self, FocusSet};
@@ -80,4 +81,41 @@ pub fn write(path: &Path, text: &str) {
 
 pub fn names(set: &FocusSet) -> Vec<&str> {
     set.enabled.iter().map(|f| f.name.as_str()).collect()
+}
+
+pub fn executable(path: &Path, text: &str) {
+    write(path, text);
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A `codex` stand-in whose `app-server` answers `initialize` then `hooks/list`, one hook per
+/// `-c hooks.<Event>=` flag it was given, and logs its argv.
+pub fn fake_codex(dir: &Path, list_reply: Option<&str>) -> PathBuf {
+    let reply = list_reply.map_or_else(
+        || {
+            r#"keys=""; for a in "$@"; do case "$a" in hooks.state=*) ;; hooks.*=*) ev=${a#hooks.}; ev=${ev%%=*}; keys="$keys{\"key\":\"/<session-flags>/config.toml:$ev:0:0\",\"source\":\"sessionFlags\",\"trustStatus\":\"untrusted\",\"currentHash\":\"sha256:$ev\",\"command\":\"x\"},";; esac; done; keys=${keys%,}
+  printf '{"id":2,"result":{"data":[{"cwd":"x","hooks":[%s,{"key":"u","source":"user","trustStatus":"trusted","currentHash":"sha256:u","command":"y"}],"warnings":[],"errors":[]}]}}\n' "$keys""#
+                .to_owned()
+        },
+        |r| format!("printf '%s\\n' '{r}'"),
+    );
+    let script = format!(
+        r#"#!/bin/sh
+log="$(dirname "$0")/codex.argv"
+printf '%s\n' "$*" >> "$log"
+if [ "$1" = "--version" ]; then echo "codex-cli 0.160.0"; exit 0; fi
+if [ "$1" = "app-server" ]; then
+  shift
+  read -r init
+  printf '{{"id":1,"result":{{}}}}\n'
+  read -r initialized
+  read -r list
+  {reply}
+  read -r _ || exit 0
+fi
+"#
+    );
+    let path = dir.join("codex");
+    executable(&path, &script);
+    path
 }

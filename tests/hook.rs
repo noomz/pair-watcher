@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
 use pair_watcher::home::Home;
-use pair_watcher::hook::{GUARD_ENV, write_shim};
+use pair_watcher::hook::{GUARD_ENV, SESSION_ENV, write_shim};
 use pair_watcher::mailbox::Mailbox;
 use serde_json::json;
 use tempfile::TempDir;
@@ -24,15 +24,23 @@ impl World {
     }
 
     fn run(&self, program: &Path, args: &[&str], stdin: &str, guard: bool) -> Output {
+        self.run_with(program, args, stdin, guard, None)
+    }
+
+    fn run_with(&self, program: &Path, args: &[&str], stdin: &str, guard: bool, session: Option<&str>) -> Output {
         let mut cmd = Command::new(program);
         cmd.args(args)
             .env("HOME", self.dir.path())
             .env_remove(GUARD_ENV)
+            .env_remove(SESSION_ENV)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if guard {
             cmd.env(GUARD_ENV, "1");
+        }
+        if let Some(key) = session {
+            cmd.env(SESSION_ENV, key);
         }
         let mut child = cmd.spawn().unwrap();
         child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
@@ -135,4 +143,32 @@ fn shim_execs_binary_and_stays_silent_once_removed() {
     write_shim(&w.home, Path::new(env!("CARGO_BIN_EXE_pair-watcher"))).unwrap();
     silent_success(&w.run(&shim, &["Stop"], r#"{"session_id":"s1"}"#, false));
     assert_eq!(mb.read_hooks(0).unwrap().records.len(), 2);
+}
+
+#[test]
+fn launch_key_routes_before_payload_session_id() {
+    let w = World::new();
+    let launched = Mailbox::register(&w.home, "k1").unwrap();
+    let other = Mailbox::register(&w.home, "worker-1").unwrap();
+    let bin = Path::new(env!("CARGO_BIN_EXE_pair-watcher"));
+    // Claude after `/clear` or Codex: the payload id is not the launch key (V58).
+    silent_success(&w.run_with(bin, &["hook", "Stop"], r#"{"session_id":"worker-1"}"#, false, Some("k1")));
+    // pi forwards without a session id when the extension cannot read one.
+    silent_success(&w.run_with(
+        bin,
+        &["hook", "agent_settled"],
+        r#"{"hook_event_name":"agent_settled"}"#,
+        false,
+        Some("k1"),
+    ));
+    let records = launched.read_hooks(0).unwrap().records;
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].body.payload["session_id"], "worker-1");
+    assert_eq!(other.read_hooks(0).unwrap().records.len(), 0);
+
+    // A launch key with no registered Watcher no-ops; it never falls through to the payload id.
+    launched.unregister().unwrap();
+    silent_success(&w.run_with(bin, &["hook", "Stop"], r#"{"session_id":"worker-1"}"#, false, Some("k1")));
+    assert_eq!(other.read_hooks(0).unwrap().records.len(), 0);
+    silent_success(&w.run_with(bin, &["hook", "Stop"], "{}", false, Some("../k1")));
 }

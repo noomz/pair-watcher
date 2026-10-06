@@ -14,21 +14,31 @@ use crate::mailbox::{Hook, Mailbox};
 /// Not a config key: config reads only `PAIR_WATCHER_<known key>`.
 pub const GUARD_ENV: &str = "PAIR_WATCHER_GUARD";
 
+/// Session key `run` mints and passes in the Worker env; hooks route by it before the payload's
+/// `session_id`, which changes on Claude `/clear` and is unknown for Codex at launch (V58).
+pub const SESSION_ENV: &str = "PAIR_WATCHER_SESSION";
+
 /// Pure append, fail-silent: never prints, never fails the Worker.
 pub fn run(event: &str) {
     if std::env::var_os(GUARD_ENV).is_some() {
         return;
     }
-    let _ = append(event, io::stdin().lock());
+    let _ = append(event, io::stdin().lock(), std::env::var(SESSION_ENV).ok());
 }
 
-fn append(event: &str, mut input: impl Read) -> io::Result<()> {
+fn append(event: &str, mut input: impl Read, launched: Option<String>) -> io::Result<()> {
     let home = Home::from_env()?;
     let mut raw = Vec::new();
     input.read_to_end(&mut raw)?;
     let payload =
         serde_json::from_slice(&raw).unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&raw).into_owned()));
-    let Some(id) = payload.get("session_id").and_then(Value::as_str) else { return Ok(()) };
+    let id = match &launched {
+        Some(key) => key.as_str(),
+        None => match payload.get("session_id").and_then(Value::as_str) {
+            Some(id) => id,
+            None => return Ok(()),
+        },
+    };
     let Some(mailbox) = Mailbox::open_registered(&home, id) else { return Ok(()) };
     mailbox.append_hook(&Hook { event: event.to_owned(), payload })
 }
@@ -53,4 +63,14 @@ pub fn write_shim(home: &Home, exe: &Path) -> io::Result<PathBuf> {
 
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// One shell line; words quoted only when they need it, so plain commands stay readable.
+pub fn shell_line<S: AsRef<str>>(words: &[S]) -> String {
+    let word = |w: &S| {
+        let w = w.as_ref();
+        let plain = !w.is_empty() && w.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-+=:,@".contains(&b));
+        if plain { w.to_owned() } else { sh_quote(w) }
+    };
+    words.iter().map(word).collect::<Vec<_>>().join(" ")
 }

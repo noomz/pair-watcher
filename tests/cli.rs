@@ -87,9 +87,9 @@ fn hook_is_silent_and_later_commands_name_their_task() {
     let out = pw(t.path(), t.path(), &["hook", "Stop", "--anything"]);
     assert!(out.status.success() && out.stdout.is_empty() && out.stderr.is_empty());
 
-    let out = pw(t.path(), t.path(), &["run", "--mode", "swarm", "--", "claude", "-p", "x"]);
+    let out = pw(t.path(), t.path(), &["attach", "s1"]);
     assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("(T4)"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("(T15)"));
 }
 
 #[test]
@@ -100,6 +100,7 @@ fn cli_surface_parses_every_i1_command() {
         "run -c ceiling_usd=3 -c mode=swarm --ceiling 2 --focus approach --focus security -- codex exec",
         "attach s1",
         "pane",
+        "pane --session s1",
         "mcp",
         "install all",
         "uninstall pi",
