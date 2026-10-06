@@ -180,7 +180,7 @@ V99|`report --export`: aggregate JSON (ratios with n, harness/model/version, Foc
 ## §T
 
 id|status|task|cites
-T1|.|Crate + CLI skeleton (clap), `~/.pair-watcher/` layout 0700, config loader: layers, precedence, repo-direction filter, unknown-key hints, defaults, `config show --origin`, `config hash`; Focus file parser + built-in briefs (`approach`, `correctness`, `security`); tests per key direction|V79,V80,V81,V83,V84,I1,I2,I3,I18,I19,C9
+T1|x|Crate + CLI skeleton (clap), `~/.pair-watcher/` layout 0700, config loader: layers, precedence, repo-direction filter, unknown-key hints, defaults, `config show --origin`, `config hash`; Focus file parser + built-in briefs (`approach`, `correctness`, `security`); tests per key direction|V79,V80,V81,V83,V84,I1,I2,I3,I18,I19,C9
 T2|.|Mailbox + event log: record types (Rust) with schema version, `events.jsonl`, `outbox.jsonl` two-phase claim/ack, append-only session log writer/reader; `pw-hook` shim + `pair-watcher hook <event>` (pure append, fail-silent, env guard)|V28,V58,V93,I4,I5,I20
 T3|.|Transcript tailers: Claude JSONL, Codex rollout + guardian sibling rollout, pi session; cursor (entry id + offset, re-anchor), arrival-time stamping; fixtures from captured transcripts|V10,V56,I6
 T4|.|Launcher `run` per harness: per-session flags, adapters written to `adapters/<v>/`, Codex `app-server hooks/list` → single inline `hooks.state` table; compat table + version probe + canary; Herdr/tmux pane placement; repo Focus approval prompt; supervisor spawn|V56,V57,V60,V61,V82,C3,C10

@@ -2,7 +2,7 @@
 
 ## Project structure and module organization
 
-Pair-watcher is a specification workspace: the v1 build contract plus throwaway prototypes. No production code yet.
+Pair-watcher is a specification workspace: the v1 build contract plus throwaway prototypes, and the Rust crate being built task by task from `SPEC.md` §T (`src/`, `tests/`, built-in Focus briefs in `focus/`).
 
 - `SPEC.md` is the v1 build contract (§G goals, §C constraints, §I interfaces, §V invariants, §T tasks, §B bugs). It wins over every other document.
 - `CONTEXT.md` defines domain vocabulary such as Worker, Watcher, Concern, Challenge, and Escalation.
@@ -26,11 +26,17 @@ node .scratch/pair-watcher/prototypes/15-pane/pane.mjs --dump --variant=B --at=3
 node --check .scratch/pair-watcher/prototypes/15-pane/pane.mjs
 ```
 
-No package manifest, production build command, or automated test suite is configured.
+Rust crate (from §T1 onward):
+
+```sh
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+```
 
 ## Style and naming conventions
 
-Use concise Markdown with descriptive headings and relative links. Follow `CONTEXT.md` terminology rather than introducing synonyms. Keep numbered ticket names descriptive, such as `20-fail-open.md`, and link findings to their ticket. Match the prototype's two-space indentation and ES module syntax. No formatter or linter is configured.
+Use concise Markdown with descriptive headings and relative links. Follow `CONTEXT.md` terminology rather than introducing synonyms. Keep numbered ticket names descriptive, such as `20-fail-open.md`, and link findings to their ticket. Prototypes: two-space indentation, ES modules, no formatter. Rust: `rustfmt.toml` + clippy clean.
 
 ## Testing guidelines
 
