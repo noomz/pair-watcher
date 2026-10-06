@@ -13,6 +13,11 @@ fn ceil(s: &str, n: usize) -> usize {
     (n..=s.len()).find(|&i| s.is_char_boundary(i)).unwrap_or(s.len())
 }
 
+/// The longest prefix of at most `n` bytes.
+pub fn prefix(s: &str, n: usize) -> &str {
+    &s[..floor(s, n)]
+}
+
 /// At most `max` bytes; a cut ends in `…`.
 pub fn head(s: &str, max: usize) -> String {
     if s.len() <= max {

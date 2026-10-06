@@ -108,3 +108,40 @@ fn binary_has_no_counts() {
     let diff = f.store.diff(&a, &b).unwrap();
     assert_eq!((diff[0].added, diff[0].removed), (None, None));
 }
+
+/// V5: the Worker's `.git/info/exclude` and repo-local `core.excludesFile` keep files out of
+/// snapshots (so out of the wake diff sent to the model provider), edits applying next snapshot.
+#[test]
+fn worker_excludes_apply() {
+    let f = fixture();
+    let a = f.store.take().unwrap();
+    fs::write(f.root.join(".git/info/exclude"), ".env\n").unwrap();
+    fs::write(f.root.join(".env"), "SECRET=1\n").unwrap();
+    fs::write(f.root.join("local.key"), "k\n").unwrap();
+    fs::write(f.root.join(".git/my-excludes"), "*.key\n").unwrap();
+    git(&f.root, &["config", "core.excludesFile", ".git/my-excludes"]);
+    fs::write(f.root.join("kept.txt"), "k\n").unwrap();
+    let b = f.store.take().unwrap();
+    let paths: Vec<String> = f.store.diff(&a, &b).unwrap().into_iter().map(|d| d.path).collect();
+    assert_eq!(paths, ["kept.txt"]);
+
+    fs::write(f.root.join(".git/info/exclude"), "").unwrap();
+    let c = f.store.take().unwrap();
+    let paths: Vec<String> = f.store.diff(&b, &c).unwrap().into_iter().map(|d| d.path).collect();
+    assert_eq!(paths, [".env"], "exclude edit applies from the next snapshot");
+}
+
+/// A path git must quote in the patch header loses only its own hunks.
+#[test]
+fn quoted_path_keeps_other_patches() {
+    let f = fixture();
+    let a = f.store.take().unwrap();
+    fs::write(f.root.join("plain b.txt"), "x\n").unwrap();
+    fs::write(f.root.join("q\"uote.txt"), "y\n").unwrap();
+    fs::write(f.root.join("z.txt"), "z\n").unwrap();
+    let b = f.store.take().unwrap();
+    let diff = f.store.diff(&a, &b).unwrap();
+    let with_patch: Vec<&str> = diff.iter().filter(|d| !d.patch.is_empty()).map(|d| d.path.as_str()).collect();
+    assert_eq!(diff.len(), 3);
+    assert_eq!(with_patch, ["plain b.txt", "z.txt"]);
+}

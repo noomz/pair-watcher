@@ -408,3 +408,42 @@ fn stateless_rebuild() {
     assert_eq!(a, b);
     assert_eq!(ha, hb);
 }
+
+/// V7: ≤4 prompts at the 1.5 KB item cap still fit the 6 K Task cap.
+#[test]
+fn task_cap_holds_with_few_items() {
+    let prompts: Vec<Item> = (0..4).map(|i| Item::Prompt(format!("{i}{}", "x".repeat(3000)))).collect();
+    let instructions = ["AGENTS.md".to_owned(), "CLAUDE.md".to_owned()];
+    let (input, _) = wake::normal(
+        Trigger::TurnEnd,
+        &History::default(),
+        &[entry(prompts)],
+        None,
+        &ctx(&[], None, "", &instructions),
+    );
+    let task = input.section("Task").unwrap();
+    assert!(task.len() <= 6 * 1024, "{}", task.len());
+}
+
+/// V7: `[N more hunks]` lines and a long last stat line stay inside the 10 K Diff cap.
+#[test]
+fn diff_cap_holds_with_partial_files() {
+    let wake_files: Vec<FileDiff> = (0..40).map(|i| patch(&format!("f{i}"), 3, 25)).collect();
+    let mut session: Vec<FileDiff> = (0..60).map(|i| patch(&format!("s{i}"), 0, 0)).collect();
+    session.push(patch(&"long/".repeat(500), 0, 0));
+    let items: Vec<Item> = (0..40)
+        .flat_map(|i| call(&i.to_string(), "Edit", &format!("{{\"file_path\":\"f{i}\"}}"), "ok", false))
+        .collect();
+    let (input, _) = wake::normal(
+        Trigger::TurnEnd,
+        &History::default(),
+        &[entry(items)],
+        Some(&Diff { wake: &wake_files, session: &session }),
+        &ctx(&[], None, "", &[]),
+    );
+    let diff = input.section("Diff").unwrap();
+    assert!(diff.contains("more hunks]") || diff.contains("Other changes:"));
+    assert!(diff.len() <= 10 * 1024, "{}", diff.len());
+    let session_part = &diff[diff.find("Session since start").unwrap()..];
+    assert!(session_part.len() <= 2048 && !session_part.contains("long/long/"), "{}", session_part.len());
+}

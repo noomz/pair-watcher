@@ -1,7 +1,9 @@
 //! Tree snapshots of the Worker's work tree, untracked files included, ignored ones not (V5).
 //! The store is a bare repo in the mailbox with its own index; it borrows the Worker's objects
 //! read-only through `alternates`, so new blobs land only in the store and the Worker repo,
-//! `.git` included, is never written (C2).
+//! `.git` included, is never written (C2). The Worker's own excludes (`.git/info/exclude`,
+//! repo-local `core.excludesFile`) apply as they do for the Worker: an excluded file never
+//! reaches a snapshot or the wake input sent to the model provider (V5).
 
 use std::fs::{self, DirBuilder};
 use std::io;
@@ -26,6 +28,8 @@ pub struct Store {
     git_dir: PathBuf,
     index: PathBuf,
     root: PathBuf,
+    /// The Worker's git common dir (objects, `info/exclude`).
+    common: PathBuf,
 }
 
 /// One changed file between two trees.
@@ -43,24 +47,38 @@ impl Store {
     /// Opens `<mailbox>/snapshots.git`, creating it on first use.
     pub fn open(mailbox: &Path, repo: &Repo) -> io::Result<Store> {
         let git_dir = mailbox.join("snapshots.git");
-        let store = Store { index: mailbox.join("snapshots.index"), root: repo.root.clone(), git_dir };
-        if !store.git_dir.join("HEAD").is_file() {
-            DirBuilder::new().recursive(true).mode(0o700).create(&store.git_dir)?;
-            git(Command::new("git").args(["init", "--quiet", "--bare"]).arg(&store.git_dir))?;
+        if !git_dir.join("HEAD").is_file() {
+            DirBuilder::new().recursive(true).mode(0o700).create(&git_dir)?;
+            git(Command::new("git").args(["init", "--quiet", "--bare"]).arg(&git_dir))?;
         }
-        let objects = git(Command::new("git").arg("-C").arg(&repo.root).args([
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-common-dir",
-        ]))?;
-        let alternates = store.git_dir.join("objects/info/alternates");
-        fs::write(&alternates, format!("{}\n", Path::new(objects.trim()).join("objects").display()))?;
-        Ok(store)
+        let common = git(worker(&repo.root).args(["rev-parse", "--path-format=absolute", "--git-common-dir"]))?;
+        let common = PathBuf::from(common.trim());
+        fs::write(git_dir.join("objects/info/alternates"), format!("{}\n", common.join("objects").display()))?;
+        Ok(Store { index: mailbox.join("snapshots.index"), root: repo.root.clone(), git_dir, common })
     }
 
-    /// Snapshots the work tree; returns the tree id.
+    /// Snapshots the work tree; returns the tree id. Excludes are re-read each time, so an edit
+    /// mid-session applies from the next snapshot.
     pub fn take(&self) -> io::Result<String> {
-        git(self.cmd(true).args(["add", "--all"]))?;
+        let exclude = self.git_dir.join("info/exclude");
+        match fs::read(self.common.join("info/exclude")) {
+            Ok(bytes) => {
+                DirBuilder::new().recursive(true).mode(0o700).create(self.git_dir.join("info"))?;
+                fs::write(&exclude, bytes)?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let _ = fs::remove_file(&exclude);
+            }
+            Err(e) => return Err(e),
+        }
+        let mut add = self.cmd(true);
+        // Repo-local setting only: the global one already applies to the store as is.
+        if let Ok(file) =
+            git(worker(&self.root).args(["config", "--local", "--type=path", "--get", "core.excludesFile"]))
+        {
+            add.arg("-c").arg(format!("core.excludesFile={}", self.root.join(file.trim()).display()));
+        }
+        git(add.args(["add", "--all"]))?;
         Ok(git(self.cmd(true).arg("write-tree"))?.trim().to_owned())
     }
 
@@ -94,10 +112,13 @@ impl Store {
             from,
             to,
         ]))?;
+        // Without rename detection both header paths are the file's; a path git must quote has
+        // no match and stays stat-only, never costing the other files their hunks.
         let patches = split_patches(&patch);
-        if patches.len() == files.len() {
-            for (file, patch) in files.iter_mut().zip(patches) {
-                file.patch = patch.to_owned();
+        for file in &mut files {
+            let header = format!("diff --git a/{0} b/{0}\n", file.path);
+            if let Some(p) = patches.iter().find(|p| p.starts_with(&header)) {
+                file.patch = (*p).to_owned();
             }
         }
         Ok(files)
@@ -115,6 +136,16 @@ impl Store {
         cmd.args(["-c", "core.quotePath=false", "-c", "core.fsmonitor=false"]);
         cmd
     }
+}
+
+/// Read-only git in the Worker repo.
+fn worker(root: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    for var in GIT_ENV {
+        cmd.env_remove(var);
+    }
+    cmd.arg("-C").arg(root);
+    cmd
 }
 
 /// Patch text split at each `diff --git` header, in git's file order.

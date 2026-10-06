@@ -131,9 +131,14 @@ pub enum Outcome {
     Error,
 }
 
+/// Tools whose result carries a process exit status: Claude `Bash`, Codex `exec` (and older
+/// `exec_command`/`shell`/`local_shell`), pi `bash`. Other results may be file content.
+const SHELL_TOOLS: [&str; 6] = ["Bash", "bash", "exec", "exec_command", "shell", "local_shell"];
+
 impl Outcome {
-    pub fn of(output: &str, error: bool) -> Outcome {
-        match exit_code(output) {
+    pub fn of(tool: &str, output: &str, error: bool) -> Outcome {
+        let exit = if SHELL_TOOLS.contains(&tool) { exit_code(output) } else { None };
+        match exit {
             Some(n) if n != 0 => Outcome::Exit(n),
             _ if error => Outcome::Error,
             _ => Outcome::Ok,
@@ -158,7 +163,7 @@ impl fmt::Display for Outcome {
 /// Exit status as harnesses print it near the start of a result (Codex `exit_code`/`Exit code:`,
 /// Claude `Exit code N`); later text may be file content, so only the head is searched.
 pub fn exit_code(output: &str) -> Option<i64> {
-    let head = output[..output.len().min(400)].to_ascii_lowercase();
+    let head = clip::prefix(output, 400).to_ascii_lowercase();
     ["\"exit_code\":", "exit code:", "exit code", "exited with code"].iter().find_map(|needle| {
         let at = head.find(needle)? + needle.len();
         let num = head[at..].trim_start();

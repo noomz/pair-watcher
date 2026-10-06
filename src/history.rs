@@ -81,7 +81,7 @@ impl History {
                 Item::ToolResult { id, output, error } => {
                     let call = next.open.as_mut().and_then(|t| t.actions.iter_mut().rev().find(|a| a.id == *id));
                     if let Some(call) = call {
-                        call.outcome = Some(Outcome::of(output, *error));
+                        call.outcome = Some(Outcome::of(&call.tool, output, *error));
                         if call.tool == ASK_TOOL {
                             next.ask(true, output);
                         }

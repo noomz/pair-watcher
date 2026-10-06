@@ -207,3 +207,4 @@ T23|.|Packaging: `dist` release binaries macOS/Linux, shell installer, Homebrew 
 ## §B
 
 id|date|cause|fix
+B1|2026-10-06|snapshot store `git add --all` under store `--git-dir` read store excludes, not Worker's: `.git/info/exclude` + repo-local `core.excludesFile` skipped → Worker-excluded files (`.env`) in snapshots + wake Diff to provider|V5

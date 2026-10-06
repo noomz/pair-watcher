@@ -56,9 +56,9 @@ fn outcome_reads_exit_status() {
     assert_eq!(exit_code("Exit code 101\nerror[E0308]"), Some(101));
     assert_eq!(exit_code("Process exited with code -1"), Some(-1));
     assert_eq!(exit_code(&format!("{}exit code 3", "x".repeat(500))), None, "head only");
-    assert_eq!(Outcome::of("Exit code 1\nboom", true), Outcome::Exit(1));
-    assert_eq!(Outcome::of("Access blocked", true), Outcome::Error);
-    assert_eq!(Outcome::of("fine", false), Outcome::Ok);
+    assert_eq!(Outcome::of("Bash", "Exit code 1\nboom", true), Outcome::Exit(1));
+    assert_eq!(Outcome::of("bash", "Access blocked", true), Outcome::Error);
+    assert_eq!(Outcome::of("Bash", "fine", false), Outcome::Ok);
     assert_eq!(error_line("ok\nerror[E0308]: mismatched types\n").as_deref(), Some("error[E0308]: mismatched types"));
 }
 
@@ -148,4 +148,30 @@ fn ingest_is_pure() {
     let before = h.clone();
     let _ = h.ingest(&[turn("b", bash("2", "ls", "x", false))]);
     assert_eq!(h, before);
+}
+
+/// A multibyte character across the 400-byte search window never panics.
+#[test]
+fn exit_code_survives_multibyte_at_cut() {
+    let out = format!("{}→ exit code 3", "x".repeat(399));
+    assert!(!out.is_char_boundary(400));
+    assert_eq!(exit_code(&out), None);
+    assert_eq!(Outcome::of("Bash", &out, false), Outcome::Ok);
+}
+
+/// Only shell results carry an exit status; file content that mentions one does not fail.
+#[test]
+fn exit_status_only_from_shell_tools() {
+    let log = r#"{"job": "ci", "exit_code": 2}"#;
+    assert_eq!(Outcome::of("Read", log, false), Outcome::Ok);
+    assert_eq!(Outcome::of("Grep", "Exit code 1", false), Outcome::Ok);
+    assert_eq!(Outcome::of("exec", log, false), Outcome::Exit(2));
+    let h = History::default().ingest(&[turn(
+        "read the log",
+        vec![
+            Item::ToolCall { id: "r".into(), name: "Read".into(), input: r#"{"file_path":"ci.json"}"#.into() },
+            Item::ToolResult { id: "r".into(), output: log.into(), error: false },
+        ],
+    )]);
+    assert_eq!(h.digest(4096), "T1 \"read the log\" · Read ci.json → ok");
 }

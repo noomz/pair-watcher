@@ -35,6 +35,8 @@ const BODY_HEAD: usize = 600;
 const BODY_TAIL: usize = 400;
 const INPUT_LINE: usize = 200;
 const TEXT_MIN: usize = 120;
+/// Room kept for a `[N more hunks]` / `[N more files]` line.
+const MORE_LINE: usize = 24;
 
 /// Repo instruction files, listed by path for the Watcher to read on demand (V6).
 const INSTRUCTION_FILES: [&str; 5] =
@@ -194,7 +196,7 @@ fn task_section(history: &History, instructions: &[String]) -> String {
     }
     let total: usize = items.iter().map(|i| i.len() + 1).sum();
     if out.len() + total <= TASK_CAP || items.len() <= 4 {
-        return out + &items.join("\n");
+        return clip::head(&(out + &items.join("\n")), TASK_CAP);
     }
     let (first, rest) = items.split_first().expect("more than 4 items");
     let (middle, latest) = rest.split_at(rest.len() - 3);
@@ -295,7 +297,8 @@ fn diff_section(diff: Option<&Diff>, touched: &dyn Fn(&str) -> bool) -> (String,
             let header = format!("=== {}\n", stat_line(f));
             let mut shown = 0;
             for h in &hunks {
-                let need = h.len() + if shown == 0 { header.len() } else { 0 };
+                // Room for a `[N more hunks]` line after it.
+                let need = h.len() + if shown == 0 { header.len() } else { 0 } + MORE_LINE;
                 if out.len() + need > budget {
                     break;
                 }
@@ -337,8 +340,12 @@ fn stat_lines(files: &[&FileDiff], room: usize) -> String {
     let mut out = String::new();
     for (i, f) in files.iter().enumerate() {
         let line = stat_line(f) + "\n";
-        if out.len() + line.len() + 24 > room && i + 1 < files.len() {
-            out.push_str(&format!("[{} more files]\n", files.len() - i));
+        let reserve = if i + 1 < files.len() { MORE_LINE } else { 0 };
+        if out.len() + line.len() + reserve > room {
+            let more = format!("[{} more files]\n", files.len() - i);
+            if out.len() + more.len() <= room {
+                out.push_str(&more);
+            }
             break;
         }
         out.push_str(&line);
@@ -418,23 +425,22 @@ fn turn_section(entries: &[Entry], cap: usize) -> String {
                 body: None,
             })),
             Item::ToolResult { id, output, error } => {
-                let outcome = Outcome::of(output, *error);
-                let result =
-                    Some((outcome, output.len(), outcome.failed().then(|| action::error_line(output)).flatten()));
-                let found = segs.iter_mut().rev().find_map(|s| match s {
-                    Seg::Call(c) if c.id == *id => Some(c),
-                    _ => None,
-                });
-                match found {
-                    Some(c) => (c.result, c.output) = (result, Some(output.clone())),
-                    None => segs.push(Seg::Call(Call {
+                let found = segs.iter().rposition(|s| matches!(s, Seg::Call(c) if c.id == *id));
+                let i = found.unwrap_or_else(|| {
+                    segs.push(Seg::Call(Call {
                         tool: "(earlier call)".into(),
                         id: id.clone(),
                         input: String::new(),
-                        result,
-                        output: Some(output.clone()),
+                        result: None,
+                        output: None,
                         body: None,
-                    })),
+                    }));
+                    segs.len() - 1
+                });
+                if let Seg::Call(c) = &mut segs[i] {
+                    let outcome = Outcome::of(&c.tool, output, *error);
+                    let line = outcome.failed().then(|| action::error_line(output)).flatten();
+                    (c.result, c.output) = (Some((outcome, output.len(), line)), Some(output.clone()));
                 }
             }
             Item::TurnEnd => segs.push(Seg::TurnEnd),
