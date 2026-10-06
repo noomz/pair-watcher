@@ -7,6 +7,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use crate::config::{self, Sources};
 use crate::focus::{self, FocusSource};
 use crate::home::Home;
+use crate::hook;
 use crate::problem::{Problem, tilde};
 use crate::repo;
 
@@ -252,7 +253,10 @@ pub fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         // Hooks never fail the Worker (V58).
-        Command::Hook { .. } => ExitCode::SUCCESS,
+        Command::Hook { event, .. } => {
+            hook::run(&event);
+            ExitCode::SUCCESS
+        }
         Command::Config { action: ConfigAction::Show { origin } } => config_show(origin),
         Command::Run(_) | Command::Attach { .. } | Command::Focus { .. } => later("T4"),
         Command::Pane | Command::Mute { .. } | Command::Nochallenge(_) | Command::Pause(_) => later("T12"),

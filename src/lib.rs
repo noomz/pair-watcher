@@ -1,6 +1,11 @@
 pub mod cli;
 pub mod config;
+pub mod event;
 pub mod focus;
 pub mod home;
+pub mod hook;
+pub mod jsonl;
+pub mod mailbox;
+pub mod outbox;
 pub mod problem;
 pub mod repo;

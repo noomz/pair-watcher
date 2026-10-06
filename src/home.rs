@@ -45,6 +45,15 @@ impl Home {
         self.root.join("focus")
     }
 
+    pub fn sessions_dir(&self) -> PathBuf {
+        self.root.join("sessions")
+    }
+
+    /// The stable command every harness hook runs (V58).
+    pub fn hook_shim(&self) -> PathBuf {
+        self.root.join("bin").join("pw-hook")
+    }
+
     /// User per-repo overrides + tool-written `[approved_focus]`.
     pub fn repo_config(&self, root_commit: &str) -> PathBuf {
         self.root.join("repos").join(format!("{root_commit}.toml"))
