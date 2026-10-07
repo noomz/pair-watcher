@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::io;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::action::{self, SHELL_TOOLS};
 use crate::budget::{Budget, Need};
@@ -112,10 +112,14 @@ fn check(e: &Evidence, s: &Sources) -> Result<(), String> {
                 }
                 _ => false,
             });
-            // Older turns as the digest holds them: one action's signature and its outcome.
+            // Older turns as the digest holds them: the cited command signed the same way (ids,
+            // hashes, temp paths stripped; clipped) must equal one action's signature, and its
+            // outcome the cited output.
             let digested = s.history.actions().any(|(tool, sig, outcome)| {
+                let cited = action::signature(tool, &json!({ "command": cmd }).to_string());
+                let arg = |sig: &str| sig.strip_prefix(tool).map(str::to_owned).unwrap_or_default();
                 SHELL_TOOLS.contains(&tool)
-                    && sig.strip_prefix(tool).is_some_and(|arg| same(arg, &cmd))
+                    && same(&arg(sig), &arg(&cited))
                     && outcome.is_some_and(|o| o.to_string() == out)
             });
             (ran || digested).then_some(()).ok_or_else(fail)
@@ -175,8 +179,24 @@ fn strings(input: &str) -> Vec<String> {
 }
 
 /// The whole command, whitespace aside: a fragment (`cargo`, the tool name) never stands for it.
+/// A shell wrapper (`bash -lc <script>`, as Codex records `shell` calls) counts as its script.
 fn same(a: &str, b: &str) -> bool {
-    a.split_whitespace().eq(b.split_whitespace())
+    let (a, b) = (script(a), script(b));
+    !a.is_empty() && a.split_whitespace().eq(b.split_whitespace())
+}
+
+/// `<sh|bash|zsh> -c|-lc <script>` → `<script>` without surrounding quotes; anything else as is.
+fn script(cmd: &str) -> &str {
+    let mut words = cmd.trim().splitn(3, char::is_whitespace);
+    let (Some(shell), Some(flag), Some(rest)) = (words.next(), words.next(), words.next()) else {
+        return cmd.trim();
+    };
+    let shell = shell.rsplit('/').next().unwrap_or(shell);
+    if !matches!(shell, "sh" | "bash" | "zsh") || !matches!(flag, "-c" | "-lc") {
+        return cmd.trim();
+    }
+    let rest = rest.trim();
+    ['"', '\''].iter().find_map(|q| rest.strip_prefix(*q).and_then(|r| r.strip_suffix(*q))).unwrap_or(rest)
 }
 
 /// Each line trimmed, blank edges dropped: indentation and trailing space are not content.

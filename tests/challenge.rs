@@ -76,6 +76,12 @@ fn fx() -> Fx {
                     input: r#"{"file_path":"notes.md","content":"run cargo test later"}"#.into(),
                 },
                 Item::ToolResult { id: "t2".into(), output: "File created successfully".into(), error: false },
+                Item::ToolCall {
+                    id: "t3".into(),
+                    name: "shell".into(),
+                    input: r#"{"command":["bash","-lc","cargo fmt --check"]}"#.into(),
+                },
+                Item::ToolResult { id: "t3".into(), output: "Diff in src/a.rs at line 3".into(), error: false },
             ],
         },
     ];
@@ -98,6 +104,7 @@ fn older() -> Vec<Entry> {
     first.extend(call("a1", "Bash", r#"{"command":"cargo build"}"#, "Exit code 0"));
     first.extend(call("a2", "Read", r#"{"file_path":"src/retry.rs"}"#, "fn retry() {"));
     first.extend(call("a3", "Bash", r#"{"command":"cargo check"}"#, "Exit code 127"));
+    first.extend(call("a7", "Bash", r#"{"command":"git show abc1234f"}"#, "Exit code 0"));
     first.extend(test("a4"));
     first.push(Item::TurnEnd);
     let turn = |id: &str| [test(id), vec![Item::TurnEnd]].concat();
@@ -227,6 +234,10 @@ fn evidence_verified_verbatim() {
             command("cargo test --all", "1 failed"),
             command("cargo build", "ok"),
             command("cargo test", "exit 1"),
+            command("git show abc1234f", "ok"),
+            command("git show <hash>", "ok"),
+            command("cargo fmt --check", "Diff in src/a.rs"),
+            command("bash -lc \"cargo fmt --check\"", "Diff in src/a.rs"),
             Evidence::Transcript { excerpt: "keep polling until the review passes".into() },
             Evidence::Transcript { excerpt: "run cargo test later".into() },
             Evidence::Hint { excerpt: HINT.into() },
@@ -263,6 +274,8 @@ fn evidence_rejected() {
             command("&&", "ok"),
             command("Bash", "ok"),
             command("cargo", "1 failed"),
+            command("git show", "ok"),
+            command("cargo fmt", "Diff in src/a.rs"),
             Evidence::Transcript { excerpt: "retry storms the API".into() },
             Evidence::Transcript { excerpt: "I give up".into() },
             Evidence::Hint { excerpt: "seen 3×".into() },
@@ -287,6 +300,8 @@ fn evidence_rejected() {
             "command \"&&\": no such call with that output",
             "command \"Bash\": no such call with that output",
             "command \"cargo\": no such call with that output",
+            "command \"git show\": no such call with that output",
+            "command \"cargo fmt\": no such call with that output",
             "transcript \"retry storms the API\": not found",
             "transcript \"I give up\": not found",
             "hint \"seen 3×\": not in this wake's history",
