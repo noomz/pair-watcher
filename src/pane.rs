@@ -1,0 +1,824 @@
+//! The standalone pane (V63–V70, I17): a fold over the session event log (V93) plus the live
+//! pending line from the outbox, drawn by the pure [`crate::layout`]. The pane writes only human
+//! facts and `shown` (V43, V69).
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::{self, IsTerminal, Write};
+use std::time::{Duration, Instant};
+
+use crate::budget::{self, Budget, Stage};
+use crate::challenge::{Challenges, Op as ChallengeOp, Origin};
+use crate::concern::{Change, ConcernList, Resolution, State, Tag};
+use crate::debate::{Debate, Op as DebateOp, Outcome as DebateOutcome, Second, Verdict};
+use crate::delivery::{self, Pending};
+use crate::escalation::{self, Escalations, Op as EscalationOp, Stage as EscalationStage};
+use crate::event::{Event, Kind};
+use crate::human::{self, Act};
+use crate::jsonl::Record;
+use crate::layout::{Frame, Input, Overlay, Ui, layout};
+use crate::mailbox::Mailbox;
+use crate::status::{Coverage, Op as StatusOp, Outcome, Wake, WatcherOp};
+use crate::term::{self, Key};
+
+/// Ticker lines kept; the Board shows the last 2 (V63).
+const TICKER_KEEP: usize = 50;
+
+/// One Debate log entry under its Concern: time · event · reason (V63).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Entry {
+    pub t: u64,
+    pub event: String,
+    pub reason: String,
+}
+
+/// What the pane knows of one Concern beyond the Concern list.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Info {
+    pub added: u64,
+    /// Debate log, all Challenges on it, oldest first.
+    pub entries: Vec<Entry>,
+    /// How it closed, for its CLOSED row.
+    pub end: Option<String>,
+    pub helpful: bool,
+}
+
+/// How a ticker line is coloured: red only for refusals (V64), magenta for diagnostics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tone {
+    Plain,
+    Diag,
+    Refusal,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Tick {
+    pub t: u64,
+    pub text: String,
+    pub tone: Tone,
+}
+
+/// One Stream overlay line (V68).
+#[derive(Clone, Debug, PartialEq)]
+pub struct StreamLine {
+    pub t: u64,
+    pub focus: Option<String>,
+    /// A Debate turn, indented under its Concern.
+    pub indent: bool,
+    pub sym: char,
+    pub text: String,
+}
+
+/// One wake strip cell (V63).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Cell {
+    /// Wake number; `None` = a lost span.
+    pub n: Option<u64>,
+    pub glyph: char,
+}
+
+/// Strip glyphs by precedence when Watchers of one wake differ.
+const GLYPHS: [char; 6] = ['▲', '✗', '■', '↻', '·', '░'];
+
+/// Everything the Board draws, folded from the log.
+#[derive(Clone, Debug)]
+pub struct Board {
+    /// Local time offset, seconds east of UTC, for `HH:MM`.
+    pub tz: i64,
+    pub started: Option<u64>,
+    pub swarm: bool,
+    pub focuses: Vec<String>,
+    pub observe_only: bool,
+    pub ended: bool,
+    /// Standing rulings loaded at start (V78; T14 logs the count).
+    pub rulings: usize,
+    pub budget: Budget,
+    pub concerns: ConcernList,
+    pub challenges: Challenges,
+    pub debate: Debate,
+    pub escalations: Escalations,
+    pub info: HashMap<String, Info>,
+    /// When each Escalation was raised.
+    pub raised: HashMap<String, u64>,
+    /// Escalations closed by a ruling, an answer, staleness or session end (T13 events).
+    pub closed_escalations: HashSet<String>,
+    /// Model per Watcher, with its notes.
+    pub models: BTreeMap<String, (String, bool, bool)>,
+    pub user_paused: bool,
+    /// Lagging / BLIND per Focus; key `None` = every Watcher.
+    pub lagging: BTreeMap<Option<String>, u64>,
+    pub blind: BTreeMap<Option<String>, (u64, String)>,
+    pub fallback: Option<String>,
+    pub nochallenge: bool,
+    pub muted: Vec<String>,
+    pub lost_ms: u64,
+    pub cells: Vec<Cell>,
+    /// Latest wake: time, outcome word, wake number.
+    pub last_wake: Option<(u64, &'static str, u64)>,
+    /// When the Watcher last spoke (Concern or Escalation).
+    pub last_spoke: Option<u64>,
+    pub ticker: Vec<Tick>,
+    pub stream: Vec<StreamLine>,
+    pub shown: HashSet<String>,
+    /// The item waiting for delivery, read live from the outbox (V26, V65).
+    pub pending: Option<Pending>,
+    /// Challenge id → Concern id.
+    challenged: HashMap<String, String>,
+}
+
+impl Board {
+    pub fn new(tz: i64) -> Board {
+        Board {
+            tz,
+            started: None,
+            swarm: false,
+            focuses: Vec::new(),
+            observe_only: false,
+            ended: false,
+            rulings: 0,
+            budget: Budget::new(budget::RAISE_USD),
+            concerns: ConcernList::default(),
+            challenges: Challenges::default(),
+            debate: Debate::default(),
+            escalations: Escalations::default(),
+            info: HashMap::new(),
+            raised: HashMap::new(),
+            closed_escalations: HashSet::new(),
+            models: BTreeMap::new(),
+            user_paused: false,
+            lagging: BTreeMap::new(),
+            blind: BTreeMap::new(),
+            fallback: None,
+            nochallenge: false,
+            muted: Vec::new(),
+            lost_ms: 0,
+            cells: Vec::new(),
+            last_wake: None,
+            last_spoke: None,
+            ticker: Vec::new(),
+            stream: Vec::new(),
+            shown: HashSet::new(),
+            pending: None,
+            challenged: HashMap::new(),
+        }
+    }
+
+    pub fn rebuild<'a>(tz: i64, records: impl IntoIterator<Item = &'a Record<Event>>) -> Board {
+        let mut b = Board::new(tz);
+        for r in records {
+            b.apply(r);
+        }
+        b
+    }
+
+    pub fn time(&self, t: u64) -> String {
+        hhmm(t, self.tz)
+    }
+
+    /// The Escalations still waiting on the human (NEEDS YOU), oldest first.
+    pub fn needs_you(&self) -> impl Iterator<Item = &escalation::Escalation> {
+        self.escalations
+            .all()
+            .iter()
+            .filter(|e| e.stage != EscalationStage::Dropped && !self.closed_escalations.contains(&e.id))
+    }
+
+    /// The Concern holding the Challenge slot (IN DEBATE).
+    pub fn in_debate(&self) -> Option<&str> {
+        self.challenges.slot().filter(|s| !s.stale || s.sent).map(|s| s.concern.as_str())
+    }
+
+    pub fn apply(&mut self, r: &Record<Event>) {
+        let (t, e) = (r.t, &r.body);
+        let stage = self.budget.stage();
+        self.concerns.apply(e);
+        self.challenges.apply(e);
+        self.debate.apply(e);
+        self.escalations.apply(e);
+        match e.k {
+            Kind::Session => self.session(t, e),
+            Kind::Concern => self.concern(t, e),
+            Kind::Human => self.human(t, e),
+            Kind::Shown => {
+                if let Some(id) = e.str("id") {
+                    self.shown.insert(id.to_owned());
+                }
+            }
+            Kind::Challenge => self.challenge(t, e),
+            Kind::Debate => self.debate_op(t, e),
+            Kind::Escalation => self.escalation(t, e),
+            Kind::Ruled | Kind::Answered | Kind::ClosedStale | Kind::Unruled => {
+                if let Some(id) = e.str("id") {
+                    self.closed_escalations.insert(id.to_owned());
+                }
+            }
+            Kind::Wake => self.wake(t, e),
+            Kind::Status => self.status(t, e),
+            Kind::Coverage => self.coverage(t, e),
+            Kind::Watcher => self.watcher(t, e),
+            Kind::Ruling | Kind::Audit => {}
+        }
+        let now = self.budget.stage();
+        if now != stage {
+            let text = match now {
+                Stage::Watching => "budget: watching again".to_owned(),
+                Stage::Thinned => "budget 60%: checkpoints off".to_owned(),
+                Stage::Collapsed => "budget 75%: Swarm runs as one Companion".to_owned(),
+                Stage::Reserve => "budget 90%: normal wakes stop; reserve only".to_owned(),
+                Stage::Paused => {
+                    format!("paused {}/{}: no model calls", money(&self.budget, true), money(&self.budget, false))
+                }
+            };
+            self.tick(t, text, Tone::Plain);
+        }
+    }
+
+    fn tick(&mut self, t: u64, text: String, tone: Tone) {
+        self.ticker.push(Tick { t, text, tone });
+        if self.ticker.len() > TICKER_KEEP {
+            self.ticker.remove(0);
+        }
+    }
+
+    fn stream(&mut self, t: u64, focus: Option<&str>, indent: bool, sym: char, text: String) {
+        self.stream.push(StreamLine { t, focus: focus.map(str::to_owned), indent, sym, text });
+    }
+
+    fn focus_of(&self, concern: &str) -> Option<String> {
+        self.concerns.get(concern).map(|c| c.focus.clone())
+    }
+
+    /// A Debate entry under the Concern a Challenge is on; also a Stream line.
+    fn entry(&mut self, t: u64, challenge: &str, event: String, reason: String) {
+        let Some(concern) = self.challenged.get(challenge).cloned() else { return };
+        let focus = self.focus_of(&concern);
+        let text = if reason.is_empty() { event.clone() } else { format!("{event} — {reason}") };
+        self.stream(t, focus.as_deref(), true, '│', text);
+        self.info.entry(concern).or_default().entries.push(Entry { t, event, reason });
+    }
+
+    fn end(&mut self, id: &str, end: String) {
+        let info = self.info.entry(id.to_owned()).or_default();
+        if info.end.is_none() {
+            info.end = Some(end);
+        }
+    }
+
+    fn session(&mut self, t: u64, e: &Event) {
+        match e.str("phase") {
+            Some("start") => {
+                self.started = Some(t);
+                self.swarm = e.str("mode") == Some("swarm");
+                self.focuses = strings(e.fields.get("focuses"));
+                self.observe_only = e.fields.get("observe_only").and_then(|v| v.as_bool()).unwrap_or(false);
+                self.rulings = e.fields.get("rulings").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let ceiling = e.fields.get("ceiling_usd").and_then(|v| v.as_f64()).unwrap_or(budget::RAISE_USD);
+                self.budget = Budget::new(ceiling);
+                for note in strings(e.fields.get("notes")) {
+                    self.tick(t, note, Tone::Plain);
+                }
+            }
+            Some("end") => {
+                self.ended = true;
+                let open = self.concerns.all().iter().filter(|c| c.state == State::Open).count();
+                self.tick(t, format!("session ended; {open} open Concerns closed"), Tone::Plain);
+            }
+            _ => {}
+        }
+    }
+
+    fn concern(&mut self, t: u64, e: &Event) {
+        match e.parse::<Change>() {
+            Some(Change::Add { concern: c, .. }) => {
+                self.last_spoke = Some(t);
+                self.info.entry(c.id.clone()).or_default().added = t;
+                let text = format!("{} {} [{}] {}", c.id, c.severity.name(), c.focus, c.headline);
+                self.stream(t, Some(&c.focus), false, '+', text);
+            }
+            Some(Change::Update { concern: c, .. }) => {
+                self.last_spoke = Some(t);
+                let text = format!("{} {} [{}] {}", c.id, c.severity.name(), c.focus, c.headline);
+                self.stream(t, Some(&c.focus), false, '↑', text);
+            }
+            Some(Change::Resolve { id, reason, .. }) => {
+                let why = match reason {
+                    Resolution::Fixed => "fixed",
+                    Resolution::NoLongerApplies => "no longer applies",
+                };
+                self.end(&id, format!("resolved: {why}"));
+                let focus = self.focus_of(&id);
+                self.stream(t, focus.as_deref(), false, '✓', format!("{id} resolved: {why}"));
+            }
+            Some(Change::Duplicate { id, of, .. }) => {
+                self.end(&id, format!("resolved: duplicate of {of}"));
+                let focus = self.focus_of(&id);
+                self.stream(t, focus.as_deref(), false, '✓', format!("{id} duplicate of {of}"));
+            }
+            Some(Change::Unverifiable { id, .. }) => {
+                self.tick(t, format!("{id} challenge-ready, evidence unverifiable: stays a Concern"), Tone::Diag);
+            }
+            Some(Change::Trimmed { .. }) | None => {}
+        }
+    }
+
+    fn human(&mut self, t: u64, e: &Event) {
+        match e.parse::<Act>() {
+            Some(Act::Dismiss { id }) => {
+                self.end(&id, "dismissed".to_owned());
+                let focus = self.focus_of(&id);
+                self.stream(t, focus.as_deref(), false, '✗', format!("{id} dismissed by you (final)"));
+                self.tick(t, format!("{id} dismissed"), Tone::Plain);
+            }
+            Some(Act::Promote { id, remark }) => {
+                let focus = self.focus_of(&id);
+                let remark = remark.map(|r| format!(" + \"{r}\"")).unwrap_or_default();
+                self.stream(t, focus.as_deref(), false, '⇡', format!("{id} promoted by you{remark}"));
+                self.tick(t, format!("{id} promoted{remark}"), Tone::Plain);
+            }
+            Some(Act::Helpful { id }) => {
+                self.info.entry(id).or_default().helpful = true;
+            }
+            Some(Act::Mute { focus }) => {
+                if !self.muted.contains(&focus) {
+                    self.muted.push(focus.clone());
+                }
+                self.tick(t, format!("muted: {focus} (this session)"), Tone::Plain);
+            }
+            Some(Act::Nochallenge) => {
+                self.nochallenge = true;
+                self.tick(t, "no auto-Challenge (this session)".to_owned(), Tone::Plain);
+            }
+            None => {}
+        }
+    }
+
+    fn challenge(&mut self, t: u64, e: &Event) {
+        match e.parse::<ChallengeOp>() {
+            Some(ChallengeOp::Queued { id, concern, origin, remark, .. }) => {
+                self.challenged.insert(id.clone(), concern);
+                let reason = match (origin, remark) {
+                    (Origin::Auto, _) => "approach-level · evidence ✓".to_owned(),
+                    (Origin::Promoted, Some(r)) => format!("promoted · \"{r}\""),
+                    (Origin::Promoted, None) => "promoted".to_owned(),
+                };
+                self.entry(t, &id, "Challenge queued".to_owned(), reason);
+            }
+            Some(ChallengeOp::Sent { id, route }) => self.entry(t, &id, "1/2 sent".to_owned(), format!("via {route}")),
+            Some(ChallengeOp::StaleDropped { id, concern }) => {
+                self.entry(t, &id, "dropped stale".to_owned(), format!("{concern} changed before delivery"));
+                self.tick(t, format!("Challenge {id} dropped: {concern} changed before delivery"), Tone::Plain);
+            }
+            Some(ChallengeOp::PromotionRefused { concern, reason }) => {
+                self.tick(t, format!("promote {concern} refused: {reason}"), Tone::Refusal);
+            }
+            None => {}
+        }
+    }
+
+    fn debate_op(&mut self, t: u64, e: &Event) {
+        let Some(op) = e.parse::<DebateOp>() else { return };
+        match op {
+            DebateOp::Exchange { challenge, verdict, reason, .. } => {
+                let (event, reason) = match verdict {
+                    Verdict::Concede => ("Worker concede", reason.unwrap_or_default()),
+                    Verdict::Defend => ("Worker defend", reason.unwrap_or_default()),
+                    Verdict::None => ("Worker: no answer", "no verdict line".to_owned()),
+                };
+                self.entry(t, &challenge, event.to_owned(), reason);
+            }
+            DebateOp::HumanTurn { challenge, entry, .. } if !entry.is_empty() => {
+                self.entry(t, &challenge, "human turn".to_owned(), "evidence only".to_owned());
+            }
+            DebateOp::Decision { challenge, decision, text, defaulted, .. } => {
+                let name = serde_json::to_value(decision).ok().and_then(|v| v.as_str().map(str::to_owned));
+                let text = if defaulted { format!("defaulted: {text}") } else { text };
+                self.entry(t, &challenge, format!("Watcher {}", name.unwrap_or_default()), text);
+            }
+            DebateOp::Queued { challenge, second, .. } => {
+                let event = match second {
+                    Second::Rebuttal => "Rebuttal queued",
+                    Second::Reask => "Re-ask queued",
+                };
+                self.entry(t, &challenge, event.to_owned(), String::new());
+            }
+            DebateOp::Sent { challenge, route, .. } => {
+                self.entry(t, &challenge, "2/2 sent".to_owned(), format!("via {route}"));
+            }
+            DebateOp::End { challenge, concern, outcome, escalated, withdrawn } => {
+                let words = |v: serde_json::Value| v.as_str().unwrap_or_default().replace('-', " ");
+                let outcome_words = words(serde_json::to_value(outcome).unwrap_or_default());
+                let reason = match (outcome, escalated, withdrawn) {
+                    (DebateOutcome::Unresolved, Some(true), _) => "unresolved → Escalation".to_owned(),
+                    (DebateOutcome::Unresolved, _, _) => "unresolved, not escalated".to_owned(),
+                    (DebateOutcome::Withdrawn, _, Some(w)) => {
+                        format!("withdrawn — {}", words(serde_json::to_value(w).unwrap_or_default()))
+                    }
+                    _ => outcome_words,
+                };
+                self.entry(t, &challenge, "ended".to_owned(), reason.clone());
+                if outcome == DebateOutcome::Unresolved && escalated != Some(true) {
+                    self.tick(t, format!("Challenge {challenge}: unresolved, not escalated"), Tone::Plain);
+                } else {
+                    self.tick(t, format!("{concern} Debate ended: {reason}"), Tone::Plain);
+                }
+                if outcome == DebateOutcome::Withdrawn {
+                    self.end(&concern, "withdrawn".to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn escalation(&mut self, t: u64, e: &Event) {
+        match e.parse::<EscalationOp>() {
+            Some(EscalationOp::Raised { id, title, .. }) => {
+                self.last_spoke = Some(t);
+                self.raised.insert(id.clone(), t);
+                self.stream(t, None, false, '▲', format!("{id} {title}"));
+            }
+            Some(EscalationOp::Notified { id, error: Some(error), .. }) => {
+                self.tick(t, format!("{id} notification failed: {error}"), Tone::Diag);
+            }
+            Some(EscalationOp::DroppedStale { id, why }) => {
+                self.stream(t, None, false, '■', format!("{id} Escalation dropped: {why}"));
+                self.tick(t, format!("{id} Escalation dropped: {why}"), Tone::Plain);
+            }
+            _ => {}
+        }
+    }
+
+    fn wake(&mut self, t: u64, e: &Event) {
+        let Some(w) = e.parse::<Wake>() else { return };
+        self.budget.record(w.spend);
+        let (glyph, word) = match w.outcome {
+            Outcome::Escalation => ('▲', "escalation"),
+            Outcome::Failed | Outcome::Invalid | Outcome::Interrupted => ('✗', "failed"),
+            Outcome::Concern | Outcome::Challenge => ('■', "concern"),
+            Outcome::Silent if w.replayed => ('↻', "replayed"),
+            Outcome::Silent => ('·', "silent"),
+        };
+        if matches!(w.outcome, Outcome::Concern | Outcome::Challenge | Outcome::Escalation) {
+            self.last_spoke = Some(t);
+        }
+        match self.cells.iter_mut().rev().find(|c| c.n == Some(w.n)) {
+            Some(c) => {
+                if rank(glyph) < rank(c.glyph) {
+                    c.glyph = glyph;
+                }
+            }
+            None => self.cells.push(Cell { n: Some(w.n), glyph }),
+        }
+        // Watchers of one wake share `n`: the loudest outcome speaks for it.
+        let word = match self.last_wake {
+            Some((_, prev, n)) if n == w.n && rank_word(prev) < rank_word(word) => prev,
+            _ => word,
+        };
+        self.last_wake = Some((t, word, w.n));
+        if w.outcome == Outcome::Failed && w.trigger == "blocked" {
+            self.tick(t, escalation::UNAVAILABLE.to_owned(), Tone::Diag);
+        }
+    }
+
+    fn status(&mut self, t: u64, e: &Event) {
+        let Some(op) = e.parse::<StatusOp>() else { return };
+        match op {
+            StatusOp::Model { watcher, model, same_vendor, shares_quota } => {
+                self.models.insert(watcher, (model, same_vendor, shares_quota));
+            }
+            StatusOp::Raise => {
+                self.budget.raise();
+                let text =
+                    format!("+{} → ceiling {}; resuming", budget::usd(budget::RAISE_USD), money(&self.budget, false));
+                self.tick(t, text, Tone::Plain);
+            }
+            StatusOp::UserPause => {
+                self.user_paused = true;
+                self.tick(t, "paused by you: no wakes, no spend (Z resumes)".to_owned(), Tone::Plain);
+            }
+            StatusOp::UserResume => {
+                self.user_paused = false;
+                self.tick(t, "resumed: one wake on the current state".to_owned(), Tone::Plain);
+            }
+            StatusOp::Lagging { focus } => {
+                self.lagging.entry(focus).or_insert(t);
+            }
+            StatusOp::LaggingEnd { focus } => {
+                self.lagging.remove(&focus);
+            }
+            StatusOp::Blind { focus, reason } => {
+                let who = focus.as_deref().map(|f| format!(" ({f})")).unwrap_or_default();
+                self.tick(t, format!("BLIND{who}: {reason}"), Tone::Refusal);
+                self.blind.entry(focus).or_insert((t, reason));
+            }
+            StatusOp::BlindEnd { focus } => {
+                if let Some((from, _)) = self.blind.remove(&focus) {
+                    let mins = t.saturating_sub(from) / 60_000;
+                    let text = format!("blind {}–{} ({mins} min)", self.time(from), self.time(t));
+                    self.tick(t, text, Tone::Plain);
+                }
+            }
+            StatusOp::Fallback { model, .. } => {
+                self.tick(t, format!("fallback {model}: primary failing"), Tone::Plain);
+                self.fallback = Some(model);
+            }
+            StatusOp::Primary => {
+                self.fallback = None;
+                self.tick(t, "back on the primary model".to_owned(), Tone::Plain);
+            }
+            StatusOp::BlindNotified { .. } => {}
+        }
+    }
+
+    fn coverage(&mut self, t: u64, e: &Event) {
+        match e.parse::<Coverage>() {
+            Some(Coverage::Lost { from, to, cause }) => {
+                self.lost_ms += to.saturating_sub(from);
+                self.cells.push(Cell { n: None, glyph: '░' });
+                let text = format!("lost {}–{} ({cause}): not reviewed", self.time(from), self.time(to));
+                self.tick(t, text, Tone::Diag);
+            }
+            Some(Coverage::Delayed { from, to }) => {
+                self.tick(t, format!("reviewed late {}–{}", self.time(from), self.time(to)), Tone::Plain);
+            }
+            Some(Coverage::BacklogPaused { .. }) => self.tick(t, "backlog paused (budget)".to_owned(), Tone::Plain),
+            None => {}
+        }
+    }
+
+    fn watcher(&mut self, t: u64, e: &Event) {
+        let text = match e.parse::<WatcherOp>() {
+            Some(WatcherOp::Restart { why }) => format!("Watcher restarted: {why}"),
+            Some(WatcherOp::Crash { focus: Some(f), why }) => format!("{f} Watcher crashed: {why}"),
+            Some(WatcherOp::Crash { focus: None, why }) => format!("Watcher crashed: {why}"),
+            Some(WatcherOp::HangKill) => "Watcher hung: killed and restarted".to_owned(),
+            Some(WatcherOp::CrashLoop { focus: Some(f) }) => format!("{f} Watcher crash-looping: stopped"),
+            Some(WatcherOp::CrashLoop { focus: None }) => "Watcher crash-looping: stopped".to_owned(),
+            Some(WatcherOp::SupervisorGone) => "supervisor gone".to_owned(),
+            None => return,
+        };
+        self.tick(t, text, Tone::Diag);
+    }
+
+    /// The CLOSED end state of a Concern, or `None` if it belongs in OPEN / IN DEBATE.
+    pub fn closed_as(&self, id: &str) -> Option<String> {
+        let c = self.concerns.get(id)?;
+        let info = self.info.get(id);
+        if c.state != State::Open {
+            let end = info.and_then(|i| i.end.clone());
+            return Some(end.unwrap_or_else(|| c.state.name().to_owned()));
+        }
+        if self.in_debate() == Some(id) {
+            return None;
+        }
+        if self.muted.contains(&c.focus) {
+            return Some("muted".to_owned());
+        }
+        if self.ended {
+            return Some("closed: session end".to_owned());
+        }
+        match c.tag {
+            Some(Tag::UnresolvedQuiet) => Some("unresolved quiet".to_owned()),
+            Some(Tag::Escalated) => {
+                let mut ours = self.escalations.all().iter().filter(|e| e.concern.as_deref() == Some(id));
+                match ours.find(|e| self.needs_you().any(|n| n.id == e.id) || self.closed_escalations.contains(&e.id)) {
+                    Some(e) if self.closed_escalations.contains(&e.id) => Some("escalated → ruled".to_owned()),
+                    Some(_) => None,
+                    None => Some("escalated".to_owned()),
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The first Concern, Escalation or BLIND opens the pane (V67); the Watcher process calls
+/// `placement` on the first event this holds for.
+pub fn opens(e: &Event) -> bool {
+    match e.k {
+        Kind::Concern => e.str("op") == Some("add"),
+        Kind::Escalation => e.str("op") == Some("raised"),
+        Kind::Status => e.str("op") == Some("blind"),
+        _ => false,
+    }
+}
+
+fn rank(glyph: char) -> usize {
+    GLYPHS.iter().position(|g| *g == glyph).unwrap_or(GLYPHS.len())
+}
+
+fn rank_word(word: &str) -> usize {
+    ["escalation", "failed", "concern", "replayed", "silent"].iter().position(|w| *w == word).unwrap_or(9)
+}
+
+fn strings(v: Option<&serde_json::Value>) -> Vec<String> {
+    v.and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_owned)).collect())
+        .unwrap_or_default()
+}
+
+/// `$x` spent or the ceiling.
+pub fn money(b: &Budget, spent: bool) -> String {
+    budget::usd(if spent { b.spent() } else { b.ceiling() })
+}
+
+/// `HH:MM` at `tz` seconds east of UTC.
+pub fn hhmm(t_ms: u64, tz: i64) -> String {
+    let secs = (t_ms / 1000) as i64 + tz;
+    let day = secs.rem_euclid(86_400);
+    format!("{:02}:{:02}", day / 3600, day / 60 % 60)
+}
+
+/// What a key asks of the runtime.
+#[derive(Debug, PartialEq)]
+pub enum Effect {
+    None,
+    Quit,
+    /// Human facts to append to the session log (V43).
+    Append(Vec<Event>),
+}
+
+/// One key on the Board (I17). Pure: `ui` changes, events are returned for the caller to log.
+pub fn key(b: &Board, ui: &mut Ui, frame: &Frame, k: Key) -> Effect {
+    ui.note = None;
+    if let Some(input) = ui.input.as_mut() {
+        match k {
+            Key::Char(c) => input.text.push(c),
+            Key::Backspace => {
+                input.text.pop();
+            }
+            Key::Esc => ui.input = None,
+            Key::CtrlC => return Effect::Quit,
+            Key::Enter => {
+                let Input { concern, text } = ui.input.take().expect("in input");
+                let remark = Some(text.trim().to_owned()).filter(|r| !r.is_empty());
+                return Effect::Append(vec![Act::Promote { id: concern, remark }.event()]);
+            }
+            Key::Up | Key::Down => {}
+        }
+        return Effect::None;
+    }
+    let selected = frame.selected.clone();
+    let concern = selected.as_deref().and_then(|id| b.concerns.get(id));
+    let append = |act: Act| Effect::Append(vec![act.event()]);
+    match k {
+        Key::Char('q') | Key::CtrlC => return Effect::Quit,
+        Key::Esc => ui.overlay = Overlay::None,
+        Key::Char('j') | Key::Down => ui.selected = step(&frame.order, selected.as_deref(), 1),
+        Key::Char('k') | Key::Up => ui.selected = step(&frame.order, selected.as_deref(), -1),
+        Key::Enter => {
+            if let Some(id) = selected.filter(|id| !ui.expanded.remove(id)) {
+                ui.expanded.insert(id);
+            }
+        }
+        Key::Char('c') => ui.closed = !ui.closed,
+        Key::Char('l') => ui.overlay = toggle(ui.overlay, Overlay::Stream),
+        Key::Char('?') => ui.overlay = toggle(ui.overlay, Overlay::Help),
+        Key::Char('f') => {
+            let mut all = b.focuses.clone();
+            for c in b.concerns.all() {
+                if !all.contains(&c.focus) {
+                    all.push(c.focus.clone());
+                }
+            }
+            let next = match &ui.filter {
+                None => all.first(),
+                Some(f) => all.iter().skip_while(|x| *x != f).nth(1),
+            };
+            ui.filter = next.cloned();
+        }
+        Key::Char('d') => match concern {
+            Some(c) if c.state == State::Open => return append(Act::Dismiss { id: c.id.clone() }),
+            Some(c) => ui.note = Some(format!("{} is already {}", c.id, c.state.name())),
+            None if selected.is_some() => ui.note = Some("rulings on NEEDS YOU are not available yet".to_owned()),
+            None => ui.note = Some("nothing selected".to_owned()),
+        },
+        Key::Char('P') => match concern {
+            Some(c) if c.state == State::Open => ui.input = Some(Input { concern: c.id.clone(), text: String::new() }),
+            Some(c) => ui.note = Some(format!("{} is {}: cannot be promoted", c.id, c.state.name())),
+            None => ui.note = Some("select an open Concern to promote".to_owned()),
+        },
+        Key::Char('+') => {
+            if let Some(id) = selected.filter(|id| !b.info.get(id).is_some_and(|i| i.helpful)) {
+                return append(Act::Helpful { id });
+            }
+        }
+        Key::Char('m') => match concern.map(|c| c.focus.clone()).or_else(|| ui.filter.clone()) {
+            Some(f) if b.muted.contains(&f) => ui.note = Some(format!("{f} is already muted")),
+            Some(focus) => return append(Act::Mute { focus }),
+            None => ui.note = Some("select a Concern (or filter a Focus) to mute".to_owned()),
+        },
+        Key::Char('a') if !b.nochallenge => return append(Act::Nochallenge),
+        Key::Char('Z') => {
+            let op = if b.user_paused { StatusOp::UserResume } else { StatusOp::UserPause };
+            return Effect::Append(vec![op.event()]);
+        }
+        Key::Char('$') => return Effect::Append(vec![StatusOp::Raise.event()]),
+        _ => {}
+    }
+    Effect::None
+}
+
+fn toggle(now: Overlay, to: Overlay) -> Overlay {
+    if now == to { Overlay::None } else { to }
+}
+
+fn step(order: &[String], selected: Option<&str>, by: isize) -> Option<String> {
+    if order.is_empty() {
+        return None;
+    }
+    let i = selected.and_then(|s| order.iter().position(|x| x == s)).unwrap_or(0) as isize;
+    let j = (i + by).clamp(0, order.len() as isize - 1);
+    order.get(j as usize).cloned()
+}
+
+/// `shown` (V69): a Concern row continuously on screen this long in a running pane.
+pub const SHOWN_AFTER: Duration = Duration::from_secs(5);
+
+/// When each visible Concern came on screen; ids due a `shown` event.
+#[derive(Default)]
+pub struct Shown {
+    since: HashMap<String, Instant>,
+    sent: HashSet<String>,
+}
+
+impl Shown {
+    /// The visible ids that have now been on screen ≥5 s and are not yet logged as shown.
+    pub fn due(&mut self, b: &Board, visible: &[String], now: Instant) -> Vec<String> {
+        self.since.retain(|id, _| visible.contains(id));
+        let mut due = Vec::new();
+        for id in visible {
+            let since = *self.since.entry(id.clone()).or_insert(now);
+            if now.duration_since(since) >= SHOWN_AFTER && !b.shown.contains(id) && self.sent.insert(id.clone()) {
+                due.push(id.clone());
+            }
+        }
+        due
+    }
+}
+
+const TICK: Duration = Duration::from_millis(250);
+/// A local note (refused key) stays this long.
+const NOTE_FOR: Duration = Duration::from_secs(4);
+
+/// `pair-watcher pane`: tails the session log and draws the Board until `q`.
+pub fn run(mailbox: &Mailbox) -> io::Result<()> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err(io::Error::other("the pane needs a terminal"));
+    }
+    let log = mailbox.log();
+    let mut board = Board::new(term::local_offset());
+    let mut ui = Ui::default();
+    let mut offset = 0;
+    let mut shown = Shown::default();
+    let mut drawn: Vec<String> = Vec::new();
+    let mut note_at = Instant::now();
+    let _raw = term::Raw::enter()?;
+    let mut out = io::stdout();
+    loop {
+        let batch = log.read_from(offset)?;
+        offset = batch.next;
+        for r in &batch.records {
+            board.apply(r);
+        }
+        board.pending =
+            delivery::pending(&board.challenges, &board.debate, board.observe_only, mailbox).unwrap_or(None);
+        if ui.note.is_some() && note_at.elapsed() > NOTE_FOR {
+            ui.note = None;
+        }
+        let (w, h) = term::size();
+        let frame = layout(&board, &ui, w, h);
+        ui.selected = frame.selected.clone();
+        let lines: Vec<String> = frame.lines.iter().map(|l| l.ansi()).collect();
+        if lines != drawn {
+            let mut screen = String::from("\x1b[H");
+            for (i, l) in lines.iter().enumerate() {
+                screen.push_str(l);
+                screen.push_str("\x1b[K");
+                if i + 1 < lines.len() {
+                    screen.push_str("\r\n");
+                }
+            }
+            screen.push_str("\x1b[J");
+            out.write_all(screen.as_bytes())?;
+            out.flush()?;
+            drawn = lines;
+        }
+        for id in shown.due(&board, &frame.visible, Instant::now()) {
+            log.append(human::shown(&id))?;
+        }
+        for k in term::keys(TICK)? {
+            let frame = layout(&board, &ui, w, h);
+            match key(&board, &mut ui, &frame, k) {
+                Effect::Quit => return Ok(()),
+                Effect::Append(events) => {
+                    for e in events {
+                        log.append(e)?;
+                    }
+                }
+                Effect::None => {}
+            }
+            if ui.note.is_some() {
+                note_at = Instant::now();
+            }
+        }
+    }
+}

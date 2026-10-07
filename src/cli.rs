@@ -7,11 +7,13 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use crate::delivery::{self, Route, Worker};
 use crate::focus::FocusSource;
 use crate::home::Home;
+use crate::human::Act;
 use crate::jsonl::now_ms;
 use crate::mailbox::Mailbox;
 use crate::outbox::Claim;
 use crate::problem::{Problem, tilde};
-use crate::{config, hook, models, run, supervisor};
+use crate::status::Op as StatusOp;
+use crate::{config, hook, mailbox, models, pane, repo, run, supervisor};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -277,7 +279,12 @@ fn dispatch(command: Command) -> ExitCode {
         Command::Focus { action: FocusAction::Approve { name, .. } } => run::focus_approve(&name),
         Command::Supervise { session, worker_pid } => supervise(&session, worker_pid),
         Command::Attach { .. } => later("T15"),
-        Command::Pane(_) | Command::Mute { .. } | Command::Nochallenge(_) | Command::Pause(_) => later("T12"),
+        Command::Pane(arg) => pane(arg),
+        Command::Mute { focus, session } => session_fact(&session, |m| mute(m, &focus)),
+        Command::Nochallenge(session) => session_fact(&session, |m| {
+            m.log().append(Act::Nochallenge.event()).map(|()| "no auto-Challenge".to_owned())
+        }),
+        Command::Pause(session) => session_fact(&session, pause),
         Command::Rule { .. } | Command::Undo(_) | Command::Keep(_) => later("T13"),
         Command::Rulings { .. } => later("T14"),
         Command::Install { .. } | Command::Uninstall { .. } | Command::Auth | Command::Doctor => later("T16"),
@@ -411,6 +418,57 @@ fn adapter(args: &[String]) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => fail(&e.to_string()),
     }
+}
+
+/// `--session`, else the only live session in the current repo (I1).
+fn session(arg: &SessionArg, ended_ok: bool) -> Result<Mailbox, String> {
+    let home = Home::from_env().map_err(|e| e.to_string())?;
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let root = repo::discover(&cwd).map_or(cwd, |r| r.root);
+    mailbox::resolve(&home, arg.session.as_deref(), &root, ended_ok)
+}
+
+fn pane(arg: SessionArg) -> ExitCode {
+    match session(&arg, true) {
+        Ok(m) => match pane::run(&m) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e.to_string()),
+        },
+        Err(e) => fail(&e),
+    }
+}
+
+/// A human fact for a live session (V43); prints what it did.
+fn session_fact(arg: &SessionArg, write: impl FnOnce(&Mailbox) -> std::io::Result<String>) -> ExitCode {
+    match session(arg, false) {
+        Ok(m) => match write(&m) {
+            Ok(done) => {
+                println!("pair-watcher: {done} (session {})", m.id());
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e.to_string()),
+        },
+        Err(e) => fail(&e),
+    }
+}
+
+/// `mute <focus>` (V70): an enabled Focus of the session only.
+fn mute(m: &Mailbox, focus: &str) -> std::io::Result<String> {
+    let board = pane::Board::rebuild(0, &m.log().read_from(0)?.records);
+    if !board.focuses.iter().any(|f| f == focus) {
+        return Err(std::io::Error::other(format!("no Focus {focus} in this session ({})", board.focuses.join(", "))));
+    }
+    m.log().append(Act::Mute { focus: focus.to_owned() }.event())?;
+    Ok(format!("muted {focus}"))
+}
+
+/// `pause` pauses a running Watcher and resumes a paused one (V70).
+fn pause(m: &Mailbox) -> std::io::Result<String> {
+    let board = pane::Board::rebuild(0, &m.log().read_from(0)?.records);
+    let (op, done) =
+        if board.user_paused { (StatusOp::UserResume, "resumed") } else { (StatusOp::UserPause, "paused (you)") };
+    m.log().append(op.event())?;
+    Ok(done.to_owned())
 }
 
 fn later(task: &str) -> ExitCode {

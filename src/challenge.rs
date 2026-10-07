@@ -15,6 +15,7 @@ use crate::clip;
 use crate::concern::{Change, Concern, ConcernList, Evidence, State};
 use crate::event::{Event, EventLog, Kind};
 use crate::history::{self, History};
+use crate::human::Act;
 use crate::outbox::{Gate, Item, ItemKind, Outbox, Withdraw};
 use crate::output;
 use crate::snapshot::Store;
@@ -283,6 +284,8 @@ pub struct Challenges {
     slot: Option<Slot>,
     /// Challenges so far per Concern: ids, and no auto-Challenge after any earlier one (V22).
     count: HashMap<String, usize>,
+    /// The human's `promote` requests not yet answered, oldest first: (Concern, remark) (V43).
+    requests: Vec<(String, Option<String>)>,
 }
 
 impl Challenges {
@@ -298,10 +301,16 @@ impl Challenges {
         self.slot.as_ref()
     }
 
-    /// Folds `challenge` and `concern` events, `human dismiss`, and the Debate engine's
-    /// `debate {op: end, challenge}`, which frees the slot. A `queued` while the slot is held
-    /// is ignored (`queue` never writes one).
+    /// Folds `challenge` and `concern` events, `human dismiss` and `promote`, and the Debate
+    /// engine's `debate {op: end, challenge}`, which frees the slot. A `queued` while the slot is
+    /// held is ignored (`queue` never writes one).
     pub fn apply(&mut self, event: &Event) {
+        if event.k == Kind::Challenge
+            && let Some(Op::Queued { concern, origin: Origin::Promoted, .. } | Op::PromotionRefused { concern, .. }) =
+                event.parse::<Op>()
+        {
+            self.answered(&concern);
+        }
         match event.k {
             Kind::Challenge => match event.parse::<Op>() {
                 Some(Op::Queued { id, concern, origin, .. }) if self.slot.is_none() => {
@@ -322,17 +331,48 @@ impl Challenges {
                 Some(Change::Resolve { id, .. } | Change::Duplicate { id, .. }) => self.changed(&id),
                 _ => {}
             },
-            Kind::Human if event.str("action") == Some("dismiss") => {
-                if let Some(id) = event.str("id") {
-                    self.changed(id);
-                }
-            }
+            Kind::Human => match event.parse::<Act>() {
+                Some(Act::Dismiss { id }) => self.changed(&id),
+                Some(Act::Promote { id, remark }) => self.requests.push((id, remark)),
+                _ => {}
+            },
             Kind::Debate if event.str("op") == Some("end") => {
                 if let Some(id) = event.str("challenge") {
                     self.free(id);
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Answers each `human promote` request, oldest first, as [`Challenges::promote`] (V20):
+    /// queued, or refused and logged. The arbiter runs this every loop, not only on wakes; the
+    /// human surfaces only ask (V43). Returns the ticker lines of refusals.
+    pub fn answer_requests(
+        &mut self,
+        log: &EventLog,
+        outbox: &Outbox,
+        list: &ConcernList,
+        now: u64,
+    ) -> io::Result<Vec<String>> {
+        let mut ticker = Vec::new();
+        while let Some((id, remark)) = self.requests.first().cloned() {
+            let before = self.requests.len();
+            if let Err(refused) = self.promote(log, outbox, list, &id, remark.as_deref(), now)? {
+                ticker.push(refused);
+            }
+            if self.requests.len() == before {
+                // Answered by nothing it logged (cannot happen): never loop on it.
+                self.requests.remove(0);
+            }
+        }
+        Ok(ticker)
+    }
+
+    /// The first open request for `concern` is answered.
+    fn answered(&mut self, concern: &str) {
+        if let Some(i) = self.requests.iter().position(|(c, _)| c == concern) {
+            self.requests.remove(i);
         }
     }
 

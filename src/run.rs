@@ -181,6 +181,7 @@ fn session_start(l: &Launch, observe_only: bool, notes: &[String]) -> Event {
         .with("harness", l.harness.name())
         .with("harness_version", l.version.map_or(Value::Null, |v| v.to_string().into()))
         .with("mode", mode)
+        .with("ceiling_usd", loaded.resolved.get("ceiling_usd").and_then(toml::Value::as_float).unwrap_or(5.0))
         .with("focuses", json!(focuses))
         .with("config_hash", config::config_hash(&loaded.resolved, &loaded.focuses.enabled))
         .with("layer_files", json!(layers))

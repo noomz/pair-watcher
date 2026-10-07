@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::event::EventLog;
+use crate::event::{EventLog, Kind};
 use crate::home::{Home, write_atomic};
 use crate::jsonl::{self, Batch, Record};
 use crate::outbox::Outbox;
@@ -44,6 +44,29 @@ impl Mailbox {
     pub fn open_registered(home: &Home, id: &str) -> Option<Mailbox> {
         let dir = session_dir(home, id).ok()?;
         dir.join(REGISTERED).is_file().then_some(Mailbox { dir })
+    }
+
+    /// A session's mailbox, live or ended (the pane can show an ended session's log).
+    pub fn open(home: &Home, id: &str) -> Option<Mailbox> {
+        let dir = session_dir(home, id).ok()?;
+        dir.is_dir().then_some(Mailbox { dir })
+    }
+
+    /// A Watcher still follows the session.
+    pub fn is_live(&self) -> bool {
+        self.dir.join(REGISTERED).is_file()
+    }
+
+    pub fn id(&self) -> String {
+        self.dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+    }
+
+    /// The repo from the `session` start event.
+    pub fn repo(&self) -> Option<PathBuf> {
+        let batch = self.log().read_from(0).ok()?;
+        let start =
+            batch.records.into_iter().find(|r| r.body.k == Kind::Session && r.body.str("phase") == Some("start"))?;
+        start.body.str("repo").map(PathBuf::from)
     }
 
     /// Session end: hooks stop appending; the files stay until pruned.
@@ -88,6 +111,44 @@ impl Mailbox {
 
     pub fn log(&self) -> EventLog {
         EventLog::new(self.dir.join("log.jsonl"))
+    }
+}
+
+/// Live sessions, by id.
+pub fn live(home: &Home) -> Vec<Mailbox> {
+    let Ok(dir) = fs::read_dir(home.sessions_dir()) else { return Vec::new() };
+    let mut out: Vec<Mailbox> = dir
+        .filter_map(|e| e.ok())
+        .filter_map(|e| Mailbox::open(home, &e.file_name().to_string_lossy()))
+        .filter(Mailbox::is_live)
+        .collect();
+    out.sort_by_key(Mailbox::id);
+    out
+}
+
+/// `--session` for session-scoped commands (I1): the named session (live, unless `ended_ok`),
+/// else the only live session in `repo`; anything else is refused with the live sessions listed.
+pub fn resolve(home: &Home, id: Option<&str>, repo: &Path, ended_ok: bool) -> Result<Mailbox, String> {
+    let all = live(home);
+    let list = || {
+        let lines: Vec<String> = all
+            .iter()
+            .map(|m| format!("  {}  {}", m.id(), m.repo().map(|r| r.display().to_string()).unwrap_or_default()))
+            .collect();
+        if lines.is_empty() { "no live sessions".to_owned() } else { format!("live sessions:\n{}", lines.join("\n")) }
+    };
+    if let Some(id) = id {
+        return match Mailbox::open(home, id) {
+            Some(m) if ended_ok || m.is_live() => Ok(m),
+            Some(_) => Err(format!("session {id} has ended; {}", list())),
+            None => Err(format!("no session {id}; {}", list())),
+        };
+    }
+    let here: Vec<&Mailbox> = all.iter().filter(|m| m.repo().as_deref() == Some(repo)).collect();
+    match here.as_slice() {
+        [one] => Ok((*one).clone()),
+        [] => Err(format!("no live session in {}; pass --session; {}", repo.display(), list())),
+        _ => Err(format!("{} live sessions in {}; pass --session; {}", here.len(), repo.display(), list())),
     }
 }
 

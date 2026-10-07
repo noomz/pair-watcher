@@ -108,6 +108,8 @@ struct Slot {
     /// Route of the latest claim.
     route: Option<String>,
     held: Option<String>,
+    /// When each hold with a reason began.
+    waits: Vec<u64>,
     done: bool,
     acked: bool,
 }
@@ -222,6 +224,13 @@ impl Outbox {
         Ok(fold(records).into_iter().find(|s| s.item.id == id && !s.done).and_then(|s| s.held))
     }
 
+    /// When each hold of pending item `id` began, oldest first: the pane merges them into one
+    /// `pending` line with a wait count (V65).
+    pub fn waits(&self, id: &str) -> io::Result<Vec<u64>> {
+        let records = jsonl::read_from::<Record<Entry>>(&self.path, 0)?.records;
+        Ok(fold(records).into_iter().find(|s| s.item.id == id && !s.done).map(|s| s.waits).unwrap_or_default())
+    }
+
     /// Acked items with the route that delivered them, oldest first.
     pub fn delivered(&self) -> io::Result<Vec<Delivered>> {
         let records = jsonl::read_from::<Record<Entry>>(&self.path, 0)?.records;
@@ -256,8 +265,15 @@ fn fold(records: Vec<Record<Entry>>) -> Vec<Slot> {
     for r in records {
         let id = match &r.body {
             Entry::Queued(item) => {
-                let fresh =
-                    Slot { item: item.clone(), claim: None, route: None, held: None, done: false, acked: false };
+                let fresh = Slot {
+                    item: item.clone(),
+                    claim: None,
+                    route: None,
+                    held: None,
+                    waits: Vec::new(),
+                    done: false,
+                    acked: false,
+                };
                 // A re-queued (dropped) id is new: it goes to the back, oldest-first order kept.
                 match slots.iter().position(|s| s.item.id == item.id) {
                     None => slots.push(fresh),
@@ -282,7 +298,12 @@ fn fold(records: Vec<Record<Entry>>) -> Vec<Slot> {
                 slot.route = Some(route);
                 slot.held = None;
             }
-            Entry::Held { reason, .. } => slot.held = reason,
+            Entry::Held { reason, .. } => {
+                if reason.is_some() {
+                    slot.waits.push(r.t);
+                }
+                slot.held = reason;
+            }
             Entry::Released { token, .. } => {
                 if slot.claim.as_ref().is_some_and(|(t, _)| *t == token) {
                     slot.claim = None;

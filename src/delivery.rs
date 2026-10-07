@@ -87,23 +87,12 @@ impl View {
 
     /// The item waiting for delivery: the slot's Challenge, else the Debate's exchange 2 (V34).
     fn waiting(&self) -> Option<&str> {
-        match self.challenges.slot() {
-            Some(s) if !s.sent && !s.stale => Some(&s.id),
-            _ => self.debate.waiting(),
-        }
+        waiting(&self.challenges, &self.debate)
     }
 
     /// The item waiting for delivery: id + pane line (V26, V29).
     pub fn pending(&self, mailbox: &Mailbox) -> io::Result<Option<(String, String)>> {
-        let Some(id) = self.waiting() else { return Ok(None) };
-        let line = if self.observe_only {
-            "pending: observe-only, not delivered"
-        } else if mailbox.outbox().held(id)?.as_deref() == Some(DRAFT) {
-            "pending: human draft in prompt"
-        } else {
-            "pending: Worker idle"
-        };
-        Ok(Some((id.to_owned(), line.to_owned())))
+        Ok(pending(&self.challenges, &self.debate, self.observe_only, mailbox)?.map(|p| (p.id, p.line)))
     }
 
     /// Claude mod status-line field (I8): non-zero parts only; `None` clears the line.
@@ -284,4 +273,40 @@ pub fn poll(mailbox: &Mailbox, route: Route, worker: Worker, now: u64) -> io::Re
         commentary: view.commentary(pending.as_ref().map(|(_, line)| line.as_str())),
         item: item.map(|c| PollItem { id: c.item.id, text: c.item.text, token: c.token }),
     })
+}
+
+/// The item waiting for delivery: the slot's Challenge, else the Debate's exchange 2 (V34).
+fn waiting<'a>(challenges: &'a Challenges, debate: &'a Debate) -> Option<&'a str> {
+    match challenges.slot() {
+        Some(s) if !s.sent && !s.stale => Some(&s.id),
+        _ => debate.waiting(),
+    }
+}
+
+/// An item waiting for delivery, as the pane shows it (V26, V29, V65).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pending {
+    pub id: String,
+    pub line: String,
+    /// When each hold by a human draft began: consecutive waits merge into one line.
+    pub waits: Vec<u64>,
+}
+
+/// The item waiting for delivery and why (V26, V29).
+pub fn pending(
+    challenges: &Challenges,
+    debate: &Debate,
+    observe_only: bool,
+    mailbox: &Mailbox,
+) -> io::Result<Option<Pending>> {
+    let Some(id) = waiting(challenges, debate) else { return Ok(None) };
+    let outbox = mailbox.outbox();
+    let line = if observe_only {
+        "pending: observe-only, not delivered"
+    } else if outbox.held(id)?.as_deref() == Some(DRAFT) {
+        "pending: human draft in prompt"
+    } else {
+        "pending: Worker idle"
+    };
+    Ok(Some(Pending { id: id.to_owned(), line: line.to_owned(), waits: outbox.waits(id)? }))
 }

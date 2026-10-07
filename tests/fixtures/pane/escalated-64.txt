@@ -1,0 +1,30 @@
+● watching $1.38/$5 · gpt-6.1-sol · Companion
+  wakes ·■■··▲ · last 12:00 escalation
+NEEDS YOU 1 ────────────────────────────────────────────────── +
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃›▲ 12:00 Debate unresolved: 5th review round, 0 new findings  ┃
+┃   (c2)                                                       ┃
+┃ Watcher (approach): stop reviewing; run the failing test     ┃
+┃   instead                                                    ┃
+┃ Worker: the human asked for a polished diff                  ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+OPEN 1 ─────────────────────────────────────────── d · P · + · m
+  c1 note [correctness] Retry loop swallows the timeout error
+CLOSED 1 ───────────────────────────────────────────────────── c
+  c3 dismissed Token printed at debug level
+
+
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────
+11:12 c3 dismissed
+12:00 c2 Debate ended: unresolved → Escalation

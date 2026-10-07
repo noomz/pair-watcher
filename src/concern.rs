@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::event::{Event, Kind};
+use crate::human::Act;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -141,7 +142,7 @@ impl Change {
 
 /// The human's `d` on a Concern (V94 `human dismiss`). Final: it never reopens (V13).
 pub fn dismissal(id: &str) -> Event {
-    Event::new(Kind::Human).with("action", "dismiss").with("id", id)
+    Act::Dismiss { id: id.to_owned() }.event()
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
