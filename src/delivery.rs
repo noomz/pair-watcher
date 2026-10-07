@@ -133,13 +133,23 @@ impl View {
     }
 }
 
-/// Claims the next item `route` may deliver now (V28), or `None`.
+/// Claims the next item `route` may deliver now (V28), or `None`. The stale check reads the log
+/// again under the outbox lock: a dismissal logged while this deliverer waited for the lock counts.
 pub fn claim(mailbox: &Mailbox, view: &View, route: Route, now: u64) -> io::Result<Option<Claim>> {
     let Some(harness) = view.harness else { return Ok(None) };
     if view.observe_only || (route.idle() && !settled(mailbox, harness)?) {
         return Ok(None);
     }
-    mailbox.outbox().claim(route.name(), now, |item| view.gate(item))
+    let mut fresh = None;
+    let claim =
+        mailbox.outbox().claim(route.name(), now, |item| match fresh.get_or_insert_with(|| View::read(mailbox)) {
+            Ok(view) => view.gate(item),
+            Err(_) => Gate::Skip,
+        })?;
+    match fresh {
+        Some(Err(e)) => Err(e),
+        _ => Ok(claim),
+    }
 }
 
 /// No turn end in the hook inbox past the arbiter's settled offset (V21).

@@ -414,10 +414,11 @@ fn escalate_unresolved_gate() {
 #[test]
 fn blocked_worker_debate_waits() {
     let mut f = fx();
-    let before = f.d.clone();
     let tool = T::ToolCall { id: "t1".into(), name: "Bash".into(), input: "{}".into() };
     f.observe(&[Entry { id: "b".into(), t: 0, items: vec![T::Text("Running it.".into()), tool] }]);
-    assert_eq!(f.d, before);
+    assert!(f.ops("exchange").is_empty());
+    assert_eq!(f.d.open().unwrap().phase, Phase::Awaiting);
+    f.assert_consistent();
     assert_eq!(f.decide(&[]).ended, None);
 }
 

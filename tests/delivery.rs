@@ -6,7 +6,7 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use pair_watcher::challenge::{Challenges, Origin};
-use pair_watcher::concern::{Change, Concern, Severity, State};
+use pair_watcher::concern::{self, Change, Concern, Severity, State};
 use pair_watcher::debate::{Debate, EscalateAt};
 use pair_watcher::delivery::{self, Route, View, Worker};
 use pair_watcher::event::{Event, Kind};
@@ -419,4 +419,30 @@ fn rebuttal_is_delivered_like_the_challenge() {
     assert_eq!(item.id, "c1/2");
     assert!(item.text.contains("Challenge c1 (2/2)"), "{}", item.text);
     assert!(delivery::poll(&w.mb, Route::Mod, Worker::Idle, now).unwrap().item.is_none(), "claimed once");
+}
+
+/// Codex review: a dismissal logged after the deliverer read its view, while it waited for the
+/// outbox lock, still drops the rebuttal at claim (V28, V37).
+#[test]
+fn claim_rereads_the_log_under_the_lock() {
+    let w = world("claude", false);
+    let now = now_ms();
+    let first = delivery::poll(&w.mb, Route::Mod, Worker::Idle, now).unwrap().item.unwrap();
+    let item =
+        pair_watcher::outbox::Item { id: first.id, kind: pair_watcher::outbox::ItemKind::Challenge, text: first.text };
+    assert!(w.mb.outbox().ack(&pair_watcher::outbox::Claim { item, token: first.token }, now).unwrap());
+    w.sync_sent();
+    let (log, outbox) = (w.mb.log(), w.mb.outbox());
+    let mut d = Debate::rebuild(&w.events());
+    let reply = T::Text("Challenge c1: defend — it is idempotent".into());
+    d.observe(&log, &outbox, &[Entry { id: "e".into(), t: 0, items: vec![reply, T::TurnEnd] }], now).unwrap();
+    let lines = [("approach".to_owned(), Line::Debate { decision: Decision::Rebut, text: "429s".into() })];
+    let roster =
+        [pair_watcher::arbiter::Watcher { name: "approach".into(), focuses: vec!["approach".into()], model: None }];
+    d.decide(&log, &outbox, &w.view().concerns, &roster, &lines, EscalateAt::Warn, now).unwrap();
+
+    let stale = w.view();
+    log.append(concern::dismissal("c1")).unwrap();
+    assert!(delivery::claim(&w.mb, &stale, Route::Mod, now).unwrap().is_none());
+    assert!(outbox.pending().unwrap().is_empty(), "dropped as stale");
 }

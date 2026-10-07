@@ -457,7 +457,8 @@ impl Debate {
                 turn.push(entry.id.clone());
             }
         }
-        // A slice cut mid-turn keeps a verdict line for the turn end in a later slice.
+        // A slice cut mid-turn keeps a verdict line for the turn end in a later slice, and the
+        // entries it read, so a replay never reads them again.
         let Some(open) = self.open.as_ref() else { return Ok(()) };
         let joined = text.join("\n");
         let partial = if open.phase == Phase::Awaiting && verdict(&joined, &open.challenge).is_some() {
@@ -465,7 +466,7 @@ impl Debate {
         } else {
             String::new()
         };
-        if partial != open.partial {
+        if partial != open.partial || !turn.is_empty() {
             let challenge = open.challenge.clone();
             self.commit(log, &Op::Partial { challenge, text: partial, turn })?;
         }
