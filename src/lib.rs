@@ -9,6 +9,7 @@ pub mod clip;
 pub mod concern;
 pub mod config;
 pub mod credentials;
+pub mod delivery;
 pub mod event;
 pub mod focus;
 pub mod harness;

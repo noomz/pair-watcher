@@ -149,8 +149,15 @@ fn claude_runs_in_place_with_session_settings_and_supervisor() {
 
     let session = w.session("claude");
     let settings = w.mailbox_dir(&session).join("claude-settings.json");
-    let expected = ["--settings", settings.to_str().unwrap(), "--resume", "x"];
+    let mod_dir = w.home.adapters_dir().join(env!("CARGO_PKG_VERSION")).join("claude");
+    let expected =
+        ["--settings", settings.to_str().unwrap(), "--plugin-dir", mod_dir.to_str().unwrap(), "--resume", "x"];
     assert_eq!(w.args("claude"), expected, "C3: per-session flags first, user args kept");
+    // I8: the mod rides `--plugin-dir`, written from the binary's embedded copy.
+    let register = fs::read_to_string(mod_dir.join("hooks/register.ts")).unwrap();
+    assert_eq!(register, include_str!("../adapters/claude/hooks/register.ts"));
+    assert!(mod_dir.join(".claude-plugin/plugin.json").is_file() && mod_dir.join("hooks/hooks.json").is_file());
+    assert!(!mod_dir.join("tests").exists(), "mod tests are not shipped");
     let json: Value = serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
     let shim = w.home.hook_shim();
     assert_eq!(json["hooks"]["Stop"][0]["hooks"][0]["command"], format!("{} Stop", shim.display()));

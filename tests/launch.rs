@@ -114,8 +114,9 @@ fn plan_puts_our_flags_before_the_users() {
     let plan = Plan::new(&os(&["/bin/pi", "--model", "x"]), launch::pi_args(Path::new("/a/pi/pair-watcher.ts")));
     assert_eq!(plan.program, "/bin/pi");
     assert_eq!(plan.args, os(&["-e", "/a/pi/pair-watcher.ts", "--model", "x"]));
-    let plan = Plan::new(&os(&["claude", "--resume"]), launch::claude_args(Path::new("/s/claude-settings.json")));
-    assert_eq!(plan.args, os(&["--settings", "/s/claude-settings.json", "--resume"]));
+    let ours = launch::claude_args(Path::new("/s/claude-settings.json"), Path::new("/a/claude"));
+    let plan = Plan::new(&os(&["claude", "--resume"]), ours);
+    assert_eq!(plan.args, os(&["--settings", "/s/claude-settings.json", "--plugin-dir", "/a/claude", "--resume"]));
 }
 
 #[test]

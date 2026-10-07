@@ -1,4 +1,4 @@
-//! Per-session Worker wiring (C3): Claude `--settings`, Codex `-c hooks.*` + one inline
+//! Per-session Worker wiring (C3): Claude `--settings` + `--plugin-dir`, Codex `-c hooks.*` + one inline
 //! `hooks.state` trust table (V57), pi `-e`. User config is never touched.
 
 use std::ffi::{OsStr, OsString};
@@ -75,8 +75,13 @@ pub fn claude_settings(shim: &Path) -> Value {
     json!({ "hooks": hooks })
 }
 
-pub fn claude_args(settings_file: &Path) -> Vec<String> {
-    vec!["--settings".into(), settings_file.to_string_lossy().into_owned()]
+pub fn claude_args(settings_file: &Path, mod_dir: &Path) -> Vec<String> {
+    vec![
+        "--settings".into(),
+        settings_file.to_string_lossy().into_owned(),
+        "--plugin-dir".into(),
+        mod_dir.to_string_lossy().into_owned(),
+    ]
 }
 
 /// `-c hooks.<Event>=[…]` values, one per event.

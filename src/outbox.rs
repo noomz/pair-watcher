@@ -3,7 +3,8 @@
 //!
 //! Lines: `queued` → `claimed` (route, token) → `acked` | `dropped`. A claim that is never acked
 //! (deliverer killed) expires after [`LEASE_MS`] and the item is claimable again, so a crash
-//! never loses an item.
+//! never loses an item. `held` records why a deliverer is holding an item back (V26 pane
+//! `pending: human draft in prompt`); it never changes what is delivered.
 
 use std::io;
 use std::path::PathBuf;
@@ -35,6 +36,7 @@ enum Entry {
     Claimed { id: String, route: String, token: String },
     Acked { id: String, token: String },
     Dropped { id: String, reason: String },
+    Held { id: String, route: String, reason: Option<String> },
 }
 
 /// A deliverer's verdict on one pending item at claim time.
@@ -61,6 +63,13 @@ pub enum Withdraw {
     Missing,
 }
 
+/// An item delivered by `route` (V28).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Delivered {
+    pub item: Item,
+    pub route: String,
+}
+
 /// Held by whoever claimed an item until it acks.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Claim {
@@ -77,6 +86,9 @@ struct Slot {
     item: Item,
     /// Latest claim: token + claim time.
     claim: Option<(String, u64)>,
+    /// Route of the latest claim.
+    route: Option<String>,
+    held: Option<String>,
     done: bool,
     acked: bool,
 }
@@ -157,6 +169,35 @@ impl Outbox {
         })
     }
 
+    /// Records why `route` holds pending item `id` back (`None` clears it); written only when the
+    /// reason changes, so a polling deliverer adds a line per change, not per poll.
+    pub fn hold(&self, id: &str, route: &str, reason: Option<&str>, now: u64) -> io::Result<()> {
+        self.transact(now, |slots| match slots.iter().find(|s| s.item.id == id && !s.done) {
+            Some(s) if s.held.as_deref() != reason => {
+                let held =
+                    Entry::Held { id: id.to_owned(), route: route.to_owned(), reason: reason.map(str::to_owned) };
+                (vec![held], ())
+            }
+            _ => (vec![], ()),
+        })
+    }
+
+    /// Why a deliverer holds pending item `id` back, if it says.
+    pub fn held(&self, id: &str) -> io::Result<Option<String>> {
+        let records = jsonl::read_from::<Record<Entry>>(&self.path, 0)?.records;
+        Ok(fold(records).into_iter().find(|s| s.item.id == id && !s.done).and_then(|s| s.held))
+    }
+
+    /// Acked items with the route that delivered them, oldest first.
+    pub fn delivered(&self) -> io::Result<Vec<Delivered>> {
+        let records = jsonl::read_from::<Record<Entry>>(&self.path, 0)?.records;
+        Ok(fold(records)
+            .into_iter()
+            .filter(|s| s.acked)
+            .map(|s| Delivered { item: s.item, route: s.route.unwrap_or_default() })
+            .collect())
+    }
+
     /// Items neither acked nor dropped, oldest first (claimed ones included).
     pub fn pending(&self) -> io::Result<Vec<Item>> {
         let records = jsonl::read_from::<Record<Entry>>(&self.path, 0)?.records;
@@ -181,7 +222,8 @@ fn fold(records: Vec<Record<Entry>>) -> Vec<Slot> {
     for r in records {
         let id = match &r.body {
             Entry::Queued(item) => {
-                let fresh = Slot { item: item.clone(), claim: None, done: false, acked: false };
+                let fresh =
+                    Slot { item: item.clone(), claim: None, route: None, held: None, done: false, acked: false };
                 // A re-queued (dropped) id is new: it goes to the back, oldest-first order kept.
                 match slots.iter().position(|s| s.item.id == item.id) {
                     None => slots.push(fresh),
@@ -193,11 +235,19 @@ fn fold(records: Vec<Record<Entry>>) -> Vec<Slot> {
                 }
                 continue;
             }
-            Entry::Claimed { id, .. } | Entry::Acked { id, .. } | Entry::Dropped { id, .. } => id,
+            Entry::Claimed { id, .. }
+            | Entry::Acked { id, .. }
+            | Entry::Dropped { id, .. }
+            | Entry::Held { id, .. } => id,
         };
         let Some(slot) = slots.iter_mut().find(|s| s.item.id == *id) else { continue };
         match r.body {
-            Entry::Claimed { token, .. } => slot.claim = Some((token, r.t)),
+            Entry::Claimed { token, route, .. } => {
+                slot.claim = Some((token, r.t));
+                slot.route = Some(route);
+                slot.held = None;
+            }
+            Entry::Held { reason, .. } => slot.held = reason,
             Entry::Acked { .. } => (slot.done, slot.acked) = (true, true),
             Entry::Dropped { .. } => slot.done = true,
             Entry::Queued(_) => {}

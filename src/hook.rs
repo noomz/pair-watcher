@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::delivery;
 use crate::home::Home;
+use crate::jsonl::now_ms;
 use crate::mailbox::{Hook, Mailbox};
 
 /// Set for every Watcher subprocess; hooks no-op under it so a Watcher never triggers itself.
@@ -18,15 +20,22 @@ pub const GUARD_ENV: &str = "PAIR_WATCHER_GUARD";
 /// `session_id`, which changes on Claude `/clear` and is unknown for Codex at launch (V58).
 pub const SESSION_ENV: &str = "PAIR_WATCHER_SESSION";
 
-/// Pure append, fail-silent: never prints, never fails the Worker.
+/// Pure append, fail-silent: never fails the Worker. Prints only a Claude `Stop` block carrying a
+/// ready Challenge (I7, V26).
 pub fn run(event: &str) {
     if std::env::var_os(GUARD_ENV).is_some() {
         return;
     }
-    let _ = append(event, io::stdin().lock(), std::env::var(SESSION_ENV).ok());
+    let Ok(Some((mailbox, payload))) = append(event, io::stdin().lock(), std::env::var(SESSION_ENV).ok()) else {
+        return;
+    };
+    if event == "Stop" {
+        let _ = delivery::stop_block(&mailbox, &payload, &mut io::stdout().lock(), now_ms());
+    }
 }
 
-fn append(event: &str, mut input: impl Read, launched: Option<String>) -> io::Result<()> {
+/// The registered mailbox it appended to, with the parsed payload.
+fn append(event: &str, mut input: impl Read, launched: Option<String>) -> io::Result<Option<(Mailbox, Value)>> {
     let home = Home::from_env()?;
     let mut raw = Vec::new();
     input.read_to_end(&mut raw)?;
@@ -36,11 +45,12 @@ fn append(event: &str, mut input: impl Read, launched: Option<String>) -> io::Re
         Some(key) => key.as_str(),
         None => match payload.get("session_id").and_then(Value::as_str) {
             Some(id) => id,
-            None => return Ok(()),
+            None => return Ok(None),
         },
     };
-    let Some(mailbox) = Mailbox::open_registered(&home, id) else { return Ok(()) };
-    mailbox.append_hook(&Hook { event: event.to_owned(), payload })
+    let Some(mailbox) = Mailbox::open_registered(&home, id) else { return Ok(None) };
+    mailbox.append_hook(&Hook { event: event.to_owned(), payload: payload.clone() })?;
+    Ok(Some((mailbox, payload)))
 }
 
 /// Writes `bin/pw-hook`: execs `exe` while it exists, else exits 0, so a removed binary stays

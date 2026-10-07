@@ -9,12 +9,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::event::EventLog;
-use crate::home::Home;
+use crate::home::{Home, write_atomic};
 use crate::jsonl::{self, Batch, Record};
 use crate::outbox::Outbox;
 
 /// Present while a Watcher follows the session; hooks no-op without it (V58).
 const REGISTERED: &str = "registered";
+/// Hook inbox offset the arbiter has stale-checked through (V21); idle deliverers wait on it.
+const SETTLED: &str = "settled";
 
 /// One hook invocation as appended to `events.jsonl` (I5).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -63,6 +65,21 @@ impl Mailbox {
     /// Hook inbox from `offset` (the Watcher's inbox cursor, V10).
     pub fn read_hooks(&self, offset: u64) -> io::Result<Batch<Record<Hook>>> {
         jsonl::read_from(&self.dir.join("events.jsonl"), offset)
+    }
+
+    /// Arbiter: every hook record before inbox `offset` has had its wake committed and the
+    /// waiting Challenge stale-checked (V21).
+    pub fn settle(&self, offset: u64) -> io::Result<()> {
+        write_atomic(&self.dir.join(SETTLED), offset.to_string().as_bytes())
+    }
+
+    /// The inbox offset last [`settle`](Self::settle)d; 0 before the first.
+    pub fn settled(&self) -> io::Result<u64> {
+        match fs::read_to_string(self.dir.join(SETTLED)) {
+            Ok(text) => text.trim().parse().map_err(|_| io::Error::other(format!("bad {SETTLED} file"))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(0),
+            Err(e) => Err(e),
+        }
     }
 
     pub fn outbox(&self) -> Outbox {

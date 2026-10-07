@@ -8,11 +8,18 @@ use std::path::PathBuf;
 
 use crate::home::{Home, write_atomic};
 
-/// (path under the version dir, contents).
-const FILES: [(&str, &str); 1] = [(PI_EXTENSION, include_str!("../adapters/pi/pair-watcher.ts"))];
+/// (path under the version dir, contents). Tests and generated mod types stay out.
+const FILES: [(&str, &str); 4] = [
+    (PI_EXTENSION, include_str!("../adapters/pi/pair-watcher.ts")),
+    ("claude/.claude-plugin/plugin.json", include_str!("../adapters/claude/.claude-plugin/plugin.json")),
+    ("claude/hooks/hooks.json", include_str!("../adapters/claude/hooks/hooks.json")),
+    ("claude/hooks/register.ts", include_str!("../adapters/claude/hooks/register.ts")),
+];
 
 /// pi `-e` target, relative to the version dir.
 pub const PI_EXTENSION: &str = "pi/pair-watcher.ts";
+/// Claude `--plugin-dir` target (the mod, I8), relative to the version dir.
+pub const CLAUDE_MOD: &str = "claude";
 
 /// Writes every adapter file that is missing or differs; returns the version dir.
 pub fn write(home: &Home) -> io::Result<PathBuf> {

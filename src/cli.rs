@@ -4,8 +4,12 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+use crate::delivery::{self, Route, Worker};
 use crate::focus::FocusSource;
 use crate::home::Home;
+use crate::jsonl::now_ms;
+use crate::mailbox::Mailbox;
+use crate::outbox::Claim;
 use crate::problem::{Problem, tilde};
 use crate::{config, hook, models, run, supervisor};
 
@@ -28,7 +32,8 @@ pub enum Command {
     Attach { session: String },
     /// Open the standalone pane
     Pane(SessionArg),
-    /// Hook entry point (pure append, fail-silent)
+    /// Hook entry point (pure append, fail-silent); `hook adapter …` serves the Claude mod and pi
+    /// extension
     Hook {
         event: String,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
@@ -255,8 +260,12 @@ pub enum PrefilterAction {
 }
 
 pub fn main() -> ExitCode {
-    let cli = Cli::parse();
-    match cli.command {
+    dispatch(Cli::parse().command)
+}
+
+fn dispatch(command: Command) -> ExitCode {
+    match command {
+        Command::Hook { event, rest } if event == ADAPTER => adapter(&rest),
         // Hooks never fail the Worker (V58).
         Command::Hook { event, .. } => {
             hook::run(&event);
@@ -280,6 +289,113 @@ pub fn main() -> ExitCode {
         | Command::Telemetry { .. }
         | Command::Prune => later("T18"),
         Command::Mcp => later("T20"),
+    }
+}
+
+/// `pw-hook adapter …`: the adapters reach the binary through the stable shim (V58).
+const ADAPTER: &str = "adapter";
+
+/// What the Claude mod and the pi extension ask of the mailbox (I8, I9).
+#[derive(Parser, Debug)]
+#[command(name = "pw-hook adapter", no_binary_name = true)]
+enum AdapterCmd {
+    /// Status line + Commentary; claims the next item only when the Worker is idle
+    Poll {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        route: AdapterRoute,
+        #[arg(long)]
+        worker: AdapterWorker,
+    },
+    /// The claimed item was handed to the Worker
+    Ack {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        token: String,
+    },
+    /// `/pw <command> …`: a session command for this session
+    Pw {
+        #[arg(long)]
+        session: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+enum AdapterRoute {
+    Mod,
+    Pi,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+enum AdapterWorker {
+    Idle,
+    Busy,
+    Draft,
+}
+
+/// Session commands `/pw` may run (I8).
+const PW_COMMANDS: [&str; 6] = ["rule", "undo", "keep", "mute", "nochallenge", "pause"];
+
+/// Fail-silent like a hook: a no-op under the Watcher guard or for an unregistered session.
+fn adapter(args: &[String]) -> ExitCode {
+    if std::env::var_os(hook::GUARD_ENV).is_some() {
+        return ExitCode::SUCCESS;
+    }
+    let cmd = match AdapterCmd::try_parse_from(args) {
+        Ok(cmd) => cmd,
+        Err(e) => return fail(&e.to_string()),
+    };
+    let session = match &cmd {
+        AdapterCmd::Poll { session, .. } | AdapterCmd::Ack { session, .. } | AdapterCmd::Pw { session, .. } => session,
+    };
+    let Some(mailbox) = Home::from_env().ok().and_then(|home| Mailbox::open_registered(&home, session)) else {
+        return ExitCode::SUCCESS;
+    };
+    let now = now_ms();
+    let result = match cmd {
+        AdapterCmd::Poll { route, worker, .. } => {
+            let route = match route {
+                AdapterRoute::Mod => Route::Mod,
+                AdapterRoute::Pi => Route::PiFollowUp,
+            };
+            let worker = match worker {
+                AdapterWorker::Idle => Worker::Idle,
+                AdapterWorker::Busy => Worker::Busy,
+                AdapterWorker::Draft => Worker::Draft,
+            };
+            delivery::poll(&mailbox, route, worker, now).and_then(|poll| {
+                println!("{}", serde_json::to_string(&poll)?);
+                Ok(())
+            })
+        }
+        AdapterCmd::Ack { id, token, .. } => {
+            let pending = mailbox.outbox().pending().map(|items| items.into_iter().find(|i| i.id == id));
+            match pending {
+                Ok(Some(item)) => mailbox.outbox().ack(&Claim { item, token }, now).map(drop),
+                Ok(None) => Ok(()),
+                Err(e) => Err(e),
+            }
+        }
+        AdapterCmd::Pw { session, args } => {
+            if !args.first().is_some_and(|c| PW_COMMANDS.contains(&c.as_str())) {
+                return fail(&format!("/pw takes {}", PW_COMMANDS.join("|")));
+            }
+            let argv = std::iter::once("pair-watcher".to_owned()).chain(args).chain(["--session".to_owned(), session]);
+            return match Cli::try_parse_from(argv) {
+                Ok(cli) => dispatch(cli.command),
+                Err(e) => fail(e.to_string().lines().next().unwrap_or("bad /pw command")),
+            };
+        }
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => fail(&e.to_string()),
     }
 }
 

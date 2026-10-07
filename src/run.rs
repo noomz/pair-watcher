@@ -133,7 +133,7 @@ fn wire(l: &Launch) -> io::Result<(Plan, Vec<String>)> {
             Harness::Claude => {
                 let file = mailbox.dir().join("claude-settings.json");
                 write_atomic(&file, &serde_json::to_vec_pretty(&launch::claude_settings(&shim))?)?;
-                launch::claude_args(&file)
+                launch::claude_args(&file, &adapters.join(adapters::CLAUDE_MOD))
             }
             Harness::Codex => {
                 let values = launch::codex_hook_values(&shim);

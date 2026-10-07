@@ -1,0 +1,229 @@
+//! Delivery of Challenges and Rulings to the Worker (V25–V29, I7–I9).
+//!
+//! Every route is a turn-end block or a harness-native follow-up at idle; nothing is steered,
+//! sent mid-tool or typed into a prompt box (V25). Deliverers touch only the outbox: the Claude
+//! `Stop` hook, the Claude mod and the pi extension (through `pw-hook adapter`), and the Watcher's
+//! `codex queue` call. The arbiter alone logs `challenge sent` from the outbox's acks (V43).
+
+use std::ffi::OsStr;
+use std::io::{self, Write};
+use std::process::{Command, Stdio};
+
+use serde::Serialize;
+use serde_json::{Value, json};
+
+use crate::challenge::Challenges;
+use crate::concern::{ConcernList, Severity, State};
+use crate::event::{Event, Kind};
+use crate::harness::Harness;
+use crate::mailbox::Mailbox;
+use crate::outbox::Claim;
+use crate::trigger::{self, Signal};
+
+/// Held reason a deliverer records while the human has a draft in the prompt box (V26).
+pub const DRAFT: &str = "draft";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Route {
+    /// Claude `Stop` hook block (I7).
+    Stop,
+    /// Claude mod `$.prompt.submit` at idle with an empty box (I8).
+    Mod,
+    /// `codex queue` after `Stop` (V27).
+    CodexQueue,
+    /// pi extension `sendUserMessage(…, {deliverAs: "followUp"})` (I9).
+    PiFollowUp,
+}
+
+impl Route {
+    pub fn name(self) -> &'static str {
+        match self {
+            Route::Stop => "stop",
+            Route::Mod => "mod",
+            Route::CodexQueue => "codex-queue",
+            Route::PiFollowUp => "pi-followup",
+        }
+    }
+
+    /// Starts a turn at idle, so it waits for the stale check of the latest turn end (V21). The
+    /// `Stop` block carries a Challenge that was ready before that `Stop` (V26).
+    fn idle(self) -> bool {
+        self != Route::Stop
+    }
+}
+
+/// The session as its event log has it: what deliverers need to pick and gate a route.
+pub struct View {
+    /// From `session` start; `None` (no start logged) delivers nothing.
+    pub harness: Option<Harness>,
+    /// No hooks: Challenges stay pending, never delivered (V29).
+    pub observe_only: bool,
+    pub challenges: Challenges,
+    pub concerns: ConcernList,
+}
+
+impl View {
+    pub fn read(mailbox: &Mailbox) -> io::Result<View> {
+        let events: Vec<Event> = mailbox.log().read_from(0)?.records.into_iter().map(|r| r.body).collect();
+        let start = events.iter().find(|e| e.k == Kind::Session && e.str("phase") == Some("start"));
+        Ok(View {
+            harness: start.and_then(|e| e.str("harness")).and_then(|h| Harness::from_program(OsStr::new(h))),
+            observe_only: start.and_then(|e| e.fields.get("observe_only")).and_then(Value::as_bool).unwrap_or(false),
+            challenges: Challenges::rebuild(&events),
+            concerns: ConcernList::rebuild(&events),
+        })
+    }
+
+    /// The slot's Challenge while it waits for delivery: id + pane line (V26, V29).
+    pub fn pending(&self, mailbox: &Mailbox) -> io::Result<Option<(String, String)>> {
+        let Some(slot) = self.challenges.slot().filter(|s| !s.sent && !s.stale) else { return Ok(None) };
+        let line = if self.observe_only {
+            "pending: observe-only, not delivered"
+        } else if mailbox.outbox().held(&slot.id)?.as_deref() == Some(DRAFT) {
+            "pending: human draft in prompt"
+        } else {
+            "pending: Worker idle"
+        };
+        Ok(Some((slot.id.clone(), line.to_owned())))
+    }
+
+    /// Claude mod status-line field (I8): non-zero parts only; `None` clears the line.
+    pub fn status_line(&self) -> Option<String> {
+        let open = self.concerns.all().iter().filter(|c| c.state == State::Open).count();
+        let mut parts = Vec::new();
+        if self.observe_only {
+            parts.push("observe-only".to_owned());
+        }
+        if open > 0 {
+            parts.push(format!("{open} open"));
+        }
+        if let Some(s) = self.challenges.slot().filter(|s| !s.stale) {
+            parts.push(format!("Challenge {} {}", s.id, if s.sent { "in debate" } else { "pending" }));
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+
+    /// `/commentary` lines: open Concerns, `warn` first, then the waiting Challenge.
+    pub fn commentary(&self, pending: Option<&str>) -> Vec<String> {
+        let mut open: Vec<_> = self.concerns.all().iter().filter(|c| c.state == State::Open).collect();
+        open.sort_by_key(|c| c.severity != Severity::Warn);
+        let mut lines: Vec<String> =
+            open.iter().map(|c| format!("{} {} [{}] {}", c.severity.name(), c.id, c.focus, c.headline)).collect();
+        lines.extend(pending.map(str::to_owned));
+        lines
+    }
+}
+
+/// Claims the next item `route` may deliver now (V28), or `None`.
+pub fn claim(mailbox: &Mailbox, view: &View, route: Route, now: u64) -> io::Result<Option<Claim>> {
+    let Some(harness) = view.harness else { return Ok(None) };
+    if view.observe_only || (route.idle() && !settled(mailbox, harness)?) {
+        return Ok(None);
+    }
+    mailbox.outbox().claim(route.name(), now, |item| view.challenges.gate(item))
+}
+
+/// No turn end in the hook inbox past the arbiter's settled offset (V21).
+fn settled(mailbox: &Mailbox, harness: Harness) -> io::Result<bool> {
+    let hooks = mailbox.read_hooks(mailbox.settled()?)?.records;
+    Ok(!hooks.iter().any(|r| trigger::signal(harness, &r.body.event) == Some(Signal::TurnEnd)))
+}
+
+/// The Claude `Stop` hook's answer (I7, V26): a ready item blocks the stop with its text as
+/// `reason`, written to `out`. Never while `stop_hook_active` (Claude is already continuing for a
+/// block). Returns whether it blocked.
+pub fn stop_block(mailbox: &Mailbox, payload: &Value, out: &mut impl Write, now: u64) -> io::Result<bool> {
+    if payload.get("stop_hook_active").and_then(Value::as_bool) == Some(true) {
+        return Ok(false);
+    }
+    let view = View::read(mailbox)?;
+    if view.harness != Some(Harness::Claude) {
+        return Ok(false);
+    }
+    let Some(claim) = claim(mailbox, &view, Route::Stop, now)? else { return Ok(false) };
+    let mut line = serde_json::to_vec(&json!({"decision": "block", "reason": claim.item.text}))?;
+    line.push(b'\n');
+    out.write_all(&line)?;
+    out.flush()?;
+    mailbox.outbox().ack(&claim, now)?;
+    Ok(true)
+}
+
+/// After the turn-end wake (V27): `<codex> queue --thread <id> --message <text>` for the next
+/// deliverable item. Returns the delivered id. A failed call leaves the claim to lapse, so the
+/// item is tried again after the lease.
+pub fn codex_queue(mailbox: &Mailbox, codex: &OsStr, now: u64) -> io::Result<Option<String>> {
+    let view = View::read(mailbox)?;
+    if view.harness != Some(Harness::Codex) {
+        return Ok(None);
+    }
+    let Some(thread) = worker_session(mailbox)? else { return Ok(None) };
+    let Some(claim) = claim(mailbox, &view, Route::CodexQueue, now)? else { return Ok(None) };
+    let status = Command::new(codex)
+        .args(["queue", "--thread", &thread, "--message", &claim.item.text])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if !status.success() {
+        return Err(io::Error::other(format!("codex queue: {status}")));
+    }
+    mailbox.outbox().ack(&claim, now)?;
+    Ok(Some(claim.item.id))
+}
+
+/// The Worker's own session id, from the latest hook payload carrying one (V58).
+pub fn worker_session(mailbox: &Mailbox) -> io::Result<Option<String>> {
+    let hooks = mailbox.read_hooks(0)?.records;
+    Ok(hooks.iter().rev().find_map(|r| r.body.payload.get("session_id")?.as_str().map(str::to_owned)))
+}
+
+/// What an adapter's deliverer reports about its Worker each poll.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Worker {
+    /// No turn running, prompt box empty: it may deliver now.
+    Idle,
+    /// A turn is running: hold for the turn end.
+    Busy,
+    /// Idle, but the human has a draft in the prompt box (V26).
+    Draft,
+}
+
+/// One adapter poll's answer (`pw-hook adapter poll`).
+#[derive(Serialize, Debug, PartialEq)]
+pub struct Poll {
+    /// Status-line field; absent clears it.
+    pub status: Option<String>,
+    pub commentary: Vec<String>,
+    /// Claimed for delivery: send `text`, then ack with `token`.
+    pub item: Option<PollItem>,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+pub struct PollItem {
+    pub id: String,
+    pub text: String,
+    pub token: String,
+}
+
+/// An adapter route's poll: claims only at `Worker::Idle`; otherwise records why the waiting
+/// Challenge is held, for the pane.
+pub fn poll(mailbox: &Mailbox, route: Route, worker: Worker, now: u64) -> io::Result<Poll> {
+    let view = View::read(mailbox)?;
+    let item = match worker {
+        Worker::Idle => claim(mailbox, &view, route, now)?,
+        Worker::Busy | Worker::Draft => {
+            if let Some(slot) = view.challenges.slot().filter(|s| !s.sent) {
+                let reason = (worker == Worker::Draft).then_some(DRAFT);
+                mailbox.outbox().hold(&slot.id, route.name(), reason, now)?;
+            }
+            None
+        }
+    };
+    let pending = view.pending(mailbox)?;
+    Ok(Poll {
+        status: view.status_line(),
+        commentary: view.commentary(pending.as_ref().map(|(_, line)| line.as_str())),
+        item: item.map(|c| PollItem { id: c.item.id, text: c.item.text, token: c.token }),
+    })
+}

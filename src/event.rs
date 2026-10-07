@@ -58,6 +58,11 @@ impl Event {
         Event { k, fields }
     }
 
+    /// String field `key`, if present and a string.
+    pub fn str(&self, key: &str) -> Option<&str> {
+        self.fields.get(key).and_then(Value::as_str)
+    }
+
     /// The fields read back as `T`; `None` when they do not fit.
     pub fn parse<T: DeserializeOwned>(&self) -> Option<T> {
         serde_json::from_value(Value::Object(self.fields.clone())).ok()

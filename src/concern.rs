@@ -174,8 +174,8 @@ impl ConcernList {
                 }
                 Some(Change::Trimmed { .. }) | None => {}
             },
-            Kind::Human if event.fields.get("action").and_then(|a| a.as_str()) == Some("dismiss") => {
-                if let Some(id) = event.fields.get("id").and_then(|i| i.as_str()) {
+            Kind::Human if event.str("action") == Some("dismiss") => {
+                if let Some(id) = event.str("id") {
                     self.close(id, State::Dismissed);
                 }
             }

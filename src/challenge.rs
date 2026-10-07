@@ -235,7 +235,7 @@ pub enum Op {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         remark: Option<String>,
     },
-    /// Delivered by `route` (T9); the Debate is on.
+    /// Delivered by `route` (`delivery::Route`); the Debate is on.
     Sent {
         id: String,
         route: String,
@@ -322,13 +322,13 @@ impl Challenges {
                 Some(Change::Resolve { id, .. } | Change::Duplicate { id, .. }) => self.changed(&id),
                 _ => {}
             },
-            Kind::Human if field(event, "action") == Some("dismiss") => {
-                if let Some(id) = field(event, "id") {
+            Kind::Human if event.str("action") == Some("dismiss") => {
+                if let Some(id) = event.str("id") {
                     self.changed(id);
                 }
             }
-            Kind::Debate if field(event, "op") == Some("end") => {
-                if let Some(id) = field(event, "challenge") {
+            Kind::Debate if event.str("op") == Some("end") => {
+                if let Some(id) = event.str("challenge") {
                     self.free(id);
                 }
             }
@@ -473,6 +473,19 @@ impl Challenges {
         Ok(Some(format!("Challenge {id} dropped: {concern} changed before delivery")))
     }
 
+    /// Logs `challenge sent {route}` once the outbox has the slot's Challenge acked (V28, V94):
+    /// the Debate is on. Deliverers write only the outbox; the log is the arbiter's (V43). Returns
+    /// the route it logged.
+    pub fn sync_sent(&mut self, log: &EventLog, outbox: &Outbox) -> io::Result<Option<String>> {
+        let Some(id) = self.slot.as_ref().filter(|s| !s.sent).map(|s| s.id.clone()) else { return Ok(None) };
+        let delivered = outbox.delivered()?;
+        let Some(d) = delivered.into_iter().find(|d| d.item.kind == ItemKind::Challenge && d.item.id == id) else {
+            return Ok(None);
+        };
+        self.commit(log, &Op::Sent { id, route: d.route.clone() })?;
+        Ok(Some(d.route))
+    }
+
     fn commit(&mut self, log: &EventLog, op: &Op) -> io::Result<()> {
         let event = op.event();
         log.append(event.clone())?;
@@ -492,10 +505,6 @@ impl Challenges {
             self.slot = None;
         }
     }
-}
-
-fn field<'e>(event: &'e Event, key: &str) -> Option<&'e str> {
-    event.fields.get(key).and_then(Value::as_str)
 }
 
 /// The Challenge as the Worker reads it (I11).
