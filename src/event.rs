@@ -4,6 +4,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -46,6 +47,20 @@ impl Event {
     pub fn with(mut self, key: &str, value: impl Into<Value>) -> Self {
         self.fields.insert(key.to_owned(), value.into());
         self
+    }
+
+    /// An event whose fields are `body` serialized as a JSON object.
+    pub fn typed<T: Serialize>(k: Kind, body: &T) -> Self {
+        let fields = match serde_json::to_value(body) {
+            Ok(Value::Object(map)) => map,
+            other => panic!("event body must serialize to an object, got {other:?}"),
+        };
+        Event { k, fields }
+    }
+
+    /// The fields read back as `T`; `None` when they do not fit.
+    pub fn parse<T: DeserializeOwned>(&self) -> Option<T> {
+        serde_json::from_value(Value::Object(self.fields.clone())).ok()
     }
 }
 

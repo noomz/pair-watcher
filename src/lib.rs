@@ -1,6 +1,7 @@
 pub mod action;
 pub mod adapters;
 pub mod approval;
+pub mod arbiter;
 pub mod budget;
 pub mod cli;
 pub mod clip;
@@ -18,6 +19,7 @@ pub mod launch;
 pub mod mailbox;
 pub mod models;
 pub mod outbox;
+pub mod output;
 pub mod placement;
 pub mod problem;
 pub mod provider;

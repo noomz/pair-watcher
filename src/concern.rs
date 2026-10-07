@@ -1,20 +1,51 @@
-//! Concern record shape (I10) as wake input lists it (V7, V44). Lifecycle and ids: T7 arbiter.
+//! Concerns (I10) and their one lifecycle (V13, V18). The list is a fold over the session event
+//! log (V93): the arbiter writes `concern` changes, the human writes `human dismiss`; anything that
+//! reads the log (pane, restart) rebuilds the same list.
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+use crate::event::{Event, Kind};
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
 pub enum Severity {
     Note,
     Warn,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
 pub enum State {
     Open,
     Dismissed,
     Resolved,
 }
 
+/// One cited item backing a Challenge; each must exist verbatim in its source (V17).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum Evidence {
+    /// `at` = `file:line`; `excerpt` = text at that line in the snapshot.
+    File {
+        #[serde(rename = "ref")]
+        at: String,
+        excerpt: String,
+    },
+    Command {
+        command: String,
+        output: String,
+    },
+    Transcript {
+        excerpt: String,
+    },
+    /// A repeat hint line from the wake input (V4).
+    Hint {
+        excerpt: String,
+    },
+}
+
 /// One Concern; a list of them is oldest first.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Concern {
     pub id: String,
     /// Owner Focus (V44).
@@ -24,6 +55,127 @@ pub struct Concern {
     pub headline: String,
     pub detail: Vec<String>,
     pub refs: Vec<String>,
+    /// The Watcher marks it approach-level and challenge-ready (V16).
+    pub challenge: bool,
+    pub evidence: Vec<Evidence>,
+    pub alternative: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Resolution {
+    Fixed,
+    NoLongerApplies,
+}
+
+/// Payload of a `concern` event (V94). `watcher` = the Watcher whose output caused it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(tag = "op", rename_all = "kebab-case")]
+pub enum Change {
+    Add {
+        watcher: String,
+        #[serde(flatten)]
+        concern: Concern,
+    },
+    /// The owner's new evidence; replaces the Concern with the same id.
+    Update {
+        watcher: String,
+        #[serde(flatten)]
+        concern: Concern,
+    },
+    Resolve {
+        watcher: String,
+        id: String,
+        reason: Resolution,
+    },
+    /// Resolved as a repeat of `of` (V44).
+    Duplicate {
+        watcher: String,
+        id: String,
+        of: String,
+    },
+    /// Over the per-wake cap: never shown, never listed, so a later raise is not a repeat (V14).
+    /// `id` is set when an update was trimmed.
+    Trimmed {
+        watcher: String,
+        focus: String,
+        severity: Severity,
+        headline: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
+}
+
+impl Change {
+    pub fn event(&self) -> Event {
+        Event::typed(Kind::Concern, self)
+    }
+}
+
+/// The human's `d` on a Concern (V94 `human dismiss`). Final: it never reopens (V13).
+pub fn dismissal(id: &str) -> Event {
+    Event::new(Kind::Human).with("action", "dismiss").with("id", id)
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ConcernList {
+    concerns: Vec<Concern>,
+}
+
+impl ConcernList {
+    pub fn rebuild<'a>(events: impl IntoIterator<Item = &'a Event>) -> ConcernList {
+        let mut list = ConcernList::default();
+        for e in events {
+            list.apply(e);
+        }
+        list
+    }
+
+    /// Oldest first, all Focuses.
+    pub fn all(&self) -> &[Concern] {
+        &self.concerns
+    }
+
+    pub fn get(&self, id: &str) -> Option<&Concern> {
+        self.concerns.iter().find(|c| c.id == id)
+    }
+
+    /// Id of the `n`-th Concern added after the current list (0 = next).
+    pub fn mint(&self, n: usize) -> String {
+        format!("c{}", self.concerns.len() + n + 1)
+    }
+
+    pub fn apply(&mut self, event: &Event) {
+        match event.k {
+            Kind::Concern => match event.parse::<Change>() {
+                Some(Change::Add { concern, .. }) => self.concerns.push(concern),
+                Some(Change::Update { concern, .. }) => {
+                    if let Some(c) = self.find(&concern.id) {
+                        *c = concern;
+                    }
+                }
+                Some(Change::Resolve { id, .. } | Change::Duplicate { id, .. }) => self.close(&id, State::Resolved),
+                Some(Change::Trimmed { .. }) | None => {}
+            },
+            Kind::Human if event.fields.get("action").and_then(|a| a.as_str()) == Some("dismiss") => {
+                if let Some(id) = event.fields.get("id").and_then(|i| i.as_str()) {
+                    self.close(id, State::Dismissed);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn find(&mut self, id: &str) -> Option<&mut Concern> {
+        self.concerns.iter_mut().find(|c| c.id == id)
+    }
+
+    /// Only an open Concern closes; a closed one never changes state again.
+    fn close(&mut self, id: &str, state: State) {
+        if let Some(c) = self.find(id).filter(|c| c.state == State::Open) {
+            c.state = state;
+        }
+    }
 }
 
 impl Severity {

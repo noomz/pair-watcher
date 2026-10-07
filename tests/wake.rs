@@ -31,6 +31,9 @@ fn concern(id: &str, focus: &str, state: State, detail: usize) -> Concern {
         headline: format!("headline of {id}"),
         detail: (0..detail).map(|i| format!("detail {i} {}", "d".repeat(100))).collect(),
         refs: vec!["src/client.ts:57".into()],
+        challenge: false,
+        evidence: vec![],
+        alternative: None,
     }
 }
 
@@ -96,6 +99,9 @@ fn repetition_input() -> (Input, History) {
             headline: "Retry change in client.ts:57 has no test".into(),
             detail: vec![],
             refs: vec![],
+            challenge: false,
+            evidence: vec![],
+            alternative: None,
         },
         Concern {
             id: "c2".into(),
@@ -105,6 +111,9 @@ fn repetition_input() -> (Input, History) {
             headline: "Review round 3 requested though round 2 found nothing new".into(),
             detail: vec!["repeat hint: gh pr comment 412 seen 3×, outcome unchanged".into()],
             refs: vec![],
+            challenge: false,
+            evidence: vec![],
+            alternative: None,
         },
     ];
     let instructions = ["AGENTS.md".to_owned()];
