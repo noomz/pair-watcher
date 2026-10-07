@@ -197,7 +197,7 @@ fn notified_exactly_once() {
     let calls = calls(f.dir.path());
     assert_eq!(calls.len(), 1);
     assert!(
-        calls[0].starts_with("Debate unresolved: retry loop never converges (c1)\nWatcher (approach): "),
+        calls[0].starts_with("--\nDebate unresolved: retry loop never converges (c1)\nWatcher (approach): "),
         "{}",
         calls[0]
     );
@@ -349,8 +349,49 @@ fn notifier_detect_and_argv() {
     let dir = TempDir::new().unwrap();
     let bin = fake(dir.path(), 0);
     Notifier::Herdr(bin.clone()).show("T \"quoted\"", "line 1\nline 2").unwrap();
-    assert_eq!(calls(dir.path())[0], "notification\nshow\nT \"quoted\"\n--body\nline 1\nline 2\n--sound\nrequest\n");
+    assert_eq!(calls(dir.path())[0], "notification\nshow\n--body=line 1\nline 2\n--sound\nrequest\n--\nT \"quoted\"\n");
     Notifier::Osascript(bin).show("T", "B").unwrap();
-    assert!(calls(dir.path())[1].ends_with("end run\nT\nB\n"), "{}", calls(dir.path())[1]);
+    assert!(calls(dir.path())[1].ends_with("end run\n--\nT\nB\n"), "{}", calls(dir.path())[1]);
     assert!(Notifier::None.show("T", "B").is_err());
+}
+
+/// Codex review: text starting with `-` never reads as a notifier option.
+#[test]
+fn dash_text_stays_text() {
+    let dir = TempDir::new().unwrap();
+    let bin = fake(dir.path(), 0);
+    Notifier::NotifySend(bin).show("--icon=x", "-u critical").unwrap();
+    assert_eq!(calls(dir.path())[0], "--\n--icon=x\n-u critical\n");
+}
+
+/// Codex review (V40): a crash after `sending` and before `notified` never sends again.
+#[test]
+fn cut_off_send_is_not_resent() {
+    let mut f = Fx::new();
+    let bin = fake(f.dir.path(), 0);
+    f.debate_unresolved(true);
+    f.raise_unresolved(true);
+    f.log(escalation::Op::Sending { id: "e1".into(), via: "notify-send".into() }.event());
+    f.e = Escalations::rebuild(&f.events());
+    assert_eq!(f.e.get("e1").unwrap().stage, Stage::Sending);
+    assert!(f.deliver(&Notifier::NotifySend(bin), false).is_empty());
+    assert!(calls(f.dir.path()).is_empty());
+    assert!(f.ops("notified")[0].str("error").unwrap().starts_with("unconfirmed"));
+    assert_eq!(f.e.get("e1").unwrap().stage, Stage::Notified);
+    f.assert_consistent();
+}
+
+/// Codex review (I13): a long alternative never clips the evidence away.
+#[test]
+fn long_alternative_keeps_evidence() {
+    let mut f = Fx::new();
+    let mut c = concern();
+    c.alternative = Some("a".repeat(300));
+    f.log(Change::Update { watcher: "approach".into(), concern: c }.event());
+    f.debate_unresolved(true);
+    f.raise_unresolved(true);
+    let line = &f.e.get("e1").unwrap().lines[0];
+    let text = line.strip_prefix("Watcher (approach): ").unwrap();
+    assert!(text.len() <= 100, "{}", text.len());
+    assert!(text.contains(" — `cargo test` → 6 failed"), "{text}");
 }

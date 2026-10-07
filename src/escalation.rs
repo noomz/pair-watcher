@@ -66,10 +66,16 @@ pub enum Op {
         /// Where to rule (I13).
         rule: String,
     },
+    /// About to call the notifier. A crash before `notified` leaves it unconfirmed: never sent
+    /// again (at most one; a second interruption costs more than a lost toast, C1).
+    Sending {
+        id: String,
+        via: String,
+    },
     Notified {
         id: String,
         via: String,
-        /// The notifier failed: not retried, the pane still shows it (V40 exactly one).
+        /// The notifier failed or was cut off: not retried, the pane still shows it (V40).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
@@ -88,6 +94,7 @@ impl Op {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
     Raised,
+    Sending,
     Notified,
     Dropped,
 }
@@ -179,6 +186,7 @@ impl Escalations {
                     let stage = Stage::Raised;
                     self.all.push(Escalation { id, cause, concern, challenge, hook, title, lines, rule, stage });
                 }
+                Some(Op::Sending { id, .. }) => self.stage(&id, Stage::Sending),
                 Some(Op::Notified { id, .. }) => self.stage(&id, Stage::Notified),
                 Some(Op::DroppedStale { id, .. }) => self.stage(&id, Stage::Dropped),
                 None => {}
@@ -188,7 +196,8 @@ impl Escalations {
     }
 
     fn stage(&mut self, id: &str, stage: Stage) {
-        if let Some(e) = self.all.iter_mut().find(|e| e.id == id && e.stage == Stage::Raised) {
+        let open = |s: Stage| matches!(s, Stage::Raised | Stage::Sending);
+        if let Some(e) = self.all.iter_mut().find(|e| e.id == id && open(e.stage)) {
             e.stage = stage;
         }
     }
@@ -217,11 +226,7 @@ impl Escalations {
                 Some(c) if swarm => format!("Watcher ({})", c.focus),
                 _ => "Watcher".to_owned(),
             };
-            let argument = c.map(|c| {
-                let strongest = c.evidence.first().map(evidence);
-                let parts: Vec<&str> = c.alternative.as_deref().into_iter().chain(strongest.as_deref()).collect();
-                clip::head(&parts.join(" — "), WATCHER_MAX)
-            });
+            let argument = c.map(|c| argument(c.alternative.as_deref(), c.evidence.first().map(evidence)));
             let worker = self.reasons.get(&challenge).map_or("no verdict line (no answer)", String::as_str);
             let op = Op::Raised {
                 title: format!("Debate unresolved: {headline} ({concern})"),
@@ -314,6 +319,17 @@ impl Escalations {
         answered: impl Fn(u64) -> io::Result<bool>,
         notifier: &Notifier,
     ) -> io::Result<Vec<String>> {
+        // Cut off mid-send by a crash: it may have gone out, so it is never sent again.
+        let cut: Vec<(String, String)> = self
+            .all
+            .iter()
+            .filter(|e| e.stage == Stage::Sending)
+            .map(|e| (e.id.clone(), notifier.name().to_owned()))
+            .collect();
+        for (id, via) in cut {
+            let error = Some("unconfirmed: interrupted while sending".to_owned());
+            self.commit(log, &Op::Notified { id, via, error })?;
+        }
         let pending: Vec<Escalation> = self.all.iter().filter(|e| e.stage == Stage::Raised).cloned().collect();
         let mut notified = Vec::new();
         for e in pending {
@@ -328,8 +344,10 @@ impl Escalations {
                 self.commit(log, &Op::DroppedStale { id: e.id, why })?;
                 continue;
             }
+            let via = notifier.name().to_owned();
+            self.commit(log, &Op::Sending { id: e.id.clone(), via: via.clone() })?;
             let error = notifier.show(&e.title, &e.body()).err().map(|err| err.to_string());
-            self.commit(log, &Op::Notified { id: e.id.clone(), via: notifier.name().to_owned(), error })?;
+            self.commit(log, &Op::Notified { id: e.id.clone(), via, error })?;
             notified.push(e.id);
         }
         Ok(notified)
@@ -378,6 +396,23 @@ pub fn question(payload: &Value) -> String {
             .to_owned()
     };
     clip::first_line(&text.split_whitespace().collect::<Vec<_>>().join(" "), QUESTION_MAX)
+}
+
+/// Alternative + strongest evidence in [`WATCHER_MAX`] bytes; when both do not fit, each keeps
+/// at least half the room the other leaves, so the evidence is never clipped away (I13).
+fn argument(alternative: Option<&str>, evidence: Option<String>) -> String {
+    const SEP: &str = " — ";
+    match (alternative, evidence) {
+        (Some(a), Some(e)) if a.len() + SEP.len() + e.len() > WATCHER_MAX => {
+            let room = WATCHER_MAX - SEP.len();
+            let evidence = e.len().min(room - a.len().min(room / 2));
+            format!("{}{SEP}{}", clip::head(a, room - evidence), clip::head(&e, evidence))
+        }
+        (Some(a), Some(e)) => format!("{a}{SEP}{e}"),
+        (Some(a), None) => clip::head(a, WATCHER_MAX),
+        (None, Some(e)) => clip::head(&e, WATCHER_MAX),
+        (None, None) => String::new(),
+    }
 }
 
 fn evidence(e: &Evidence) -> String {
@@ -434,10 +469,12 @@ impl Notifier {
         }
     }
 
-    /// Shows one notification; title and body go as argv, never through a shell or script text.
+    /// Shows one notification; title and body go as argv, never through a shell or script text,
+    /// and never where they could read as options (text may start with `-`).
     pub fn show(&self, title: &str, body: &str) -> io::Result<()> {
+        let body_opt = format!("--body={body}");
         let (bin, args): (&PathBuf, Vec<&str>) = match self {
-            Notifier::Herdr(bin) => (bin, vec!["notification", "show", title, "--body", body, "--sound", "request"]),
+            Notifier::Herdr(bin) => (bin, vec!["notification", "show", &body_opt, "--sound", "request", "--", title]),
             Notifier::Osascript(bin) => (
                 bin,
                 vec![
@@ -447,11 +484,12 @@ impl Notifier {
                     "display notification (item 2 of argv) with title (item 1 of argv)",
                     "-e",
                     "end run",
+                    "--",
                     title,
                     body,
                 ],
             ),
-            Notifier::NotifySend(bin) => (bin, vec![title, body]),
+            Notifier::NotifySend(bin) => (bin, vec!["--", title, body]),
             Notifier::None => return Err(io::Error::new(io::ErrorKind::Unsupported, "no notifier")),
         };
         let mut child =
