@@ -59,6 +59,10 @@ pub struct Concern {
     pub challenge: bool,
     pub evidence: Vec<Evidence>,
     pub alternative: Option<String>,
+    /// Set by `challenge::verify` on the add/update that carries it: the bar holds and every cited
+    /// item was found verbatim (V16, V17). Default-deny: absent = not challenge-ready.
+    #[serde(default)]
+    pub verified: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]

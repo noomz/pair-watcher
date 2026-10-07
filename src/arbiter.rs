@@ -184,6 +184,7 @@ fn added(list: &ConcernList, pending: &[Candidate], w: &Watcher, line: &Line) ->
         challenge: *challenge,
         evidence: evidence.clone(),
         alternative: alternative.clone(),
+        verified: false,
     };
     let key = norm(headline);
     for c in list.all().iter().filter(|c| norm(&c.headline) == key) {
@@ -207,6 +208,7 @@ fn updated(c: &Concern, line: &Line) -> Option<Concern> {
         unreachable!("updated() takes update lines")
     };
     let mut next = c.clone();
+    next.verified = false;
     if let Some(s) = severity {
         next.severity = *s;
     }
@@ -228,7 +230,9 @@ fn updated(c: &Concern, line: &Line) -> Option<Concern> {
     if let Some(a) = alternative {
         next.alternative = Some(a.clone());
     }
-    (next != *c).then_some(next)
+    let mut was = c.clone();
+    was.verified = false;
+    (next != was).then_some(next)
 }
 
 /// Shown candidates in fill order: challenge-flagged, then `warn`, then `note`; within each class

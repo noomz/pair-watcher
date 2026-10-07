@@ -34,6 +34,7 @@ fn concern(id: &str, focus: &str, state: State, detail: usize) -> Concern {
         challenge: false,
         evidence: vec![],
         alternative: None,
+        verified: false,
     }
 }
 
@@ -102,6 +103,7 @@ fn repetition_input() -> (Input, History) {
             challenge: false,
             evidence: vec![],
             alternative: None,
+            verified: false,
         },
         Concern {
             id: "c2".into(),
@@ -114,6 +116,7 @@ fn repetition_input() -> (Input, History) {
             challenge: false,
             evidence: vec![],
             alternative: None,
+            verified: false,
         },
     ];
     let instructions = ["AGENTS.md".to_owned()];

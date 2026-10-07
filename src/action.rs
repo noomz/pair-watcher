@@ -15,7 +15,7 @@ pub fn signature(tool: &str, input: &str) -> String {
 }
 
 /// The argument naming what a call does: a shell command, else its target.
-fn command(input: &str) -> String {
+pub fn command(input: &str) -> String {
     if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(input) {
         for key in ["command", "cmd", "file_path", "path", "pattern", "url", "query"] {
             match map.get(key) {
@@ -133,7 +133,7 @@ pub enum Outcome {
 
 /// Tools whose result carries a process exit status: Claude `Bash`, Codex `exec` (and older
 /// `exec_command`/`shell`/`local_shell`), pi `bash`. Other results may be file content.
-const SHELL_TOOLS: [&str; 6] = ["Bash", "bash", "exec", "exec_command", "shell", "local_shell"];
+pub const SHELL_TOOLS: [&str; 6] = ["Bash", "bash", "exec", "exec_command", "shell", "local_shell"];
 
 impl Outcome {
     pub fn of(tool: &str, output: &str, error: bool) -> Outcome {

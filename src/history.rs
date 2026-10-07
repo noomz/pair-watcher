@@ -20,7 +20,7 @@ pub const ASK_MAX: usize = 1536;
 /// Task-section total before the middle folds (V6).
 pub const TASK_MAX: usize = 6 * 1024;
 /// Prompts the adapters deliver (Challenge, Ruling) start with this; they are not the human's.
-const OWN_PREFIX: &str = "[pair-watcher ·";
+pub const OWN_PREFIX: &str = "[pair-watcher ·";
 /// Claude's blocked-question tool: its result is the human's answer.
 const ASK_TOOL: &str = "AskUserQuestion";
 

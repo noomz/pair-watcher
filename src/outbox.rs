@@ -54,6 +54,7 @@ struct Slot {
     /// Latest claim: token + claim time.
     claim: Option<(String, u64)>,
     done: bool,
+    acked: bool,
 }
 
 impl Outbox {
@@ -120,6 +121,12 @@ impl Outbox {
         Ok(fold(records).into_iter().filter(|s| !s.done).map(|s| s.item).collect())
     }
 
+    /// True once item `id` was delivered (acked).
+    pub fn acked(&self, id: &str) -> io::Result<bool> {
+        let records = jsonl::read_from::<Record<Entry>>(&self.path, 0)?.records;
+        Ok(fold(records).iter().any(|s| s.item.id == id && s.acked))
+    }
+
     /// Read the whole outbox and append `f`'s entries under one exclusive lock.
     fn transact<R>(&self, now: u64, f: impl FnOnce(&[Slot]) -> (Vec<Entry>, R)) -> io::Result<R> {
         let file = jsonl::open_append(&self.path)?;
@@ -139,7 +146,7 @@ fn fold(records: Vec<Record<Entry>>) -> Vec<Slot> {
         let id = match &r.body {
             Entry::Queued(item) => {
                 if !slots.iter().any(|s| s.item.id == item.id) {
-                    slots.push(Slot { item: item.clone(), claim: None, done: false });
+                    slots.push(Slot { item: item.clone(), claim: None, done: false, acked: false });
                 }
                 continue;
             }
@@ -148,7 +155,8 @@ fn fold(records: Vec<Record<Entry>>) -> Vec<Slot> {
         let Some(slot) = slots.iter_mut().find(|s| s.item.id == *id) else { continue };
         match r.body {
             Entry::Claimed { token, .. } => slot.claim = Some((token, r.t)),
-            Entry::Acked { .. } | Entry::Dropped { .. } => slot.done = true,
+            Entry::Acked { .. } => (slot.done, slot.acked) = (true, true),
+            Entry::Dropped { .. } => slot.done = true,
             Entry::Queued(_) => {}
         }
     }
