@@ -315,11 +315,13 @@ fn human_turn_is_evidence_only() {
     assert!(f.ops("exchange").is_empty(), "never an exchange");
     assert_eq!(f.ops("human-turn").len(), 1);
     assert_eq!(f.d.open().unwrap().phase, Phase::Awaiting);
-    assert_eq!(f.decide(&[]).ended, None, "nothing owed");
-
-    // A later turn without a verdict is the "no answer", as usual.
-    f.observe(&turn(None, "Done."));
-    assert_eq!(f.ops("exchange").len(), 1);
+    // The reply was pre-empted: withdrawn, not adjudicated; the Concern stays open (V34).
+    let list = f.list();
+    assert!(f.d.render(&list).unwrap().ends_with("unless its actions changed approach (switched)."));
+    assert_eq!(f.decide(&[("approach", line(Decision::Rebut, "x"))]).ended, Some(Outcome::Withdrawn));
+    assert_eq!(f.end().str("withdrawn"), Some("human-went-first"));
+    assert_eq!(f.list().get("c1").unwrap().state, State::Open);
+    f.assert_consistent();
 
     // Human turn whose actions switch approach.
     let mut f = fx();

@@ -71,6 +71,8 @@ pub enum Withdrawal {
     NoLongerApplies,
     Duplicate,
     Dismissed,
+    /// A human turn came while the Worker's reply was awaited (V34).
+    HumanWentFirst,
     Budget,
     SessionEnd,
 }
@@ -203,6 +205,8 @@ pub struct Open {
     pub stop_turn: bool,
     /// Owed wakes in a row the owner did not run (V100).
     pub absent: u8,
+    /// A human turn ended while the reply was awaited: withdrawn unless `switched` (V34).
+    pub preempted: bool,
     /// Turn-end entries already read.
     pub seen: HashSet<String>,
     /// One line per step, for the wake input.
@@ -280,6 +284,7 @@ impl Debate {
                             human: false,
                             stop_turn: route == STOP,
                             absent: 0,
+                            preempted: false,
                             seen: HashSet::new(),
                             log,
                         });
@@ -334,6 +339,8 @@ impl Debate {
             }
             Op::HumanPrompt { challenge } if ours(&challenge) => o.human = true,
             Op::HumanTurn { challenge, entry } if ours(&challenge) => {
+                // A turn of its own ended while the reply was awaited; a pending exchange 2 waits.
+                o.preempted |= !entry.is_empty() && o.phase == Phase::Awaiting;
                 o.seen.insert(entry);
                 o.human = false;
                 o.log.push("   Human turn (evidence only; not an answer).".to_owned());
@@ -529,6 +536,14 @@ impl Debate {
                 }
                 (Decision::Concede, m.map_or("", |(_, t)| t), true)
             }
+            // The human went first and the owner did not judge a switch (V34).
+            (None, m) if open.preempted && open.phase == Phase::Awaiting => {
+                if let Some((d, _)) = m {
+                    step.dropped.push(format!("{watcher}: {} after the human went first", decision_name(d)));
+                }
+                self.conclude(&cx, Outcome::Withdrawn, Some(Withdrawal::HumanWentFirst), &mut step)?;
+                return Ok(step);
+            }
             (None, Some((d, _))) => {
                 step.dropped.push(format!("{watcher}: {} with no reply owed", decision_name(d)));
                 return Ok(step);
@@ -632,6 +647,9 @@ impl Debate {
                 (Phase::Owed(_), _) => "Still no verdict line: unresolved, unless its actions settle it (switched).",
                 (Phase::Decided(..), _) => "The owner's move is logged; code carries it out.",
                 (Phase::Queued(_), _) => "Exchange 2 waits for the Worker's next idle.",
+                (Phase::Awaiting, _) if o.preempted => {
+                    "The human went first: withdrawn this wake, unless its actions changed approach (switched)."
+                }
                 (Phase::Awaiting, _) => "Waiting for the Worker's verdict line.",
             }
             .to_owned(),
