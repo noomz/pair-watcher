@@ -37,6 +37,16 @@ enum Entry {
     Dropped { id: String, reason: String },
 }
 
+/// A deliverer's verdict on one pending item at claim time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gate {
+    Deliver,
+    /// Not now: it stays pending (e.g. the deliverer's view of the log may be behind).
+    Skip,
+    /// Stale: dropped, never delivered.
+    Drop,
+}
+
 /// What [`Outbox::withdraw`] found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Withdraw {
@@ -87,9 +97,9 @@ impl Outbox {
         })
     }
 
-    /// Claims the oldest deliverable item for `route`. Items `stale` judges stale are dropped
-    /// on the way; items under a live claim are skipped.
-    pub fn claim(&self, route: &str, now: u64, mut stale: impl FnMut(&Item) -> bool) -> io::Result<Option<Claim>> {
+    /// Claims the oldest item `gate` lets through for `route`. Items it judges stale are dropped
+    /// on the way; items it holds back, or under a live claim, are skipped.
+    pub fn claim(&self, route: &str, now: u64, mut gate: impl FnMut(&Item) -> Gate) -> io::Result<Option<Claim>> {
         let token = format!("{}.{now}", std::process::id());
         self.transact(now, |slots| {
             let mut out = Vec::new();
@@ -98,9 +108,13 @@ impl Outbox {
                     continue;
                 }
                 let id = slot.item.id.clone();
-                if stale(&slot.item) {
-                    out.push(Entry::Dropped { id, reason: "stale".into() });
-                    continue;
+                match gate(&slot.item) {
+                    Gate::Deliver => {}
+                    Gate::Skip => continue,
+                    Gate::Drop => {
+                        out.push(Entry::Dropped { id, reason: "stale".into() });
+                        continue;
+                    }
                 }
                 out.push(Entry::Claimed { id, route: route.to_owned(), token: token.clone() });
                 return (out, Some(Claim { item: slot.item.clone(), token }));
@@ -168,9 +182,13 @@ fn fold(records: Vec<Record<Entry>>) -> Vec<Slot> {
         let id = match &r.body {
             Entry::Queued(item) => {
                 let fresh = Slot { item: item.clone(), claim: None, done: false, acked: false };
-                match slots.iter_mut().find(|s| s.item.id == item.id) {
+                // A re-queued (dropped) id is new: it goes to the back, oldest-first order kept.
+                match slots.iter().position(|s| s.item.id == item.id) {
                     None => slots.push(fresh),
-                    Some(s) if s.done && !s.acked => *s = fresh,
+                    Some(i) if slots[i].done && !slots[i].acked => {
+                        slots.remove(i);
+                        slots.push(fresh);
+                    }
                     Some(_) => {}
                 }
                 continue;

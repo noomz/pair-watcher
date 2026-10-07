@@ -15,7 +15,7 @@ use crate::clip;
 use crate::concern::{Change, Concern, ConcernList, Evidence, State};
 use crate::event::{Event, EventLog, Kind};
 use crate::history::{History, OWN_PREFIX};
-use crate::outbox::{Item, ItemKind, Outbox, Withdraw};
+use crate::outbox::{Gate, Item, ItemKind, Outbox, Withdraw};
 use crate::snapshot::Store;
 use crate::tailer::{self, Entry};
 
@@ -74,9 +74,8 @@ pub fn failing(c: &Concern, s: &Sources) -> Vec<String> {
 }
 
 /// V19: the slot winner's evidence re-verified against the current wake before it is queued.
-/// `Some` = the `challenge-ready-unverifiable` change to commit instead; it stays a Concern until
-/// its owner updates it.
-pub fn recheck(c: &Concern, sources: &Sources) -> Option<Change> {
+/// `Some` = the `challenge-ready-unverifiable` change to commit instead.
+fn recheck(c: &Concern, sources: &Sources) -> Option<Change> {
     let failing = failing(c, sources);
     (!failing.is_empty()).then(|| Change::Unverifiable { watcher: "arbiter".to_owned(), id: c.id.clone(), failing })
 }
@@ -104,7 +103,7 @@ fn check(e: &Evidence, s: &Sources) -> Result<(), String> {
             substantive(&cmd, OUTPUT_MIN).and(substantive(&out, OUTPUT_MIN)).ok_or_else(fail)?;
             let ran = items().any(|i| match i {
                 tailer::Item::ToolCall { id, name, input }
-                    if SHELL_TOOLS.contains(&name.as_str()) && tokens(&action::command(input), &cmd) =>
+                    if SHELL_TOOLS.contains(&name.as_str()) && same(&action::command(input), &cmd) =>
                 {
                     items().any(|r| {
                         matches!(r, tailer::Item::ToolResult { id: rid, output, .. }
@@ -115,7 +114,9 @@ fn check(e: &Evidence, s: &Sources) -> Result<(), String> {
             });
             // Older turns as the digest holds them: one action's signature and its outcome.
             let digested = s.history.actions().any(|(tool, sig, outcome)| {
-                SHELL_TOOLS.contains(&tool) && tokens(sig, &cmd) && outcome.is_some_and(|o| o.to_string() == out)
+                SHELL_TOOLS.contains(&tool)
+                    && sig.strip_prefix(tool).is_some_and(|arg| same(arg, &cmd))
+                    && outcome.is_some_and(|o| o.to_string() == out)
             });
             (ran || digested).then_some(()).ok_or_else(fail)
         }
@@ -173,10 +174,9 @@ fn strings(input: &str) -> Vec<String> {
     }
 }
 
-/// `needle`'s words appear in `hay` as consecutive whole words (`rm` is not in `cargo run --format`).
-fn tokens(hay: &str, needle: &str) -> bool {
-    let (hay, needle): (Vec<&str>, Vec<&str>) = (hay.split_whitespace().collect(), needle.split_whitespace().collect());
-    !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle.as_slice())
+/// The whole command, whitespace aside: a fragment (`cargo`, the tool name) never stands for it.
+fn same(a: &str, b: &str) -> bool {
+    a.split_whitespace().eq(b.split_whitespace())
 }
 
 /// Each line trimmed, blank edges dropped: indentation and trailing space are not content.
@@ -237,6 +237,16 @@ impl Op {
     pub fn event(&self) -> Event {
         Event::typed(Kind::Challenge, self)
     }
+}
+
+/// What [`Challenges::next_auto`] found.
+#[derive(Debug, PartialEq)]
+pub enum Auto<'l> {
+    /// Queue it.
+    Ready(&'l Concern),
+    /// The re-check failed: commit this `challenge-ready-unverifiable`; it stays a Concern until
+    /// its owner updates it.
+    Unverifiable(Box<Change>),
 }
 
 /// The one open Challenge per Worker (V19): queued, or sent and in Debate.
@@ -313,14 +323,17 @@ impl Challenges {
     /// verified Concern never Challenged before (V22; a finished Debate is not reopened) wins.
     /// It waits unless what is left covers its whole Debate at `wake_usd(owner)`, its owner
     /// Watcher's last wake cost (V24). An owner with no known cost (non-finite or negative: muted,
-    /// not waking) cannot argue a Debate (V39), so its Concerns are passed over.
+    /// not waking) cannot argue a Debate (V39), so its Concerns are passed over. The winner's
+    /// evidence is re-verified against the current wake (V19): failing, nothing is queued and
+    /// the returned change is committed instead.
     pub fn next_auto<'l>(
         &self,
         list: &'l ConcernList,
         auto: bool,
         budget: &Budget,
         wake_usd: impl Fn(&Concern) -> f64,
-    ) -> Option<&'l Concern> {
+        sources: &Sources,
+    ) -> Option<Auto<'l>> {
         if !auto || self.slot.is_some() || !budget.admits(Need::Normal) {
             return None;
         }
@@ -330,7 +343,13 @@ impl Challenges {
             .filter(|c| c.state == State::Open && c.challenge && c.verified && !self.count.contains_key(&c.id))
             .map(|c| (c, wake_usd(c)))
             .find(|(_, usd)| usd.is_finite() && *usd >= 0.0)?;
-        (budget.left() >= DEBATE_WAKES * usd).then_some(c)
+        if budget.left() < DEBATE_WAKES * usd {
+            return None;
+        }
+        Some(match recheck(c, sources) {
+            None => Auto::Ready(c),
+            Some(change) => Auto::Unverifiable(Box::new(change)),
+        })
     }
 
     /// Queues `concern` as a Challenge: the outbox item, then `challenge queued` (V18, V28).
@@ -407,10 +426,17 @@ impl Challenges {
         self.queue(log, outbox, &concern, Origin::Promoted, remark, now).map(Ok)
     }
 
-    /// The outbox claim's check: a Challenge item goes out only as the slot's live Challenge
-    /// (V19, V21); stale or orphaned ones are dropped. Other kinds are not this module's.
-    pub fn deliverable(&self, item: &Item) -> bool {
-        item.kind != ItemKind::Challenge || self.slot.as_ref().is_some_and(|s| s.id == item.id && !s.stale)
+    /// The outbox claim's gate: a Challenge goes out only as the slot's live Challenge (V19); the
+    /// slot's stale one is dropped (V21). Any other Challenge item is skipped, not dropped: this
+    /// view of the log may be behind a `queue` in flight; orphans are withdrawn by `queue`. Other
+    /// kinds are not this module's.
+    pub fn gate(&self, item: &Item) -> Gate {
+        match &self.slot {
+            _ if item.kind != ItemKind::Challenge => Gate::Deliver,
+            Some(s) if s.id == item.id && s.stale => Gate::Drop,
+            Some(s) if s.id == item.id => Gate::Deliver,
+            _ => Gate::Skip,
+        }
     }
 
     /// Drops the waiting Challenge whose Concern changed or closed (V21): outbox item withdrawn,

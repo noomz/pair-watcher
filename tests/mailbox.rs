@@ -8,7 +8,7 @@ use pair_watcher::event::{Event, Kind};
 use pair_watcher::home::Home;
 use pair_watcher::jsonl::{self, Record, SCHEMA};
 use pair_watcher::mailbox::{Hook, Mailbox, valid_session_id};
-use pair_watcher::outbox::{Item, ItemKind, LEASE_MS, Outbox};
+use pair_watcher::outbox::{Gate, Item, ItemKind, LEASE_MS, Outbox};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -174,19 +174,19 @@ fn claim_ack_delivers_each_item_once_in_queue_order() {
     assert!(outbox.queue(item("c2"), 11).unwrap());
     assert!(!outbox.queue(item("c1"), 12).unwrap(), "duplicate id refused");
 
-    let a = outbox.claim("stop-block", 20, |_| false).unwrap().unwrap();
+    let a = outbox.claim("stop-block", 20, |_| Gate::Deliver).unwrap().unwrap();
     assert_eq!(a.item.id, "c1");
     // c1 is under a live claim: the next claimer gets c2.
-    let b = outbox.claim("stop-block", 21, |_| false).unwrap().unwrap();
+    let b = outbox.claim("stop-block", 21, |_| Gate::Deliver).unwrap().unwrap();
     assert_eq!(b.item.id, "c2");
-    assert!(outbox.claim("stop-block", 22, |_| false).unwrap().is_none());
+    assert!(outbox.claim("stop-block", 22, |_| Gate::Deliver).unwrap().is_none());
 
     assert!(outbox.ack(&a, 23).unwrap());
     assert!(!outbox.ack(&a, 24).unwrap(), "second ack is a no-op");
     assert_eq!(outbox.pending().unwrap(), vec![item("c2")]);
     assert!(outbox.ack(&b, 25).unwrap());
     assert!(outbox.pending().unwrap().is_empty());
-    assert!(outbox.claim("stop-block", 20 + 10 * LEASE_MS, |_| false).unwrap().is_none());
+    assert!(outbox.claim("stop-block", 20 + 10 * LEASE_MS, |_| Gate::Deliver).unwrap().is_none());
 }
 
 #[test]
@@ -194,10 +194,10 @@ fn unacked_claim_expires_and_is_reclaimed() {
     let (_d, home) = home();
     let outbox = Mailbox::register(&home, "s1").unwrap().outbox();
     outbox.queue(item("c1"), 0).unwrap();
-    let dead = outbox.claim("stop-block", 100, |_| false).unwrap().unwrap();
-    assert!(outbox.claim("mod-submit", 100 + LEASE_MS - 1, |_| false).unwrap().is_none());
+    let dead = outbox.claim("stop-block", 100, |_| Gate::Deliver).unwrap().unwrap();
+    assert!(outbox.claim("mod-submit", 100 + LEASE_MS - 1, |_| Gate::Deliver).unwrap().is_none());
 
-    let retry = outbox.claim("mod-submit", 100 + LEASE_MS, |_| false).unwrap().unwrap();
+    let retry = outbox.claim("mod-submit", 100 + LEASE_MS, |_| Gate::Deliver).unwrap().unwrap();
     assert_eq!(retry.item.id, "c1");
     assert!(!outbox.ack(&dead, 100 + LEASE_MS + 1).unwrap(), "expired claim cannot ack");
     assert!(outbox.ack(&retry, 100 + LEASE_MS + 2).unwrap());
@@ -213,7 +213,7 @@ fn stale_items_are_dropped_at_claim() {
     let got = outbox
         .claim("stop-block", 5, |i| {
             checked.push(i.id.clone());
-            i.id == "c1"
+            if i.id == "c1" { Gate::Drop } else { Gate::Deliver }
         })
         .unwrap()
         .unwrap();
@@ -232,7 +232,7 @@ fn dropped_item_is_never_claimed() {
     outbox.queue(Item { id: "r1".into(), kind: ItemKind::Ruling, text: "ruling".into() }, 0).unwrap();
     assert!(outbox.drop_item("r1", "superseded", 1).unwrap());
     assert!(!outbox.drop_item("r1", "superseded", 2).unwrap());
-    assert!(outbox.claim("stop-block", 3, |_| false).unwrap().is_none());
+    assert!(outbox.claim("stop-block", 3, |_| Gate::Deliver).unwrap().is_none());
 }
 
 #[test]
@@ -253,7 +253,7 @@ fn concurrent_claimers_split_items_exactly_once() {
                 let outbox = Outbox::new(path);
                 barrier.wait();
                 let mut got = Vec::new();
-                while let Some(c) = outbox.claim("stop-block", 1, |_| false).unwrap() {
+                while let Some(c) = outbox.claim("stop-block", 1, |_| Gate::Deliver).unwrap() {
                     assert!(outbox.ack(&c, 2).unwrap());
                     got.push(c.item.id);
                 }
@@ -264,4 +264,21 @@ fn concurrent_claimers_split_items_exactly_once() {
     let mut all: Vec<String> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
     all.sort_by_key(|id| id[1..].parse::<u32>().unwrap());
     assert_eq!(all, ids);
+}
+
+/// V28: a dropped id queued again is a new item: it goes behind items queued meanwhile, and a
+/// claim token from the old one cannot ack it.
+#[test]
+fn requeued_id_is_new() {
+    let (_d, home) = home();
+    let outbox = Mailbox::register(&home, "s1").unwrap().outbox();
+    outbox.queue(item("x"), 0).unwrap();
+    let old = outbox.claim("stop-block", 1, |_| Gate::Deliver).unwrap().unwrap();
+    outbox.queue(Item { id: "r1".into(), kind: ItemKind::Ruling, text: "ruling".into() }, 2).unwrap();
+    assert!(outbox.drop_item("x", "stale", 3).unwrap());
+    assert!(outbox.queue(item("x"), 4).unwrap());
+    assert!(!outbox.ack(&old, 5).unwrap());
+    let next = outbox.claim("stop-block", 6, |_| Gate::Deliver).unwrap().unwrap();
+    assert_eq!(next.item.id, "r1");
+    assert!(!outbox.ack(&old, 7).unwrap());
 }

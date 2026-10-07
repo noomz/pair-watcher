@@ -4,11 +4,11 @@ use std::process::Command;
 
 use pair_watcher::arbiter::{self, Output, Watcher};
 use pair_watcher::budget::Budget;
-use pair_watcher::challenge::{self, Challenges, Origin, Slot, Sources};
+use pair_watcher::challenge::{self, Auto, Challenges, Origin, Slot, Sources};
 use pair_watcher::concern::{self, Change, Concern, ConcernList, Evidence, Resolution, Severity, State};
 use pair_watcher::event::{Event, EventLog, Kind};
 use pair_watcher::history::History;
-use pair_watcher::outbox::{self as ob, ItemKind, LEASE_MS, Outbox};
+use pair_watcher::outbox::{self as ob, Gate, ItemKind, LEASE_MS, Outbox};
 use pair_watcher::output;
 use pair_watcher::repo::Repo;
 use pair_watcher::snapshot::Store;
@@ -199,8 +199,17 @@ fn budget() -> Budget {
     Budget::new(5.0)
 }
 
-fn pick(ch: &Challenges, list: &ConcernList) -> Option<String> {
-    ch.next_auto(list, true, &budget(), cost(0.1)).map(|c| c.id.clone())
+fn id(auto: Auto) -> String {
+    match auto {
+        Auto::Ready(c) => c.id.clone(),
+        Auto::Unverifiable(change) => panic!("re-check failed: {change:?}"),
+    }
+}
+
+impl Fx {
+    fn pick(&self, ch: &Challenges, list: &ConcernList) -> Option<String> {
+        ch.next_auto(list, true, &budget(), cost(0.1), &self.sources()).map(id)
+    }
 }
 
 /// V17: each cited item must exist verbatim in snapshot, transcript or History; indentation is
@@ -216,7 +225,6 @@ fn evidence_verified_verbatim() {
             file("src/retry.rs:2-3", "loop {\ncall();"),
             file("src/retry.rs:2", "loop {\n    call();"),
             command("cargo test --all", "1 failed"),
-            command("cargo test", "1 failed"),
             command("cargo build", "ok"),
             command("cargo test", "exit 1"),
             Evidence::Transcript { excerpt: "keep polling until the review passes".into() },
@@ -253,6 +261,8 @@ fn evidence_rejected() {
             command("cargo lint", "exit 1"),
             command("src/retry.rs", "ok"),
             command("&&", "ok"),
+            command("Bash", "ok"),
+            command("cargo", "1 failed"),
             Evidence::Transcript { excerpt: "retry storms the API".into() },
             Evidence::Transcript { excerpt: "I give up".into() },
             Evidence::Hint { excerpt: "seen 3×".into() },
@@ -275,6 +285,8 @@ fn evidence_rejected() {
             "command \"cargo lint\": no such call with that output",
             "command \"src/retry.rs\": no such call with that output",
             "command \"&&\": no such call with that output",
+            "command \"Bash\": no such call with that output",
+            "command \"cargo\": no such call with that output",
             "transcript \"retry storms the API\": not found",
             "transcript \"I give up\": not found",
             "hint \"seen 3×\": not in this wake's history",
@@ -310,16 +322,16 @@ fn readiness_default_deny() {
         }]
     );
     assert_eq!(list.get("c2").unwrap().state, State::Open);
-    assert_eq!(pick(&ch, &list), None);
+    assert_eq!(f.pick(&ch, &list), None);
 
     f.commit(&mut list, &mut ch, &[add(&ready("c3"))]);
-    assert_eq!(pick(&ch, &list), None, "never verified");
+    assert_eq!(f.pick(&ch, &list), None, "never verified");
 
     let mut fixed = bad.clone();
     fixed.evidence = vec![file("src/retry.rs:2", "loop {")];
     assert!(f.raise(&mut list, &mut ch, vec![update(&fixed)]).is_empty());
     assert!(list.get("c2").unwrap().verified);
-    assert_eq!(pick(&ch, &list).as_deref(), Some("c2"));
+    assert_eq!(f.pick(&ch, &list).as_deref(), Some("c2"));
     f.assert_rebuilds(&list, &ch);
 
     // The arbiter's update drops the mark until `verify` runs on it.
@@ -343,15 +355,15 @@ fn slot_oldest_wins_then_waits() {
     (a.focus, a.severity) = ("correctness".into(), Severity::Note);
     f.raise(&mut list, &mut ch, vec![add(&a), add(&ready("c2"))]);
 
-    let first = list.get(&pick(&ch, &list).unwrap()).unwrap().clone();
+    let first = list.get(&f.pick(&ch, &list).unwrap()).unwrap().clone();
     assert_eq!(first.id, "c1");
     let item = ch.queue(&f.log, &f.outbox, &first, Origin::Auto, None, 1).unwrap();
     assert_eq!(item.id, "c1");
     assert_eq!(f.outbox.pending().unwrap(), [item]);
-    assert_eq!(pick(&ch, &list), None);
+    assert_eq!(f.pick(&ch, &list), None);
 
     f.end_debate(&mut list, &mut ch, "c1");
-    assert_eq!(pick(&ch, &list).as_deref(), Some("c2"));
+    assert_eq!(f.pick(&ch, &list).as_deref(), Some("c2"));
     f.assert_rebuilds(&list, &ch);
 }
 
@@ -387,12 +399,12 @@ fn one_auto_per_concern() {
     f.raise(&mut list, &mut ch, vec![add(&ready("c1")), add(&ready("c2"))]);
     ch.queue(&f.log, &f.outbox, list.get("c1").unwrap(), Origin::Auto, None, 1).unwrap();
     f.end_debate(&mut list, &mut ch, "c1");
-    assert_eq!(pick(&ch, &list).as_deref(), Some("c2"));
+    assert_eq!(f.pick(&ch, &list).as_deref(), Some("c2"));
 
     // c2 was promoted first: once its Debate ends it is not auto-Challenged either.
     ch.promote(&f.log, &f.outbox, &list, "c2", None, 2).unwrap().unwrap();
     f.end_debate(&mut list, &mut ch, "c2");
-    assert_eq!(pick(&ch, &list), None);
+    assert_eq!(f.pick(&ch, &list), None);
 
     let ids: Vec<String> = (0..2)
         .map(|i| {
@@ -411,7 +423,7 @@ fn auto_challenge_off() {
     let f = fx();
     let (mut list, mut ch) = (ConcernList::default(), Challenges::default());
     f.raise(&mut list, &mut ch, vec![add(&ready("c1"))]);
-    assert_eq!(ch.next_auto(&list, false, &budget(), cost(0.1)), None);
+    assert_eq!(ch.next_auto(&list, false, &budget(), cost(0.1), &f.sources()), None);
     assert!(ch.promote(&f.log, &f.outbox, &list, "c1", None, 1).unwrap().is_ok());
 }
 
@@ -429,7 +441,7 @@ fn reserve_admission() {
     let mut spent = Budget::new(1.0);
     spent.record(0.7);
     let next =
-        |budget: &Budget, cost: &dyn Fn(&Concern) -> f64| ch.next_auto(&list, true, budget, cost).map(|c| c.id.clone());
+        |budget: &Budget, cost: &dyn Fn(&Concern) -> f64| ch.next_auto(&list, true, budget, cost, &f.sources()).map(id);
     assert_eq!(next(&spent, &by_owner), None, "c1's owner costs too much; c2 does not jump the queue");
     assert_eq!(next(&spent, &|_| 0.09), Some("c1".into()));
     assert_eq!(next(&spent, &|_| f64::NAN), None);
@@ -497,13 +509,13 @@ fn stale_dropped_before_delivery() {
     let (mut list, mut ch) = (ConcernList::default(), Challenges::default());
     f.raise(&mut list, &mut ch, vec![add(&ready("c1")), add(&ready("c2"))]);
     let item = ch.queue(&f.log, &f.outbox, list.get("c1").unwrap(), Origin::Auto, None, 1).unwrap();
-    assert!(ch.deliverable(&item));
+    assert_eq!(ch.gate(&item), Gate::Deliver);
     assert_eq!(ch.drop_stale(&f.log, &f.outbox, 2).unwrap(), None);
 
     let resolve = Change::Resolve { watcher: "companion".into(), id: "c1".into(), reason: Resolution::Fixed };
     f.commit(&mut list, &mut ch, &[resolve]);
-    assert!(!ch.deliverable(&item));
-    assert_eq!(f.outbox.claim("claude-stop", 2, |i| !ch.deliverable(i)).unwrap(), None);
+    assert_eq!(ch.gate(&item), Gate::Drop);
+    assert_eq!(f.outbox.claim("claude-stop", 2, |i| ch.gate(i)).unwrap(), None);
     let ticker = ch.drop_stale(&f.log, &f.outbox, 3).unwrap();
     assert_eq!(ticker.as_deref(), Some("Challenge c1 dropped: c1 changed before delivery"));
     assert_eq!(ch.slot(), None);
@@ -526,7 +538,7 @@ fn delivered_is_never_stale() {
     f.raise(&mut list, &mut ch, vec![add(&ready("c1")), add(&ready("c2"))]);
     let c1 = list.get("c1").unwrap().clone();
     ch.queue(&f.log, &f.outbox, &c1, Origin::Auto, None, 1).unwrap();
-    let claim = f.outbox.claim("claude-stop", 2, |_| false).unwrap().unwrap();
+    let claim = f.outbox.claim("claude-stop", 2, |_| Gate::Deliver).unwrap().unwrap();
     let mut changed = c1.clone();
     changed.detail.push("still looping".into());
     f.commit(&mut list, &mut ch, &[update(&changed)]);
@@ -543,7 +555,7 @@ fn delivered_is_never_stale() {
         Some(&Slot { id: "c1".into(), concern: "c1".into(), origin: Origin::Auto, sent: true, stale: false })
     );
     assert_eq!(ch.drop_stale(&f.log, &f.outbox, 5).unwrap(), None);
-    assert_eq!(pick(&ch, &list), None);
+    assert_eq!(f.pick(&ch, &list), None);
     f.assert_rebuilds(&list, &ch);
 }
 
@@ -554,7 +566,7 @@ fn expired_claim_is_dropped() {
     let (mut list, mut ch) = (ConcernList::default(), Challenges::default());
     f.raise(&mut list, &mut ch, vec![add(&ready("c1"))]);
     ch.queue(&f.log, &f.outbox, list.get("c1").unwrap(), Origin::Auto, None, 1).unwrap();
-    f.outbox.claim("claude-stop", 2, |_| false).unwrap().unwrap();
+    f.outbox.claim("claude-stop", 2, |_| Gate::Deliver).unwrap().unwrap();
     f.commit(
         &mut list,
         &mut ch,
@@ -583,13 +595,13 @@ fn queue_rollback_and_orphans() {
 
     let orphan = ob::Item { id: "c2".into(), kind: ItemKind::Challenge, text: "stray".into() };
     assert!(f.outbox.queue(orphan.clone(), 3).unwrap());
-    assert!(!ch.deliverable(&orphan));
+    assert_eq!(ch.gate(&orphan), Gate::Skip);
     let item = ch.queue(&f.log, &f.outbox, list.get("c2").unwrap(), Origin::Auto, None, 4).unwrap();
     assert_eq!(item.id, "c2");
     let pending = f.outbox.pending().unwrap();
     assert_eq!(pending.iter().filter(|i| i.id == "c2").collect::<Vec<_>>(), [&item], "orphan withdrawn");
     let ruling = ob::Item { id: "r1".into(), kind: ItemKind::Ruling, text: "x".into() };
-    assert!(ch.deliverable(&ruling), "not a Challenge: not this check's call");
+    assert_eq!(ch.gate(&ruling), Gate::Deliver, "not a Challenge: not this gate's call");
     f.assert_rebuilds(&list, &ch);
 }
 
@@ -600,12 +612,14 @@ fn winner_rechecked_against_current_wake() {
     let f = fx();
     let (mut list, mut ch) = (ConcernList::default(), Challenges::default());
     f.raise(&mut list, &mut ch, vec![add(&ready("c1"))]);
-    let winner = list.get(&pick(&ch, &list).unwrap()).unwrap().clone();
-    assert_eq!(challenge::recheck(&winner, &f.sources()), None);
+    assert_eq!(f.pick(&ch, &list).as_deref(), Some("c1"));
 
     fs::write(f.root.join("src/retry.rs"), "fn retry() {\n    for _ in 0..3 {\n        call();\n    }\n}\n").unwrap();
     let now = f.store.take().unwrap();
-    let change = challenge::recheck(&winner, &f.sources_at(&now)).unwrap();
+    let Some(Auto::Unverifiable(change)) = ch.next_auto(&list, true, &budget(), cost(0.1), &f.sources_at(&now)) else {
+        panic!("re-check should fail")
+    };
+    let change = *change;
     assert_eq!(
         change,
         Change::Unverifiable {
@@ -616,8 +630,45 @@ fn winner_rechecked_against_current_wake() {
     );
     f.commit(&mut list, &mut ch, &[change]);
     assert!(!list.get("c1").unwrap().verified);
-    assert_eq!(pick(&ch, &list), None);
+    assert_eq!(f.pick(&ch, &list), None);
     f.assert_rebuilds(&list, &ch);
+}
+
+/// V19: a deliverer whose view of the log is behind a `queue` in flight skips the new item, never
+/// drops it; once its view catches up it delivers it.
+#[test]
+fn stale_view_never_drops_live_challenge() {
+    let f = fx();
+    let (mut list, mut ch) = (ConcernList::default(), Challenges::default());
+    f.raise(&mut list, &mut ch, vec![add(&ready("c1"))]);
+    let behind = Challenges::rebuild(&f.events());
+    ch.queue(&f.log, &f.outbox, list.get("c1").unwrap(), Origin::Auto, None, 1).unwrap();
+    assert_eq!(f.outbox.claim("claude-stop", 2, |i| behind.gate(i)).unwrap(), None);
+    assert_eq!(f.outbox.pending().unwrap().len(), 1);
+    let caught_up = Challenges::rebuild(&f.events());
+    assert_eq!(f.outbox.claim("claude-stop", 3, |i| caught_up.gate(i)).unwrap().unwrap().item.id, "c1");
+}
+
+/// V19, V28: an orphan already delivered burns its id (the next suffix is minted); one a
+/// deliverer holds a live claim on refuses the queue.
+#[test]
+fn orphan_acked_or_claimed() {
+    let f = fx();
+    let (mut list, mut ch) = (ConcernList::default(), Challenges::default());
+    f.raise(&mut list, &mut ch, vec![add(&ready("c1")), add(&ready("c2"))]);
+    let stray = |id: &str| ob::Item { id: id.into(), kind: ItemKind::Challenge, text: "stray".into() };
+
+    f.outbox.queue(stray("c1"), 1).unwrap();
+    let claim = f.outbox.claim("claude-stop", 1, |_| Gate::Deliver).unwrap().unwrap();
+    assert!(f.outbox.ack(&claim, 1).unwrap());
+    assert_eq!(ch.queue(&f.log, &f.outbox, list.get("c1").unwrap(), Origin::Auto, None, 2).unwrap().id, "c1-2");
+    f.end_debate(&mut list, &mut ch, "c1-2");
+
+    f.outbox.queue(stray("c2"), 3).unwrap();
+    f.outbox.claim("claude-stop", 3, |i| if i.id == "c2" { Gate::Deliver } else { Gate::Skip }).unwrap().unwrap();
+    let err = ch.queue(&f.log, &f.outbox, list.get("c2").unwrap(), Origin::Auto, None, 4).unwrap_err();
+    assert_eq!(err.to_string(), "c2 is being delivered outside the slot");
+    assert_eq!(ch.slot(), None);
 }
 
 /// I11: header, Concern, Evidence, Alternative, human remark, disclaimer, steelman step,
