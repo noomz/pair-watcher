@@ -774,4 +774,79 @@ fn verdict_both_words_is_no_verdict() {
 fn quoted_header_stays_human() {
     assert!(!history::is_own("what does this mean?\n\n[pair-watcher · Challenge c1 · from the Watcher]"));
     assert!(!history::is_own("this is a long human sentence that ends in a colon:\n[pair-watcher · Challenge c1"));
+    assert!(!history::is_own("Explain this:\n[pair-watcher · Challenge c1 · from the Watcher]"));
+}
+
+fn entry(id: &str, items: Vec<T>) -> Entry {
+    Entry { id: id.into(), t: 0, items }
+}
+
+/// Codex review: a checkpoint wake cutting between the final text and the turn end keeps the
+/// verdict, across a rebuild too (V30, V93).
+#[test]
+fn verdict_split_across_wakes() {
+    let mut f = fx();
+    f.observe(&[entry("a", vec![T::Text("Challenge c1: concede — the loop never converges".into())])]);
+    assert!(f.ops("exchange").is_empty());
+    assert_eq!(f.ops("partial").len(), 1);
+    f.observe(&[entry("a", vec![T::Text("Challenge c1: concede — the loop never converges".into())])]);
+    assert_eq!(f.ops("partial").len(), 1, "a replayed slice logs nothing new");
+    f.d = Debate::rebuild(&f.events());
+    f.observe(&[entry("b", vec![T::TurnEnd])]);
+    assert_eq!(f.end().str("outcome"), Some("worker-concedes"));
+    f.assert_consistent();
+
+    // Tool activity after it: not the final text any more.
+    let mut f = fx();
+    f.observe(&[entry("a", vec![T::Text("Challenge c1: concede — fine".into())])]);
+    f.observe(&[entry("b", vec![T::ToolCall { id: "t1".into(), name: "Bash".into(), input: "{}".into() }])]);
+    assert_eq!(f.ops("partial").len(), 2);
+    assert_eq!(f.d.open().unwrap().partial, "");
+    f.observe(&[entry("c", vec![T::Text("done".into()), T::TurnEnd])]);
+    assert_eq!(f.ops("exchange")[0].str("verdict"), Some("none"));
+    f.assert_consistent();
+}
+
+/// Codex review: replaying a human-started `Stop`-blocked turn split over entries never flags its
+/// prompt as a human turn mid-Debate (V10, V33, V34).
+#[test]
+fn replayed_blocked_turn_prompt_stays_read() {
+    let mut f = fx_route(Severity::Warn, "stop");
+    let blocked = [
+        entry("p", vec![T::Prompt("write the file".into())]),
+        entry("e", vec![T::Text("Wrote it.".into()), T::TurnEnd]),
+    ];
+    f.observe(&blocked);
+    assert_eq!(f.ops("stop-turn").len(), 1);
+    f.observe(&blocked);
+    assert!(f.ops("human-prompt").is_empty());
+    assert!(!f.d.open().unwrap().human);
+    f.observe(&turn(None, "Done."));
+    assert_eq!(f.ops("exchange")[0].str("verdict"), Some("none"));
+    assert!(f.decide(&[]).ended.is_none(), "re-asked, not withdrawn");
+    f.assert_consistent();
+}
+
+/// Codex review: after the human went first only `switched` is judged; an owner `concede` is
+/// dropped and the Debate withdrawn with the Concern open (V34). A later answer clears it.
+#[test]
+fn human_went_first_beats_owner_concede() {
+    let mut f = fx();
+    f.observe(&turn(Some("leave the retry loop alone"), "OK."));
+    let step = f.decide(&[("approach", line(Decision::Concede, "human wants it"))]);
+    assert_eq!(step.ended, Some(Outcome::Withdrawn));
+    assert_eq!(step.dropped.len(), 1);
+    assert_eq!(f.end().str("withdrawn"), Some("human-went-first"));
+    assert_eq!(f.list().get("c1").unwrap().state, State::Open);
+    f.assert_consistent();
+
+    // A human turn, then the reply in the same slice: adjudicated as usual.
+    let mut f = fx();
+    let mut both = turn(Some("also add a test"), "Added.");
+    both.extend(turn(None, "Challenge c1: defend — it converges"));
+    f.observe(&both);
+    f.decide(&[("approach", line(Decision::Rebut, "new ground"))]);
+    f.deliver_second();
+    assert!(f.decide(&[]).ended.is_none());
+    assert!(f.d.open().is_some());
 }

@@ -22,21 +22,19 @@ pub const TASK_MAX: usize = 6 * 1024;
 /// Prompts the adapters deliver (Challenge, Ruling) start with this; they are not the human's.
 pub const OWN_PREFIX: &str = "[pair-watcher ·";
 
-/// A prompt we delivered, not the human's: it opens with our header, or a one-line harness label
-/// (`Stop hook feedback:`) then our header. A human quoting our text further down stays human.
+/// A prompt we delivered, not the human's: it opens with our header, or a harness label line
+/// then our header. A human quoting our text further down stays human.
 pub fn is_own(prompt: &str) -> bool {
     let mut lines = prompt.lines().map(str::trim).filter(|l| !l.is_empty());
     match lines.next() {
         Some(first) if first.starts_with(OWN_PREFIX) => true,
-        Some(label) if label.ends_with(':') && label.len() <= LABEL_MAX => {
-            lines.next().is_some_and(|l| l.starts_with(OWN_PREFIX))
-        }
+        Some(label) if HARNESS_LABELS.contains(&label) => lines.next().is_some_and(|l| l.starts_with(OWN_PREFIX)),
         _ => false,
     }
 }
 
-/// Longest harness label line [`is_own`] looks past.
-const LABEL_MAX: usize = 40;
+/// Lines a harness puts above a prompt it delivers for us (Claude's `Stop` block).
+const HARNESS_LABELS: &[&str] = &["Stop hook feedback:"];
 /// Claude's blocked-question tool: its result is the human's answer.
 const ASK_TOOL: &str = "AskUserQuestion";
 

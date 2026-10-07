@@ -99,6 +99,9 @@ pub enum Op {
         reason: Option<String>,
         #[serde(default)]
         entry: String,
+        /// The turn's earlier entries in the same slice: a replay skips them too.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        turn: Vec<String>,
     },
     /// The human prompted the Worker mid-Debate: that turn goes first (V34).
     HumanPrompt { challenge: String },
@@ -108,12 +111,26 @@ pub enum Op {
         challenge: String,
         #[serde(default)]
         entry: String,
+        /// The turn's earlier entries in the same slice: a replay skips them too.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        turn: Vec<String>,
     },
     /// The turn a `Stop` block continued ended: its reply is the next turn end.
     StopTurn {
         challenge: String,
         #[serde(default)]
         entry: String,
+        /// The turn's earlier entries in the same slice: a replay skips them too.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        turn: Vec<String>,
+    },
+    /// A slice ended mid-turn on assistant text holding a verdict line: the turn end in a later
+    /// slice reads it (empty = no such text pending). `turn` = the entries read for it.
+    Partial {
+        challenge: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        turn: Vec<String>,
     },
     /// The owner Watcher owed a move and did not run this wake (failed, invalid, skipped, muted).
     OwnerAbsent { challenge: String },
@@ -207,10 +224,21 @@ pub struct Open {
     pub absent: u8,
     /// A human turn ended while the reply was awaited: withdrawn unless `switched` (V34).
     pub preempted: bool,
-    /// Turn-end entries already read.
+    /// Entries of turns already read.
     pub seen: HashSet<String>,
+    /// Verdict-bearing text of the turn in progress, read in an earlier slice.
+    pub partial: String,
     /// One line per step, for the wake input.
     pub log: Vec<String>,
+}
+
+impl Open {
+    /// A turn end was read: its entries are never read again, and its text is spent.
+    fn read(&mut self, entry: String, turn: Vec<String>) {
+        self.seen.insert(entry);
+        self.seen.extend(turn);
+        self.partial.clear();
+    }
 }
 
 /// What one [`Debate::decide`] did.
@@ -286,6 +314,7 @@ impl Debate {
                             absent: 0,
                             preempted: false,
                             seen: HashSet::new(),
+                            partial: String::new(),
                             log,
                         });
                     }
@@ -326,29 +355,34 @@ impl Debate {
         let Some(o) = self.open.as_mut() else { return };
         let ours = |c: &str| c == o.challenge;
         match op {
-            Op::Exchange { challenge, n, verdict, reason, entry } if ours(&challenge) => {
-                o.seen.insert(entry);
+            Op::Exchange { challenge, n, verdict, reason, entry, turn } if ours(&challenge) => {
+                o.read(entry, turn);
                 o.log.push(match (&verdict, &reason) {
                     (Verdict::None, _) => "   Worker: no verdict line.".to_owned(),
                     (v, r) => format!("   Worker: {} — {}", name(*v), r.as_deref().unwrap_or("")),
                 });
-                (o.n, o.phase, o.human) = (n, Phase::Owed(verdict), false);
+                // An answer came after all: adjudicated.
+                (o.n, o.phase, o.human, o.preempted) = (n, Phase::Owed(verdict), false, false);
                 if reason.is_some() {
                     o.reason = reason;
                 }
             }
             Op::HumanPrompt { challenge } if ours(&challenge) => o.human = true,
-            Op::HumanTurn { challenge, entry } if ours(&challenge) => {
+            Op::HumanTurn { challenge, entry, turn } if ours(&challenge) => {
                 // A turn of its own ended while the reply was awaited; a pending exchange 2 waits.
                 o.preempted |= !entry.is_empty() && o.phase == Phase::Awaiting;
-                o.seen.insert(entry);
+                o.read(entry, turn);
                 o.human = false;
                 o.log.push("   Human turn (evidence only; not an answer).".to_owned());
             }
             // The blocked turn's own prompt is not a human turn mid-Debate.
-            Op::StopTurn { challenge, entry } if ours(&challenge) => {
-                o.seen.insert(entry);
+            Op::StopTurn { challenge, entry, turn } if ours(&challenge) => {
+                o.read(entry, turn);
                 (o.stop_turn, o.human) = (false, false);
+            }
+            Op::Partial { challenge, text, turn } if ours(&challenge) => {
+                o.seen.extend(turn);
+                o.partial = text;
             }
             Op::OwnerAbsent { challenge } if ours(&challenge) => o.absent += 1,
             Op::Decision { challenge, decision, text, defaulted, .. } if ours(&challenge) => {
@@ -379,9 +413,17 @@ impl Debate {
     /// that ends while a reply is awaited is "no answer". Call on every wake, after `sync_sent`
     /// and before the Watchers run.
     pub fn observe(&mut self, log: &EventLog, outbox: &Outbox, entries: &[Entry], now: u64) -> io::Result<()> {
-        // The turn's final assistant text: text after its last prompt or tool activity.
-        let mut text: Vec<&str> = Vec::new();
+        // The turn's final assistant text: text after its last prompt or tool activity, part of
+        // it maybe read in an earlier slice.
+        let seed = self.open.as_ref().map(|o| o.partial.clone()).unwrap_or_default();
+        let mut text: Vec<&str> = Some(seed.as_str()).filter(|t| !t.is_empty()).into_iter().collect();
+        // The turn's entries so far in this slice.
+        let mut turn: Vec<String> = Vec::new();
         for entry in entries {
+            // Read once: a replayed slice holds turns already read.
+            if self.open.as_ref().is_some_and(|o| o.seen.contains(&entry.id)) {
+                continue;
+            }
             for item in &entry.items {
                 let Some(open) = self.open.as_ref() else { return Ok(()) };
                 let challenge = open.challenge.clone();
@@ -398,46 +440,68 @@ impl Debate {
                     TItem::Prompt(_) => {
                         text.clear();
                         if open.human {
-                            self.commit(log, &Op::HumanTurn { challenge, entry: String::new() })?;
+                            self.commit(log, &Op::HumanTurn { challenge, entry: String::new(), turn: vec![] })?;
                         }
                     }
                     TItem::ToolCall { .. } | TItem::ToolResult { .. } => text.clear(),
                     TItem::Text(t) => text.push(t),
-                    // Read once: a replayed slice holds turn ends already read.
-                    TItem::TurnEnd if open.seen.contains(&entry.id) => text.clear(),
                     TItem::TurnEnd => {
-                        self.turn_end(log, outbox, &text.join("\n"), &entry.id, now)?;
+                        let turn = std::mem::take(&mut turn);
+                        self.turn_end(log, outbox, &text.join("\n"), &entry.id, turn, now)?;
                         text.clear();
                     }
                     TItem::ReviewStarted | TItem::ReviewDone { .. } => {}
                 }
             }
+            if !entry.items.contains(&TItem::TurnEnd) {
+                turn.push(entry.id.clone());
+            }
+        }
+        // A slice cut mid-turn keeps a verdict line for the turn end in a later slice.
+        let Some(open) = self.open.as_ref() else { return Ok(()) };
+        let joined = text.join("\n");
+        let partial = if open.phase == Phase::Awaiting && verdict(&joined, &open.challenge).is_some() {
+            joined
+        } else {
+            String::new()
+        };
+        if partial != open.partial {
+            let challenge = open.challenge.clone();
+            self.commit(log, &Op::Partial { challenge, text: partial, turn })?;
         }
         Ok(())
     }
 
-    fn turn_end(&mut self, log: &EventLog, outbox: &Outbox, text: &str, entry: &str, now: u64) -> io::Result<()> {
+    fn turn_end(
+        &mut self,
+        log: &EventLog,
+        outbox: &Outbox,
+        text: &str,
+        entry: &str,
+        turn: Vec<String>,
+        now: u64,
+    ) -> io::Result<()> {
         let Some(open) = self.open.clone() else { return Ok(()) };
         let (challenge, entry) = (open.challenge.clone(), entry.to_owned());
         if open.phase != Phase::Awaiting {
             if open.human {
-                self.commit(log, &Op::HumanTurn { challenge, entry })?;
+                self.commit(log, &Op::HumanTurn { challenge, entry, turn })?;
             }
             return Ok(());
         }
         match verdict(text, &open.challenge) {
-            None if open.stop_turn => self.commit(log, &Op::StopTurn { challenge, entry })?,
+            None if open.stop_turn => self.commit(log, &Op::StopTurn { challenge, entry, turn })?,
             Some((v, reason)) => {
                 let n = open.n;
-                self.commit(log, &Op::Exchange { challenge, n, verdict: v, reason: Some(reason), entry })?;
+                self.commit(log, &Op::Exchange { challenge, n, verdict: v, reason: Some(reason), entry, turn })?;
                 if v == Verdict::Concede {
                     self.end(log, outbox, Outcome::WorkerConcedes, None, None, now)?;
                 }
             }
-            None if open.human => self.commit(log, &Op::HumanTurn { challenge, entry })?,
+            None if open.human => self.commit(log, &Op::HumanTurn { challenge, entry, turn })?,
             None => {
                 let n = open.n;
-                self.commit(log, &Op::Exchange { challenge, n, verdict: Verdict::None, reason: None, entry })?
+                self.commit(log, &Op::Exchange { challenge, n, verdict: Verdict::None, reason: None, entry, turn })?
             }
         }
         Ok(())
@@ -511,6 +575,17 @@ impl Debate {
             (Some(Verdict::Concede), _) => {
                 return self.conclude(&cx, Outcome::WorkerConcedes, None, &mut step).map(|()| step);
             }
+            // The human went first: withdrawn, not adjudicated, unless the owner judged a switch
+            // (V34).
+            (None, m)
+                if open.preempted && open.phase == Phase::Awaiting && !matches!(m, Some((Decision::Switched, _))) =>
+            {
+                if let Some((d, _)) = m {
+                    step.dropped.push(format!("{watcher}: {} after the human went first", decision_name(d)));
+                }
+                self.conclude(&cx, Outcome::Withdrawn, Some(Withdrawal::HumanWentFirst), &mut step)?;
+                return Ok(step);
+            }
             // Actions override words, and the Watcher may drop its objection, at any point.
             (_, Some((d @ (Decision::Switched | Decision::Concede), text))) => (d, text, false),
             (Some(Verdict::Defend), Some((Decision::Rebut, text))) if open.n == 1 => (Decision::Rebut, text, false),
@@ -535,14 +610,6 @@ impl Debate {
                     step.dropped.push(format!("{watcher}: {} not allowed at exchange {}", decision_name(d), open.n));
                 }
                 (Decision::Concede, m.map_or("", |(_, t)| t), true)
-            }
-            // The human went first and the owner did not judge a switch (V34).
-            (None, m) if open.preempted && open.phase == Phase::Awaiting => {
-                if let Some((d, _)) = m {
-                    step.dropped.push(format!("{watcher}: {} after the human went first", decision_name(d)));
-                }
-                self.conclude(&cx, Outcome::Withdrawn, Some(Withdrawal::HumanWentFirst), &mut step)?;
-                return Ok(step);
             }
             (None, Some((d, _))) => {
                 step.dropped.push(format!("{watcher}: {} with no reply owed", decision_name(d)));
