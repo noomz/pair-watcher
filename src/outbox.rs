@@ -37,6 +37,20 @@ enum Entry {
     Dropped { id: String, reason: String },
 }
 
+/// What [`Outbox::withdraw`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Withdraw {
+    Withdrawn,
+    /// Dropped before (e.g. by a claim's stale check).
+    AlreadyDropped,
+    /// Delivered: it stays.
+    Acked,
+    /// A deliverer holds a live claim: it may be on its way.
+    Claimed,
+    /// Never queued.
+    Missing,
+}
+
 /// Held by whoever claimed an item until it acks.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Claim {
@@ -62,10 +76,11 @@ impl Outbox {
         Outbox { path: path.into() }
     }
 
-    /// Queues an item; false if its id was queued before.
+    /// Queues an item; false if its id is queued, claimed or delivered. A dropped id never
+    /// reached anyone and may be queued again.
     pub fn queue(&self, item: Item, now: u64) -> io::Result<bool> {
         self.transact(now, |slots| {
-            if slots.iter().any(|s| s.item.id == item.id) {
+            if slots.iter().any(|s| s.item.id == item.id && (!s.done || s.acked)) {
                 return (vec![], false);
             }
             (vec![Entry::Queued(item)], true)
@@ -115,16 +130,23 @@ impl Outbox {
         })
     }
 
+    /// Withdraws item `id` unless it is delivered or under a live claim, in one locked step.
+    pub fn withdraw(&self, id: &str, reason: &str, now: u64) -> io::Result<Withdraw> {
+        self.transact(now, |slots| match slots.iter().find(|s| s.item.id == id) {
+            None => (vec![], Withdraw::Missing),
+            Some(s) if s.acked => (vec![], Withdraw::Acked),
+            Some(s) if s.done => (vec![], Withdraw::AlreadyDropped),
+            Some(Slot { claim: Some((_, at)), .. }) if now.saturating_sub(*at) < LEASE_MS => {
+                (vec![], Withdraw::Claimed)
+            }
+            Some(_) => (vec![Entry::Dropped { id: id.to_owned(), reason: reason.to_owned() }], Withdraw::Withdrawn),
+        })
+    }
+
     /// Items neither acked nor dropped, oldest first (claimed ones included).
     pub fn pending(&self) -> io::Result<Vec<Item>> {
         let records = jsonl::read_from::<Record<Entry>>(&self.path, 0)?.records;
         Ok(fold(records).into_iter().filter(|s| !s.done).map(|s| s.item).collect())
-    }
-
-    /// True once item `id` was delivered (acked).
-    pub fn acked(&self, id: &str) -> io::Result<bool> {
-        let records = jsonl::read_from::<Record<Entry>>(&self.path, 0)?.records;
-        Ok(fold(records).iter().any(|s| s.item.id == id && s.acked))
     }
 
     /// Read the whole outbox and append `f`'s entries under one exclusive lock.
@@ -145,8 +167,11 @@ fn fold(records: Vec<Record<Entry>>) -> Vec<Slot> {
     for r in records {
         let id = match &r.body {
             Entry::Queued(item) => {
-                if !slots.iter().any(|s| s.item.id == item.id) {
-                    slots.push(Slot { item: item.clone(), claim: None, done: false, acked: false });
+                let fresh = Slot { item: item.clone(), claim: None, done: false, acked: false };
+                match slots.iter_mut().find(|s| s.item.id == item.id) {
+                    None => slots.push(fresh),
+                    Some(s) if s.done && !s.acked => *s = fresh,
+                    Some(_) => {}
                 }
                 continue;
             }

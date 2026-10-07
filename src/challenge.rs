@@ -14,8 +14,8 @@ use crate::budget::{Budget, Need};
 use crate::clip;
 use crate::concern::{Change, Concern, ConcernList, Evidence, State};
 use crate::event::{Event, EventLog, Kind};
-use crate::history::OWN_PREFIX;
-use crate::outbox::{Item, ItemKind, Outbox};
+use crate::history::{History, OWN_PREFIX};
+use crate::outbox::{Item, ItemKind, Outbox, Withdraw};
 use crate::snapshot::Store;
 use crate::tailer::{self, Entry};
 
@@ -35,8 +35,8 @@ pub struct Sources<'a> {
     pub tree: &'a str,
     /// The session's transcript entries so far.
     pub transcript: &'a [Entry],
-    /// The wake's History section: repeat hints + digest (V4).
-    pub history: &'a str,
+    /// History after this wake's entries: digest actions + repeat hints (V4).
+    pub history: &'a History,
 }
 
 /// Marks each add/update `verified` when it is challenge-flagged and passes the bar (V16, V17).
@@ -73,6 +73,14 @@ pub fn failing(c: &Concern, s: &Sources) -> Vec<String> {
     out
 }
 
+/// V19: the slot winner's evidence re-verified against the current wake before it is queued.
+/// `Some` = the `challenge-ready-unverifiable` change to commit instead; it stays a Concern until
+/// its owner updates it.
+pub fn recheck(c: &Concern, sources: &Sources) -> Option<Change> {
+    let failing = failing(c, sources);
+    (!failing.is_empty()).then(|| Change::Unverifiable { watcher: "arbiter".to_owned(), id: c.id.clone(), failing })
+}
+
 fn check(e: &Evidence, s: &Sources) -> Result<(), String> {
     let items = || s.transcript.iter().flat_map(|e| &e.items);
     match e {
@@ -93,7 +101,7 @@ fn check(e: &Evidence, s: &Sources) -> Result<(), String> {
         Evidence::Command { command, output } => {
             let (cmd, out) = (norm(command), norm(output));
             let fail = || format!("command {}: no such call with that output", quote(command));
-            substantive(&out, OUTPUT_MIN).ok_or_else(fail)?;
+            substantive(&cmd, OUTPUT_MIN).and(substantive(&out, OUTPUT_MIN)).ok_or_else(fail)?;
             let ran = items().any(|i| match i {
                 tailer::Item::ToolCall { id, name, input }
                     if SHELL_TOOLS.contains(&name.as_str()) && tokens(&action::command(input), &cmd) =>
@@ -105,9 +113,9 @@ fn check(e: &Evidence, s: &Sources) -> Result<(), String> {
                 }
                 _ => false,
             });
-            // A digest turn line holds several `<sig> → <outcome>` parts; both must sit in one.
-            let digested = s.history.lines().flat_map(|l| l.split(" · ")).any(|part| {
-                part.split_once(" → ").is_some_and(|(sig, outcome)| tokens(sig, &cmd) && found(&norm(outcome), &out))
+            // Older turns as the digest holds them: one action's signature and its outcome.
+            let digested = s.history.actions().any(|(tool, sig, outcome)| {
+                SHELL_TOOLS.contains(&tool) && tokens(sig, &cmd) && outcome.is_some_and(|o| o.to_string() == out)
             });
             (ran || digested).then_some(()).ok_or_else(fail)
         }
@@ -128,10 +136,9 @@ fn check(e: &Evidence, s: &Sources) -> Result<(), String> {
         Evidence::Hint { excerpt } => {
             let want = norm(excerpt);
             s.history
-                .lines()
-                .map(str::trim)
-                .filter(|l| l.starts_with("hint:"))
-                .any(|l| l == want || l.strip_prefix("hint:").map(str::trim) == Some(want.as_str()))
+                .hints()
+                .iter()
+                .any(|l| *l == want || l.strip_prefix("hint:").map(str::trim) == Some(want.as_str()))
                 .then_some(())
                 .ok_or_else(|| format!("hint {}: not in this wake's history", quote(excerpt)))
         }
@@ -305,7 +312,8 @@ impl Challenges {
     /// free (V19), `auto_challenge` holds (V23), normal wakes still run, and the oldest open
     /// verified Concern never Challenged before (V22; a finished Debate is not reopened) wins.
     /// It waits unless what is left covers its whole Debate at `wake_usd(owner)`, its owner
-    /// Watcher's last wake cost; an unknown (non-finite or negative) cost admits nothing (V24).
+    /// Watcher's last wake cost (V24). An owner with no known cost (non-finite or negative: muted,
+    /// not waking) cannot argue a Debate (V39), so its Concerns are passed over.
     pub fn next_auto<'l>(
         &self,
         list: &'l ConcernList,
@@ -316,17 +324,19 @@ impl Challenges {
         if !auto || self.slot.is_some() || !budget.admits(Need::Normal) {
             return None;
         }
-        let c = list
+        let (c, usd) = list
             .all()
             .iter()
-            .find(|c| c.state == State::Open && c.challenge && c.verified && !self.count.contains_key(&c.id))?;
-        let usd = wake_usd(c);
-        (usd.is_finite() && usd >= 0.0 && budget.left() >= DEBATE_WAKES * usd).then_some(c)
+            .filter(|c| c.state == State::Open && c.challenge && c.verified && !self.count.contains_key(&c.id))
+            .map(|c| (c, wake_usd(c)))
+            .find(|(_, usd)| usd.is_finite() && *usd >= 0.0)?;
+        (budget.left() >= DEBATE_WAKES * usd).then_some(c)
     }
 
     /// Queues `concern` as a Challenge: the outbox item, then `challenge queued` (V18, V28).
-    /// Refused while the slot is held (V19). If the event cannot be logged the item is withdrawn,
-    /// so nothing is delivered outside the slot.
+    /// Refused while the slot is held (V19). An undelivered item left under the id by a crash is
+    /// withdrawn first; a delivered one burns the id. If the event cannot be logged the item is
+    /// withdrawn, so nothing is delivered outside the slot.
     pub fn queue(
         &mut self,
         log: &EventLog,
@@ -339,9 +349,14 @@ impl Challenges {
         if let Some(s) = &self.slot {
             return Err(io::Error::other(format!("Challenge {} is open", s.id)));
         }
-        let id = match self.count.get(&concern.id) {
-            None | Some(0) => concern.id.clone(),
-            Some(n) => format!("{}-{}", concern.id, n + 1),
+        let mut n = self.count.get(&concern.id).copied().unwrap_or(0);
+        let id = loop {
+            let id = if n == 0 { concern.id.clone() } else { format!("{}-{}", concern.id, n + 1) };
+            match outbox.withdraw(&id, "orphan", now)? {
+                Withdraw::Acked => n += 1,
+                Withdraw::Claimed => return Err(io::Error::other(format!("{id} is being delivered outside the slot"))),
+                Withdraw::Withdrawn | Withdraw::AlreadyDropped | Withdraw::Missing => break id,
+            }
         };
         let item = Item { id: id.clone(), kind: ItemKind::Challenge, text: text(&id, concern, remark) };
         let op = Op::Queued {
@@ -355,7 +370,7 @@ impl Challenges {
             return Err(io::Error::other(format!("outbox already holds {}", item.id)));
         }
         if let Err(e) = self.commit(log, &op) {
-            let _ = outbox.drop_item(&item.id, "unlogged", now);
+            let _ = outbox.withdraw(&item.id, "unlogged", now);
             return Err(e);
         }
         Ok(item)
@@ -392,24 +407,24 @@ impl Challenges {
         self.queue(log, outbox, &concern, Origin::Promoted, remark, now).map(Ok)
     }
 
-    /// True when Challenge `id` waits for delivery but its Concern changed (V21); the outbox
-    /// claim's stale check.
-    pub fn stale(&self, id: &str) -> bool {
-        self.slot.as_ref().is_some_and(|s| s.id == id && s.stale)
+    /// The outbox claim's check: a Challenge item goes out only as the slot's live Challenge
+    /// (V19, V21); stale or orphaned ones are dropped. Other kinds are not this module's.
+    pub fn deliverable(&self, item: &Item) -> bool {
+        item.kind != ItemKind::Challenge || self.slot.as_ref().is_some_and(|s| s.id == item.id && !s.stale)
     }
 
     /// Drops the waiting Challenge whose Concern changed or closed (V21): outbox item withdrawn,
     /// `challenge stale-dropped`, slot freed. Run after each wake commits, before delivery.
-    /// Returns the ticker line. An item already delivered stays: its `sent` is due and the Debate
-    /// owns it.
+    /// Returns the ticker line. An item delivered or under a live claim stays: its `sent` may be
+    /// due and the Debate would own it; a later call settles it once the lease runs out.
     pub fn drop_stale(&mut self, log: &EventLog, outbox: &Outbox, now: u64) -> io::Result<Option<String>> {
         let Some(Slot { id, concern, .. }) = self.slot.clone().filter(|s| s.stale && !s.sent) else {
             return Ok(None);
         };
-        if outbox.acked(&id)? {
-            return Ok(None);
+        match outbox.withdraw(&id, "stale", now)? {
+            Withdraw::Acked | Withdraw::Claimed => return Ok(None),
+            Withdraw::Withdrawn | Withdraw::AlreadyDropped | Withdraw::Missing => {}
         }
-        outbox.drop_item(&id, "stale", now)?;
         self.commit(log, &Op::StaleDropped { id: id.clone(), concern: concern.clone() })?;
         Ok(Some(format!("Challenge {id} dropped: {concern} changed before delivery")))
     }
@@ -493,16 +508,24 @@ fn verdict(id: &str) -> String {
 }
 
 /// Continuation lines indented: Watcher- or Worker-written text never starts a line of its own,
-/// so it cannot pass for a `[pair-watcher · …]` header or a Ruling (I11, I12).
+/// so it cannot pass for a `[pair-watcher · …]` header or a Ruling (I11, I12). Blank lines and
+/// relative indentation stay.
 fn indent(s: &str) -> String {
-    let breaks = ['\n', '\r', '\u{2028}', '\u{2029}'];
-    s.split(breaks)
-        .map(str::trim_end)
-        .filter(|l| !l.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n    ")
-        .trim()
-        .to_owned()
+    const BREAKS: [char; 7] = ['\n', '\r', '\u{B}', '\u{C}', '\u{85}', '\u{2028}', '\u{2029}'];
+    let s = s.replace("\r\n", "\n");
+    let lines: Vec<&str> = s.split(BREAKS).map(str::trim_end).collect();
+    let first = lines.iter().position(|l| !l.is_empty()).unwrap_or(lines.len());
+    let last = lines.iter().rposition(|l| !l.is_empty()).map_or(first, |i| i + 1);
+    let lines = &lines[first..last];
+    let mut out = lines.first().map(|l| l.trim_start().to_owned()).unwrap_or_default();
+    for l in lines.iter().skip(1) {
+        out.push('\n');
+        if !l.is_empty() {
+            out.push_str("    ");
+            out.push_str(l);
+        }
+    }
+    out
 }
 
 fn evidence(e: &Evidence) -> String {

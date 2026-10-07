@@ -166,7 +166,13 @@ impl ConcernList {
                     }
                 }
                 Some(Change::Resolve { id, .. } | Change::Duplicate { id, .. }) => self.close(&id, State::Resolved),
-                Some(Change::Trimmed { .. } | Change::Unverifiable { .. }) | None => {}
+                // A re-check failed (V19): no longer challenge-ready until its owner updates it.
+                Some(Change::Unverifiable { id, .. }) => {
+                    if let Some(c) = self.find(&id) {
+                        c.verified = false;
+                    }
+                }
+                Some(Change::Trimmed { .. }) | None => {}
             },
             Kind::Human if event.fields.get("action").and_then(|a| a.as_str()) == Some("dismiss") => {
                 if let Some(id) = event.fields.get("id").and_then(|i| i.as_str()) {

@@ -122,6 +122,16 @@ impl History {
         }
     }
 
+    /// `(tool, signature, outcome)` of every action still held per turn (older turns are folded
+    /// into counts), open turn included; outcome `None` while running.
+    pub fn actions(&self) -> impl Iterator<Item = (&str, &str, Option<Outcome>)> {
+        self.turns
+            .iter()
+            .chain(&self.open)
+            .flat_map(|t| &t.actions)
+            .map(|a| (a.tool.as_str(), a.sig.as_str(), a.outcome))
+    }
+
     pub fn asks(&self) -> &[Ask] {
         &self.asks
     }
