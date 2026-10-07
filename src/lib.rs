@@ -11,6 +11,7 @@ pub mod config;
 pub mod credentials;
 pub mod debate;
 pub mod delivery;
+pub mod escalation;
 pub mod event;
 pub mod focus;
 pub mod harness;
