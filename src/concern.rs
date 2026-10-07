@@ -210,8 +210,9 @@ impl ConcernList {
         }
     }
 
+    /// Only an open Concern carries a Debate tag; a resolved one keeps its end state.
     fn tag(&mut self, id: &str, tag: Tag) {
-        if let Some(c) = self.find(id) {
+        if let Some(c) = self.find(id).filter(|c| c.state == State::Open) {
             c.tag = Some(tag);
         }
     }

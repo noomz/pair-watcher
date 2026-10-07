@@ -21,21 +21,23 @@ pub const GUARD_ENV: &str = "PAIR_WATCHER_GUARD";
 pub const SESSION_ENV: &str = "PAIR_WATCHER_SESSION";
 
 /// Pure append, fail-silent: never fails the Worker. Prints only a Claude `Stop` block carrying a
-/// ready Challenge (I7, V26).
+/// ready Challenge (I7, V26). The block is claimed and acked before the `Stop` record is appended,
+/// so the wake that record triggers already sees the delivery (`debate` reads the reply from it).
 pub fn run(event: &str) {
     if std::env::var_os(GUARD_ENV).is_some() {
         return;
     }
-    let Ok(Some((mailbox, payload))) = append(event, io::stdin().lock(), std::env::var(SESSION_ENV).ok()) else {
+    let Ok(Some((mailbox, payload))) = registered(io::stdin().lock(), std::env::var(SESSION_ENV).ok()) else {
         return;
     };
     if event == "Stop" {
         let _ = delivery::stop_block(&mailbox, &payload, &mut io::stdout().lock(), now_ms());
     }
+    let _ = mailbox.append_hook(&Hook { event: event.to_owned(), payload });
 }
 
-/// The registered mailbox it appended to, with the parsed payload.
-fn append(event: &str, mut input: impl Read, launched: Option<String>) -> io::Result<Option<(Mailbox, Value)>> {
+/// The registered mailbox the hook routes to, with the parsed payload.
+fn registered(mut input: impl Read, launched: Option<String>) -> io::Result<Option<(Mailbox, Value)>> {
     let home = Home::from_env()?;
     let mut raw = Vec::new();
     input.read_to_end(&mut raw)?;
@@ -49,7 +51,6 @@ fn append(event: &str, mut input: impl Read, launched: Option<String>) -> io::Re
         },
     };
     let Some(mailbox) = Mailbox::open_registered(&home, id) else { return Ok(None) };
-    mailbox.append_hook(&Hook { event: event.to_owned(), payload: payload.clone() })?;
     Ok(Some((mailbox, payload)))
 }
 

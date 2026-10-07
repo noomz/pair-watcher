@@ -1,8 +1,10 @@
 use pair_watcher::arbiter::Watcher;
+use pair_watcher::challenge::Slot;
 use pair_watcher::challenge::{Challenges, Op as ChallengeOp, Origin};
 use pair_watcher::concern::{self, Change, Concern, ConcernList, Resolution, Severity, State, Tag};
 use pair_watcher::debate::{self, Debate, EscalateAt, Outcome, Phase, Verdict, Withdrawal};
 use pair_watcher::event::{Event, EventLog, Kind};
+use pair_watcher::history;
 use pair_watcher::outbox::{Gate, Item, ItemKind, Outbox};
 use pair_watcher::output::{Decision, Line};
 use pair_watcher::tailer::{Entry, Item as T};
@@ -23,6 +25,10 @@ fn fx() -> Fx {
 }
 
 fn fx_with(severity: Severity) -> Fx {
+    fx_route(severity, "mod")
+}
+
+fn fx_route(severity: Severity, route: &str) -> Fx {
     let dir = TempDir::new().unwrap();
     let log = EventLog::new(dir.path().join("log.jsonl"));
     let outbox = Outbox::new(dir.path().join("outbox.jsonl"));
@@ -38,7 +44,7 @@ fn fx_with(severity: Severity) -> Fx {
         }
         .event(),
     );
-    f.log(ChallengeOp::Sent { id: "c1".into(), route: "stop".into() }.event());
+    f.log(ChallengeOp::Sent { id: "c1".into(), route: route.into() }.event());
     assert!(f.d.open().is_some(), "challenge sent opens the Debate");
     f
 }
@@ -528,4 +534,166 @@ fn render_and_owes() {
     assert!(f.d.render(&list).unwrap().contains("last word (no third message)"));
     f.decide(&[("approach", line(Decision::Concede, "fine"))]);
     assert_eq!(f.d.render(&list), None);
+}
+
+/// V30: only the last line naming the Challenge counts; an earlier verdict is no fallback, and
+/// template echoes with `/` or `or` are no verdict.
+#[test]
+fn verdict_is_the_last_naming_line_only() {
+    let v = |t: &str| debate::verdict(t, "c1");
+    assert_eq!(v("Challenge c1: defend — X\nChallenge c1: on reflection the cache argument is weak"), None);
+    assert_eq!(v("Challenge c1: concede / defend — <reason>"), None);
+    assert_eq!(v("Challenge c1: concede or defend"), None);
+    assert_eq!(v("Challenge c1: defend — or so I think"), Some((Verdict::Defend, "or so I think".into())));
+    assert_eq!(v("see XChallenge c1: no, Challenge c1: defend — x"), Some((Verdict::Defend, "x".into())));
+}
+
+/// The real call order: delivery acked at idle, then the next wake logs `sent` before it reads
+/// the reply turn, which is the exchange (review R1).
+#[test]
+fn reply_in_the_wake_after_an_idle_delivery_is_read() {
+    let dir = TempDir::new().unwrap();
+    let log = EventLog::new(dir.path().join("log.jsonl"));
+    let outbox = Outbox::new(dir.path().join("outbox.jsonl"));
+    log.append(Change::Add { watcher: "approach".into(), concern: concern(Severity::Warn) }.event()).unwrap();
+    let events =
+        |log: &EventLog| -> Vec<Event> { log.read_from(0).unwrap().records.into_iter().map(|r| r.body).collect() };
+    let mut ch = Challenges::rebuild(&events(&log));
+    ch.queue(&log, &outbox, &concern(Severity::Warn), Origin::Auto, None, 1).unwrap();
+    // W1 ran, settled; the mod delivers at idle.
+    let claim = outbox.claim("mod", 2, |i| ch.gate(i)).unwrap().unwrap();
+    assert!(outbox.ack(&claim, 2).unwrap());
+    // W2, triggered by the reply's turn end: sync first, then observe.
+    let mut ch = Challenges::rebuild(&events(&log));
+    assert_eq!(ch.sync_sent(&log, &outbox).unwrap().as_deref(), Some("mod"));
+    let mut d = Debate::rebuild(&events(&log));
+    d.sync_sent(&log, &outbox).unwrap();
+    d.observe(&log, &outbox, &turn(Some(OWN), "Challenge c1: defend — idempotent"), 3).unwrap();
+    assert!(d.owes(), "the reply is exchange 1's answer");
+    assert_eq!(Challenges::rebuild(&events(&log)).slot().map(|s: &Slot| s.sent), Some(true));
+}
+
+/// A `Stop` block continues the blocked turn: that turn's own end is skipped once; the reply is
+/// the next turn end (review R1).
+#[test]
+fn stop_route_skips_the_blocked_turns_own_end() {
+    let mut f = fx_route(Severity::Warn, "stop");
+    f.observe(&turn(None, "Wrote the file. Task complete."));
+    assert!(f.ops("exchange").is_empty());
+    assert_eq!(f.ops("stop-turn").len(), 1);
+    f.observe(&turn(None, "Nothing to add."));
+    assert_eq!(f.ops("exchange")[0].str("verdict"), Some("none"));
+    f.assert_consistent();
+
+    // A verdict in the first turn end still counts.
+    let mut f = fx_route(Severity::Warn, "stop");
+    f.observe(&turn(None, "Challenge c1: defend — task said so"));
+    assert!(f.d.owes());
+}
+
+/// V34, V21: an exchange-2 item whose Concern closed since the last wake is dropped at claim,
+/// before any wake decides (review R2).
+#[test]
+fn rebuttal_dropped_when_its_concern_closes_between_wakes() {
+    let mut f = fx();
+    f.observe(&turn(None, "Challenge c1: defend — fine"));
+    f.decide(&[("approach", line(Decision::Rebut, "new ground"))]);
+    f.log(concern::dismissal("c1"));
+    assert_eq!(f.outbox.claim("mod", 1, |i| f.d.gate(i).unwrap()).unwrap(), None);
+    assert!(f.outbox.pending().unwrap().is_empty());
+}
+
+/// V93 crash windows (review R3–R5): every rebuild after a partial step carries the Debate on.
+#[test]
+fn crash_windows_never_hold_the_slot() {
+    // `end` logged, crash before the item was withdrawn: ended, and the gate drops the item.
+    let mut f = fx();
+    f.observe(&turn(None, "Challenge c1: defend — fine"));
+    f.decide(&[("approach", line(Decision::Rebut, "new ground"))]);
+    f.log(
+        debate::Op::End {
+            challenge: "c1".into(),
+            concern: "c1".into(),
+            outcome: Outcome::Withdrawn,
+            escalated: None,
+            withdrawn: Some(Withdrawal::Budget),
+        }
+        .event(),
+    );
+    let d = Debate::rebuild(&f.events());
+    assert_eq!(d.open(), None);
+    assert_eq!(f.outbox.claim("mod", 1, |i| d.gate(i).unwrap()).unwrap(), None);
+
+    // Orphan `c1/2` queued, crash before `queued` was logged: the re-ask still goes out.
+    let mut f = fx();
+    f.observe(&turn(None, "no verdict"));
+    f.outbox.queue(Item { id: "c1/2".into(), kind: ItemKind::Challenge, text: "orphan".into() }, 1).unwrap();
+    assert_eq!(f.decide(&[]).ended, None);
+    let pending = f.outbox.pending().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(pending[0].text.contains("You did not answer"));
+    assert_eq!(f.d.waiting(), Some("c1/2"));
+
+    // `decision escalate` logged, crash before `end`: the next decide carries it out, with no
+    // second (defaulted) decision.
+    let mut f = fx();
+    f.observe(&turn(None, "Challenge c1: defend — fine"));
+    f.log(
+        debate::Op::Decision {
+            challenge: "c1".into(),
+            watcher: "approach".into(),
+            decision: Decision::Escalate,
+            text: "trade-off".into(),
+            defaulted: false,
+        }
+        .event(),
+    );
+    f.d = Debate::rebuild(&f.events());
+    let step = f.decide(&[]);
+    assert_eq!(step.ended, Some(Outcome::Unresolved));
+    assert_eq!(f.ops("decision").len(), 1);
+    f.assert_consistent();
+}
+
+/// V100: the default concession needs the owner to have run; a failed, invalid, skipped or muted
+/// owner leaves the move owed (review R6).
+#[test]
+fn owner_that_did_not_run_still_owes() {
+    let mut f = fx();
+    f.observe(&turn(None, "Challenge c1: defend — fine"));
+    let list = f.list();
+    let others = [Watcher { name: "correctness".into(), focuses: vec!["correctness".into()], model: None }];
+    let step = f.d.decide(&f.log, &f.outbox, &list, &others, &[], EscalateAt::Warn, 1).unwrap();
+    assert_eq!(step, debate::Step::default());
+    assert!(f.d.owes() && f.ops("decision").is_empty());
+    assert_eq!(f.decide(&[]).ended, Some(Outcome::WatcherConcedes), "ran, silent: defaulted");
+}
+
+/// V34: a human prompt with no turn of its own (interrupted) is cleared by our next delivered
+/// prompt, so that turn's missing verdict is "no answer" (review R7).
+#[test]
+fn stale_human_flag_cleared_by_our_prompt() {
+    let mut f = fx();
+    f.observe(&[Entry { id: "h".into(), t: 0, items: vec![T::Prompt("[Request interrupted by user]".into())] }]);
+    assert!(f.d.open().unwrap().human);
+    f.observe(&turn(Some(OWN), "carrying on"));
+    assert_eq!(f.ops("exchange")[0].str("verdict"), Some("none"));
+}
+
+/// One own-prompt rule everywhere: our header on any line, e.g. under a harness label (review R8).
+#[test]
+fn own_prompt_predicate() {
+    assert!(history::is_own(OWN));
+    assert!(history::is_own("Stop hook feedback:\n[pair-watcher · Challenge c1 · from the Watcher, not the human]"));
+    assert!(!history::is_own("please look at the pair-watcher · Challenge c1 thing"));
+}
+
+/// V35, V100: a Concern resolved fixed mid-Debate keeps its end state; no `conceded` tag (R10).
+#[test]
+fn resolved_concern_is_not_tagged() {
+    let mut f = fx();
+    f.log(Change::Resolve { watcher: "approach".into(), id: "c1".into(), reason: Resolution::Fixed }.event());
+    assert_eq!(f.decide(&[]).ended, Some(Outcome::WorkerConcedes));
+    let c = f.list().get("c1").unwrap().clone();
+    assert_eq!((c.state, c.tag), (State::Resolved, None));
 }

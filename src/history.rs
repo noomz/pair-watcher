@@ -21,6 +21,12 @@ pub const ASK_MAX: usize = 1536;
 pub const TASK_MAX: usize = 6 * 1024;
 /// Prompts the adapters deliver (Challenge, Ruling) start with this; they are not the human's.
 pub const OWN_PREFIX: &str = "[pair-watcher ·";
+
+/// A prompt we delivered, not the human's: a line of it opens with our header (a `Stop` block's
+/// reason may come back under a harness label line).
+pub fn is_own(prompt: &str) -> bool {
+    prompt.lines().any(|l| l.trim_start().starts_with(OWN_PREFIX))
+}
 /// Claude's blocked-question tool: its result is the human's answer.
 const ASK_TOOL: &str = "AskUserQuestion";
 
@@ -70,7 +76,7 @@ impl History {
         let mut next = self.clone();
         for item in entries.iter().flat_map(|e| &e.items) {
             match item {
-                Item::Prompt(text) if !text.trim_start().starts_with(OWN_PREFIX) => next.ask(false, text),
+                Item::Prompt(text) if !is_own(text) => next.ask(false, text),
                 Item::Text(text) if !text.trim().is_empty() => next.open_turn().text = clip::first_line(text, 120),
                 Item::ToolCall { id, name, input } => next.open_turn().actions.push(Action {
                     id: id.clone(),

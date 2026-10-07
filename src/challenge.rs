@@ -14,7 +14,7 @@ use crate::budget::{Budget, Need};
 use crate::clip;
 use crate::concern::{Change, Concern, ConcernList, Evidence, State};
 use crate::event::{Event, EventLog, Kind};
-use crate::history::{History, OWN_PREFIX};
+use crate::history::{self, History};
 use crate::outbox::{Gate, Item, ItemKind, Outbox, Withdraw};
 use crate::output;
 use crate::snapshot::Store;
@@ -136,7 +136,7 @@ fn check(e: &Evidence, s: &Sources) -> Result<(), String> {
             substantive(&want, EXCERPT_MIN).ok_or_else(fail)?;
             let seen = items().any(|i| match i {
                 // Challenges and Rulings the adapters delivered are not the Worker's words.
-                tailer::Item::Prompt(t) => !t.trim_start().starts_with(OWN_PREFIX) && found(&norm(t), &want),
+                tailer::Item::Prompt(t) => !history::is_own(t) && found(&norm(t), &want),
                 tailer::Item::Text(t) | tailer::Item::ToolResult { output: t, .. } => found(&norm(t), &want),
                 tailer::Item::ToolCall { input, .. } => strings(input).iter().any(|t| found(&norm(t), &want)),
                 _ => false,

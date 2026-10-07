@@ -125,7 +125,12 @@ fn claude_stop_hook_blocks_with_the_challenge_once() {
     let again = w.stop(false);
     assert!(again.status.success() && again.stdout.is_empty(), "{again:?}");
     let hooks = w.mb.read_hooks(0).unwrap().records;
-    assert_eq!(hooks.len(), 2, "the Stop hook still appends first");
+    assert_eq!(hooks.len(), 2, "every Stop is appended");
+    // The block is acked before its Stop record lands, so the wake that record triggers sees it.
+    let outbox = fs::read_to_string(w.dir.path().join(".pair-watcher/sessions/s1/outbox.jsonl")).unwrap();
+    let acked: Value =
+        outbox.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).find(|v| v["k"] == "acked").unwrap();
+    assert!(hooks[0].t >= acked["t"].as_u64().unwrap(), "ack before the Stop record");
 
     // V43: the arbiter logs the send from the outbox ack, once.
     assert_eq!(w.sync_sent().as_deref(), Some("stop"));
