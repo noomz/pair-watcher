@@ -1,6 +1,7 @@
 //! Concerns (I10) and their one lifecycle (V13, V18). The list is a fold over the session event
-//! log (V93): the arbiter writes `concern` changes, the human writes `human dismiss`; anything that
-//! reads the log (pane, restart) rebuilds the same list.
+//! log (V93): the arbiter writes `concern` changes, the human writes `human dismiss`, the Debate
+//! engine writes `debate end` (V35); anything that reads the log (pane, restart) rebuilds the same
+//! list.
 
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +20,18 @@ pub enum State {
     Open,
     Dismissed,
     Resolved,
+}
+
+/// How a Debate left its Concern open (V35).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Tag {
+    /// The Worker conceded: open until the Watcher observes the fix.
+    Conceded,
+    /// Unresolved and escalated (V36).
+    Escalated,
+    /// Unresolved below `escalate_unresolved`: no notification (V36).
+    UnresolvedQuiet,
 }
 
 /// One cited item backing a Challenge; each must exist verbatim in its source (V17).
@@ -63,6 +76,9 @@ pub struct Concern {
     /// item was found verbatim (V16, V17). Default-deny: absent = not challenge-ready.
     #[serde(default)]
     pub verified: bool,
+    /// Set by the `debate end` that left it open (V35).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<Tag>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,7 +195,24 @@ impl ConcernList {
                     self.close(id, State::Dismissed);
                 }
             }
+            Kind::Debate if event.str("op") == Some("end") => {
+                let Some(id) = event.str("concern") else { return };
+                let escalated = event.fields.get("escalated").and_then(serde_json::Value::as_bool);
+                match event.str("outcome") {
+                    Some("worker-concedes") => self.tag(id, Tag::Conceded),
+                    Some("watcher-concedes") => self.close(id, State::Resolved),
+                    Some("unresolved") if escalated == Some(true) => self.tag(id, Tag::Escalated),
+                    Some("unresolved") => self.tag(id, Tag::UnresolvedQuiet),
+                    _ => {}
+                }
+            }
             _ => {}
+        }
+    }
+
+    fn tag(&mut self, id: &str, tag: Tag) {
+        if let Some(c) = self.find(id) {
+            c.tag = Some(tag);
         }
     }
 
@@ -200,6 +233,16 @@ impl Severity {
         match self {
             Severity::Note => "note",
             Severity::Warn => "warn",
+        }
+    }
+}
+
+impl Tag {
+    pub fn name(self) -> &'static str {
+        match self {
+            Tag::Conceded => "conceded",
+            Tag::Escalated => "escalated",
+            Tag::UnresolvedQuiet => "unresolved-quiet",
         }
     }
 }

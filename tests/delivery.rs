@@ -7,12 +7,15 @@ use std::time::{Duration, Instant};
 
 use pair_watcher::challenge::{Challenges, Origin};
 use pair_watcher::concern::{Change, Concern, Severity, State};
+use pair_watcher::debate::{Debate, EscalateAt};
 use pair_watcher::delivery::{self, Route, View, Worker};
 use pair_watcher::event::{Event, Kind};
 use pair_watcher::home::Home;
 use pair_watcher::hook::{GUARD_ENV, SESSION_ENV};
 use pair_watcher::jsonl::now_ms;
 use pair_watcher::mailbox::{Hook, Mailbox};
+use pair_watcher::output::{Decision, Line};
+use pair_watcher::tailer::{Entry, Item as T};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -52,6 +55,7 @@ fn concern() -> Concern {
         evidence: vec![],
         alternative: Some("stop and bisect".into()),
         verified: true,
+        tag: None,
     }
 }
 
@@ -372,4 +376,42 @@ fn stale_challenge_gets_no_held_reason() {
         .unwrap();
     delivery::poll(&w.mb, Route::Mod, Worker::Draft, now_ms()).unwrap();
     assert_eq!(w.mb.outbox().held("c1").unwrap(), None);
+}
+
+/// V34, I11: a Debate's exchange 2 rides the same idle routes as its Challenge: held behind a
+/// draft (named in the pane), delivered once at idle, logged sent by the arbiter.
+#[test]
+fn rebuttal_is_delivered_like_the_challenge() {
+    let w = world("claude", false);
+    let now = now_ms();
+    let first = delivery::poll(&w.mb, Route::Mod, Worker::Idle, now).unwrap().item.unwrap();
+    assert_eq!(first.id, "c1");
+    let claim = pair_watcher::outbox::Claim {
+        item: pair_watcher::outbox::Item {
+            id: first.id,
+            kind: pair_watcher::outbox::ItemKind::Challenge,
+            text: first.text,
+        },
+        token: first.token,
+    };
+    assert!(w.mb.outbox().ack(&claim, now).unwrap());
+    assert_eq!(w.sync_sent().as_deref(), Some("mod"));
+
+    let (log, outbox) = (w.mb.log(), w.mb.outbox());
+    let mut d = Debate::rebuild(&w.events());
+    let reply = T::Text("Challenge c1: defend — it is idempotent".into());
+    d.observe(&log, &outbox, &[Entry { id: "e".into(), t: 0, items: vec![reply, T::TurnEnd] }], now).unwrap();
+    let lines = [("approach".to_owned(), Line::Debate { decision: Decision::Rebut, text: "429s".into() })];
+    let roster =
+        [pair_watcher::arbiter::Watcher { name: "approach".into(), focuses: vec!["approach".into()], model: None }];
+    d.decide(&log, &outbox, &w.view().concerns, &roster, &lines, EscalateAt::Warn, now).unwrap();
+
+    let poll = delivery::poll(&w.mb, Route::Mod, Worker::Draft, now).unwrap();
+    assert!(poll.item.is_none());
+    assert_eq!(w.view().pending(&w.mb).unwrap(), Some(("c1/2".into(), "pending: human draft in prompt".into())));
+    let poll = delivery::poll(&w.mb, Route::Mod, Worker::Idle, now).unwrap();
+    let item = poll.item.unwrap();
+    assert_eq!(item.id, "c1/2");
+    assert!(item.text.contains("Challenge c1 (2/2)"), "{}", item.text);
+    assert!(delivery::poll(&w.mb, Route::Mod, Worker::Idle, now).unwrap().item.is_none(), "claimed once");
 }

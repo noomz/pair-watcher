@@ -11,11 +11,12 @@ fn every_line_kind_parses() {
 {"op":"resolve","id":"c3","reason":"duplicate","of":"c1"}
 {"op":"consider","text":"approving deletes the cache"}
 {"op":"debate","decision":"rebut","text":"the test still fails"}
+{"op":"debate","decision":"switched","text":"replaced polling with a webhook"}
 {"op":"inferred_ruling","escalation":"c4","side":"worker","prompt_ref":"prompt 3"}
 {"op":"held_back","ruling":"r2"}
 "#;
     let lines = output::parse(text).unwrap();
-    assert_eq!(lines.len(), 9);
+    assert_eq!(lines.len(), 10);
     let Line::Add { severity, focus, refs, challenge, evidence, alternative, .. } = &lines[0] else { panic!() };
     assert_eq!((*severity, focus.as_deref(), *challenge), (Severity::Warn, Some("approach"), true));
     assert_eq!(refs.len(), 2);
@@ -26,7 +27,8 @@ fn every_line_kind_parses() {
     assert!(matches!(&lines[3], Line::Resolve { reason: Reason::NoLongerApplies, of: None, .. }));
     assert!(matches!(&lines[4], Line::Resolve { reason: Reason::Duplicate, of: Some(o), .. } if o == "c1"));
     assert!(matches!(&lines[6], Line::Debate { decision: Decision::Rebut, .. }));
-    assert!(matches!(&lines[7], Line::InferredRuling { side: Side::Worker, .. }));
+    assert!(matches!(&lines[7], Line::Debate { decision: Decision::Switched, .. }), "I10, V100");
+    assert!(matches!(&lines[8], Line::InferredRuling { side: Side::Worker, .. }));
 }
 
 #[test]

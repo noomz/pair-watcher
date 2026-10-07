@@ -177,6 +177,7 @@ fn concern(id: &str, challenge: bool, evidence: Vec<Evidence>) -> Concern {
         evidence,
         alternative: Some("exponential backoff with a cap".into()),
         verified: false,
+        tag: None,
     }
 }
 

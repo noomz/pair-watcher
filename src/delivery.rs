@@ -1,4 +1,4 @@
-//! Delivery of Challenges and Rulings to the Worker (V25–V29, I7–I9).
+//! Delivery of Challenges (with a Debate's exchange 2) and Rulings to the Worker (V25–V29, I7–I9).
 //!
 //! Every route is a turn-end block or a harness-native follow-up at idle; nothing is steered,
 //! sent mid-tool or typed into a prompt box (V25). Deliverers touch only the outbox: the Claude
@@ -16,11 +16,12 @@ use serde_json::{Value, json};
 
 use crate::challenge::Challenges;
 use crate::concern::{ConcernList, Severity, State};
+use crate::debate::Debate;
 use crate::event::{Event, Kind};
 use crate::harness::Harness;
 use crate::jsonl::Record;
 use crate::mailbox::{Hook, Mailbox};
-use crate::outbox::Claim;
+use crate::outbox::{Claim, Gate, Item};
 use crate::trigger::{self, Signal};
 
 /// Held reason a deliverer records while the human has a draft in the prompt box (V26).
@@ -62,6 +63,7 @@ pub struct View {
     /// No hooks: Challenges stay pending, never delivered (V29).
     pub observe_only: bool,
     pub challenges: Challenges,
+    pub debate: Debate,
     pub concerns: ConcernList,
 }
 
@@ -73,21 +75,35 @@ impl View {
             harness: start.and_then(|e| e.str("harness")).and_then(|h| Harness::from_program(OsStr::new(h))),
             observe_only: start.and_then(|e| e.fields.get("observe_only")).and_then(Value::as_bool).unwrap_or(false),
             challenges: Challenges::rebuild(&events),
+            debate: Debate::rebuild(&events),
             concerns: ConcernList::rebuild(&events),
         })
     }
 
-    /// The slot's Challenge while it waits for delivery: id + pane line (V26, V29).
+    /// The outbox claim's gate: the Debate's exchange 2, else the Challenge slot (V19, V21, V37).
+    pub fn gate(&self, item: &Item) -> Gate {
+        self.debate.gate(item).unwrap_or_else(|| self.challenges.gate(item))
+    }
+
+    /// The item waiting for delivery: the slot's Challenge, else the Debate's exchange 2 (V34).
+    fn waiting(&self) -> Option<&str> {
+        match self.challenges.slot() {
+            Some(s) if !s.sent && !s.stale => Some(&s.id),
+            _ => self.debate.waiting(),
+        }
+    }
+
+    /// The item waiting for delivery: id + pane line (V26, V29).
     pub fn pending(&self, mailbox: &Mailbox) -> io::Result<Option<(String, String)>> {
-        let Some(slot) = self.challenges.slot().filter(|s| !s.sent && !s.stale) else { return Ok(None) };
+        let Some(id) = self.waiting() else { return Ok(None) };
         let line = if self.observe_only {
             "pending: observe-only, not delivered"
-        } else if mailbox.outbox().held(&slot.id)?.as_deref() == Some(DRAFT) {
+        } else if mailbox.outbox().held(id)?.as_deref() == Some(DRAFT) {
             "pending: human draft in prompt"
         } else {
             "pending: Worker idle"
         };
-        Ok(Some((slot.id.clone(), line.to_owned())))
+        Ok(Some((id.to_owned(), line.to_owned())))
     }
 
     /// Claude mod status-line field (I8): non-zero parts only; `None` clears the line.
@@ -123,7 +139,7 @@ pub fn claim(mailbox: &Mailbox, view: &View, route: Route, now: u64) -> io::Resu
     if view.observe_only || (route.idle() && !settled(mailbox, harness)?) {
         return Ok(None);
     }
-    mailbox.outbox().claim(route.name(), now, |item| view.challenges.gate(item))
+    mailbox.outbox().claim(route.name(), now, |item| view.gate(item))
 }
 
 /// No turn end in the hook inbox past the arbiter's settled offset (V21).
@@ -245,12 +261,12 @@ pub fn poll(mailbox: &Mailbox, route: Route, worker: Worker, now: u64) -> io::Re
         Worker::Idle => claim(mailbox, &view, route, now)?,
         Worker::Busy | Worker::Draft => None,
     };
-    // Why the waiting Challenge is held, for the pane; a claim clears it, an empty box too.
-    if let Some(slot) = view.challenges.slot().filter(|s| !s.sent && !s.stale)
+    // Why the waiting item is held, for the pane; a claim clears it, an empty box too.
+    if let Some(id) = view.waiting()
         && item.is_none()
     {
         let reason = (worker == Worker::Draft).then_some(DRAFT);
-        mailbox.outbox().hold(&slot.id, route.name(), reason, now)?;
+        mailbox.outbox().hold(id, route.name(), reason, now)?;
     }
     let pending = view.pending(mailbox)?;
     Ok(Poll {

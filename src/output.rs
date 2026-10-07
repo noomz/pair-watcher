@@ -2,7 +2,7 @@
 //! invalid: a diagnostic, never a Concern. Empty output = silent wake. Shape only; who may touch
 //! which Concern is the arbiter's call.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::concern::{Evidence, Resolution, Severity};
 
@@ -72,12 +72,14 @@ pub enum Reason {
     Duplicate,
 }
 
-#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Decision {
     Concede,
     Rebut,
     Escalate,
+    /// The Worker changed approach by its actions: it concedes, whatever it said (V30, V100).
+    Switched,
 }
 
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
