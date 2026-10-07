@@ -85,3 +85,19 @@ fn strict_shape_invalidates_whole_output() {
         assert!(err.contains(want), "{line}: want {want:?}, got {err}");
     }
 }
+
+/// I10: refs are `file:line`, `file:start-end` or `file:line:col`; empty command output is
+/// evidence ("found nothing").
+#[test]
+fn refs_and_empty_command_output() {
+    assert_eq!(output::parse_ref("src/a.rs:12"), Some(("src/a.rs", 12, 12)));
+    assert_eq!(output::parse_ref("src/a.rs:3-9"), Some(("src/a.rs", 3, 9)));
+    assert_eq!(output::parse_ref("src/a.rs:12:5"), Some(("src/a.rs", 12, 12)));
+    for bad in ["src/a.rs", "src/a.rs:0", "src/a.rs:9-3", "src/a.rs:x", ":3", "a b.rs:1"] {
+        assert_eq!(output::parse_ref(bad), None, "{bad}");
+    }
+    let line = r#"{"op":"add","severity":"warn","headline":"h","refs":["src/a.rs:12:5"],"evidence":[{"kind":"command","command":"rg TODO src","output":""}]}"#;
+    assert!(output::parse(line).is_ok());
+    let line = r#"{"op":"add","severity":"warn","headline":"h","refs":["src/a.rs:0"]}"#;
+    assert!(output::parse(line).unwrap_err().contains("not file:line"));
+}

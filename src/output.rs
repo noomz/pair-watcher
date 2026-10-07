@@ -183,34 +183,40 @@ fn check_detail(detail: &[String]) -> Result<(), String> {
     detail.iter().try_for_each(|d| one_line("detail line", d))
 }
 
-/// `file:line` or `file:start-end`.
 fn check_refs(refs: &[String]) -> Result<(), String> {
-    refs.iter().try_for_each(|r| if is_ref(r) { Ok(()) } else { Err(format!("ref {r:?} is not file:line")) })
+    refs.iter().try_for_each(|r| match parse_ref(r) {
+        Some(_) => Ok(()),
+        None => Err(format!("ref {r:?} is not file:line")),
+    })
 }
 
-fn is_ref(r: &str) -> bool {
-    let Some((file, lines)) = r.rsplit_once(':') else { return false };
-    let num = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    !file.trim().is_empty()
-        && !r.contains(char::is_whitespace)
-        && match lines.split_once('-') {
-            Some((a, b)) => num(a) && num(b),
-            None => num(lines),
-        }
+/// `file:line`, `file:start-end` or `file:line:col` (column dropped) → `(file, start, end)`,
+/// 1-based lines, `start ≤ end`.
+pub fn parse_ref(r: &str) -> Option<(&str, usize, usize)> {
+    if r.contains(char::is_whitespace) {
+        return None;
+    }
+    let num = |s: &str| s.bytes().all(|b| b.is_ascii_digit()).then(|| s.parse::<usize>().ok()).flatten();
+    let (head, last) = r.rsplit_once(':')?;
+    let (file, lines) = match head.rsplit_once(':') {
+        Some((file, line)) if num(line).is_some() && num(last).is_some() => (file, line),
+        _ => (head, last),
+    };
+    let (a, b) = lines.split_once('-').unwrap_or((lines, lines));
+    let (a, b) = (num(a)?, num(b)?);
+    (a >= 1 && b >= a && !file.trim().is_empty()).then_some((file, a, b))
 }
 
 fn check_evidence(evidence: &[Evidence]) -> Result<(), String> {
     evidence.iter().try_for_each(|e| match e {
         Evidence::File { at, excerpt } => {
-            if !is_ref(at) {
+            if parse_ref(at).is_none() {
                 return Err(format!("evidence ref {at:?} is not file:line"));
             }
             text("evidence excerpt", excerpt)
         }
-        Evidence::Command { command, output } => {
-            text("evidence command", command)?;
-            text("evidence output", output)
-        }
+        // Empty output is evidence too ("the search found nothing").
+        Evidence::Command { command, .. } => text("evidence command", command),
         Evidence::Transcript { excerpt } | Evidence::Hint { excerpt } => text("evidence excerpt", excerpt),
     })
 }

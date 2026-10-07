@@ -16,6 +16,7 @@ use crate::concern::{Change, Concern, ConcernList, Evidence, State};
 use crate::event::{Event, EventLog, Kind};
 use crate::history::{History, OWN_PREFIX};
 use crate::outbox::{Gate, Item, ItemKind, Outbox, Withdraw};
+use crate::output;
 use crate::snapshot::Store;
 use crate::tailer::{self, Entry};
 
@@ -86,7 +87,7 @@ fn check(e: &Evidence, s: &Sources) -> Result<(), String> {
         Evidence::File { at, excerpt } => {
             let want = norm(excerpt);
             substantive(&want, EXCERPT_MIN).ok_or_else(|| format!("{at}: excerpt too short"))?;
-            let (path, start, end) = parse_ref(at).ok_or_else(|| format!("{at}: not file:line"))?;
+            let (path, start, end) = output::parse_ref(at).ok_or_else(|| format!("{at}: not file:line"))?;
             let bytes = s.store.read(s.tree, path).map_err(|_| format!("{at}: not in the snapshot"))?;
             let text = String::from_utf8_lossy(&bytes);
             let window: Option<Vec<&str>> = start
@@ -100,14 +101,19 @@ fn check(e: &Evidence, s: &Sources) -> Result<(), String> {
         Evidence::Command { command, output } => {
             let (cmd, out) = (norm(command), norm(output));
             let fail = || format!("command {}: no such call with that output", quote(command));
-            substantive(&cmd, OUTPUT_MIN).and(substantive(&out, OUTPUT_MIN)).ok_or_else(fail)?;
+            // Empty output matches only a call whose result was empty.
+            substantive(&cmd, OUTPUT_MIN).ok_or_else(fail)?;
+            if !out.is_empty() {
+                substantive(&out, OUTPUT_MIN).ok_or_else(fail)?;
+            }
+            let shows = |o: &str| if out.is_empty() { norm(o).is_empty() } else { found(&norm(o), &out) };
             let ran = items().any(|i| match i {
                 tailer::Item::ToolCall { id, name, input }
                     if SHELL_TOOLS.contains(&name.as_str()) && same(&action::command(input), &cmd) =>
                 {
                     items().any(|r| {
                         matches!(r, tailer::Item::ToolResult { id: rid, output, .. }
-                            if rid == id && found(&norm(output), &out))
+                            if rid == id && shows(output))
                     })
                 }
                 _ => false,
@@ -148,14 +154,6 @@ fn check(e: &Evidence, s: &Sources) -> Result<(), String> {
                 .ok_or_else(|| format!("hint {}: not in this wake's history", quote(excerpt)))
         }
     }
-}
-
-/// `file:line` or `file:start-end`, 1-based.
-fn parse_ref(at: &str) -> Option<(&str, usize, usize)> {
-    let (path, lines) = at.rsplit_once(':')?;
-    let (a, b) = lines.split_once('-').unwrap_or((lines, lines));
-    let (a, b): (usize, usize) = (a.parse().ok()?, b.parse().ok()?);
-    (a >= 1 && b >= a && !path.is_empty()).then_some((path, a, b))
 }
 
 /// A tool call input's string values (the tailer keeps it as JSON text), else the text itself.
@@ -577,6 +575,9 @@ fn indent(s: &str) -> String {
 fn evidence(e: &Evidence) -> String {
     match e {
         Evidence::File { at, excerpt } => format!("- {at}: {}", indent(excerpt)),
+        Evidence::Command { command, output } if output.trim().is_empty() => {
+            format!("- `{}` → (no output)", indent(command))
+        }
         Evidence::Command { command, output } => format!("- `{}` → {}", indent(command), indent(output)),
         Evidence::Transcript { excerpt } => format!("- transcript: {}", indent(excerpt)),
         Evidence::Hint { excerpt } => format!("- {}", indent(excerpt)),
