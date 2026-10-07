@@ -110,6 +110,8 @@ pub struct Escalation {
     pub lines: Vec<String>,
     pub rule: String,
     pub stage: Stage,
+    /// The notifier it went to, once `sending`.
+    pub via: Option<String>,
 }
 
 impl Escalation {
@@ -183,10 +185,15 @@ impl Escalations {
                 Some(Op::Raised { id, cause, concern, challenge, hook, title, lines, rule }) => {
                     self.challenges.extend(challenge.clone());
                     self.hooks.extend(hook);
-                    let stage = Stage::Raised;
-                    self.all.push(Escalation { id, cause, concern, challenge, hook, title, lines, rule, stage });
+                    let (stage, via) = (Stage::Raised, None);
+                    self.all.push(Escalation { id, cause, concern, challenge, hook, title, lines, rule, stage, via });
                 }
-                Some(Op::Sending { id, .. }) => self.stage(&id, Stage::Sending),
+                Some(Op::Sending { id, via }) => {
+                    self.stage(&id, Stage::Sending);
+                    if let Some(e) = self.all.iter_mut().find(|e| e.id == id) {
+                        e.via = Some(via);
+                    }
+                }
                 Some(Op::Notified { id, .. }) => self.stage(&id, Stage::Notified),
                 Some(Op::DroppedStale { id, .. }) => self.stage(&id, Stage::Dropped),
                 None => {}
@@ -324,7 +331,7 @@ impl Escalations {
             .all
             .iter()
             .filter(|e| e.stage == Stage::Sending)
-            .map(|e| (e.id.clone(), notifier.name().to_owned()))
+            .map(|e| (e.id.clone(), e.via.clone().unwrap_or_default()))
             .collect();
         for (id, via) in cut {
             let error = Some("unconfirmed: interrupted while sending".to_owned());

@@ -371,12 +371,13 @@ fn cut_off_send_is_not_resent() {
     let bin = fake(f.dir.path(), 0);
     f.debate_unresolved(true);
     f.raise_unresolved(true);
-    f.log(escalation::Op::Sending { id: "e1".into(), via: "notify-send".into() }.event());
+    f.log(escalation::Op::Sending { id: "e1".into(), via: "herdr".into() }.event());
     f.e = Escalations::rebuild(&f.events());
     assert_eq!(f.e.get("e1").unwrap().stage, Stage::Sending);
     assert!(f.deliver(&Notifier::NotifySend(bin), false).is_empty());
     assert!(calls(f.dir.path()).is_empty());
     assert!(f.ops("notified")[0].str("error").unwrap().starts_with("unconfirmed"));
+    assert_eq!(f.ops("notified")[0].str("via"), Some("herdr"), "the notifier it went to, not today's");
     assert_eq!(f.e.get("e1").unwrap().stage, Stage::Notified);
     f.assert_consistent();
 }
