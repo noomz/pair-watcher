@@ -58,6 +58,16 @@ impl Home {
         self.root.join("bin").join("pw-hook")
     }
 
+    /// User price table, merged over the embedded one (I2).
+    pub fn models_file(&self) -> PathBuf {
+        self.root.join("models.toml")
+    }
+
+    /// API keys; refused when group/world-readable (I2).
+    pub fn credentials_file(&self) -> PathBuf {
+        self.root.join("credentials")
+    }
+
     /// User per-repo overrides + tool-written `[approved_focus]`.
     pub fn repo_config(&self, root_commit: &str) -> PathBuf {
         self.root.join("repos").join(format!("{root_commit}.toml"))

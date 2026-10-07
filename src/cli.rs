@@ -7,7 +7,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use crate::focus::FocusSource;
 use crate::home::Home;
 use crate::problem::{Problem, tilde};
-use crate::{config, hook, run, supervisor};
+use crate::{config, hook, models, run, supervisor};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -272,7 +272,7 @@ pub fn main() -> ExitCode {
         Command::Rule { .. } | Command::Undo(_) | Command::Keep(_) => later("T13"),
         Command::Rulings { .. } => later("T14"),
         Command::Install { .. } | Command::Uninstall { .. } | Command::Auth | Command::Doctor => later("T16"),
-        Command::Models { .. } => later("T6"),
+        Command::Models { action } => models_cmd(action),
         Command::Prefilter { .. } => later("T17"),
         Command::Report { .. }
         | Command::Replay { .. }
@@ -337,6 +337,61 @@ fn config_show(origin: bool) -> ExitCode {
         eprintln!("{p}");
     }
     ExitCode::SUCCESS
+}
+
+fn models_cmd(action: ModelsAction) -> ExitCode {
+    let home = match Home::from_env().and_then(|h| h.ensure_layout().map(|()| h)) {
+        Ok(h) => h,
+        Err(e) => return fail(&e.to_string()),
+    };
+    match action {
+        ModelsAction::Update { yes } => {
+            let fetched = match models::fetch() {
+                Ok(t) => t,
+                Err(e) => return fail(&e),
+            };
+            let diff = match models::prepare_update(&home, &fetched) {
+                Ok((_, diff)) => diff,
+                Err(e) => return fail(&e),
+            };
+            if diff.is_empty() {
+                println!("model table up to date");
+                return ExitCode::SUCCESS;
+            }
+            for line in &diff {
+                println!("{line}");
+            }
+            if !yes && !confirm("apply? [y/N] ") {
+                println!("not applied");
+                return ExitCode::SUCCESS;
+            }
+            if let Err(e) = models::apply_update(&home, &fetched) {
+                return fail(&format!("{}: {e}", tilde(&home.models_file())));
+            }
+            println!("applied; `pair-watcher models rollback` restores the previous table");
+            ExitCode::SUCCESS
+        }
+        ModelsAction::Rollback => match models::rollback(&home) {
+            Ok(true) => {
+                println!("previous model table restored");
+                ExitCode::SUCCESS
+            }
+            Ok(false) => fail("nothing to roll back"),
+            Err(e) => fail(&format!("{}: {e}", tilde(&home.models_file()))),
+        },
+    }
+}
+
+/// `y` on an interactive terminal; anything else, or no terminal, is no.
+fn confirm(question: &str) -> bool {
+    use std::io::{BufRead, IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        return false;
+    }
+    print!("{question}");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line).is_ok() && line.trim().eq_ignore_ascii_case("y")
 }
 
 fn supervise(session: &str, worker_pid: i32) -> ExitCode {

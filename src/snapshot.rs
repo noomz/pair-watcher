@@ -3,7 +3,8 @@
 //! read-only through `alternates`, so new blobs land only in the store and the Worker repo,
 //! `.git` included, is never written (C2). The Worker's own excludes (`.git/info/exclude`,
 //! repo-local `core.excludesFile`) apply as they do for the Worker: an excluded file never
-//! reaches a snapshot or the wake input sent to the model provider (V5).
+//! reaches a snapshot or the wake input sent to the model provider (V5). The Watcher's read tools
+//! are served from here, never from the live work tree (I15).
 
 use std::fs::{self, DirBuilder};
 use std::io;
@@ -122,6 +123,65 @@ impl Store {
             }
         }
         Ok(files)
+    }
+
+    /// The Worker's HEAD commit, recorded with a snapshot so `git log`/`git show` tools answer as
+    /// of that wake. `None` before the first commit.
+    pub fn head(&self) -> Option<String> {
+        let out = git(worker(&self.root).args(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])).ok()?;
+        Some(out.trim().to_owned()).filter(|h| !h.is_empty())
+    }
+
+    /// A file's bytes as snapshotted in `tree`.
+    pub fn read(&self, tree: &str, path: &str) -> io::Result<Vec<u8>> {
+        let out = self.cmd(false).args(["cat-file", "blob", &format!("{tree}:{path}")]).output()?;
+        if !out.status.success() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, format!("{path}: not in the snapshot")));
+        }
+        Ok(out.stdout)
+    }
+
+    /// `git grep -n` (extended regex, text files only) over `tree`, as `path:line:text` lines.
+    pub fn grep(&self, tree: &str, pattern: &str, path: Option<&str>) -> io::Result<String> {
+        let mut cmd = self.cmd(false);
+        cmd.args(["grep", "-n", "-I", "-E", "--no-color", "-e", pattern, tree, "--"]);
+        cmd.args(path);
+        let out = cmd.output()?;
+        match out.status.code() {
+            Some(0) => {}
+            Some(1) => return Ok(String::new()),
+            _ => return Err(io::Error::other(String::from_utf8_lossy(&out.stderr).trim().to_owned())),
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let prefix = format!("{tree}:");
+        Ok(text.lines().map(|l| format!("{}\n", l.strip_prefix(&prefix).unwrap_or(l))).collect())
+    }
+
+    /// One-line log from `head` (optionally limited to `path`), newest first.
+    pub fn log(&self, head: &str, path: Option<&str>, max: usize) -> io::Result<String> {
+        let mut cmd = self.cmd(false);
+        cmd.args(["log", "--no-color", "--date=short", "--format=%h %ad %an: %s", &format!("-n{max}")]);
+        cmd.args(["--end-of-options", head, "--"]).args(path);
+        git(&mut cmd)
+    }
+
+    /// `git show` of a commit (stat + patch) or `<rev>:<path>`. A leading `HEAD` means `head`.
+    pub fn show(&self, head: Option<&str>, rev: &str) -> io::Result<String> {
+        let rev = match (rev.strip_prefix("HEAD"), head) {
+            (Some(rest), Some(h)) => format!("{h}{rest}"),
+            (Some(_), None) => return Err(io::Error::other("the Worker repo has no commits")),
+            (None, _) => rev.to_owned(),
+        };
+        git(self.cmd(false).args([
+            "show",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--stat",
+            "-p",
+            "--end-of-options",
+            &rev,
+        ]))
     }
 
     fn cmd(&self, work_tree: bool) -> Command {
