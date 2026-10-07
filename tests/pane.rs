@@ -200,6 +200,32 @@ impl Fx {
     }
 }
 
+/// Review findings: wide glyphs, a detail of leading spaces, three Escalations at once.
+fn nasty() -> Fx {
+    let mut f = Fx::repetition();
+    let mut c = concern("c4", "approach", Severity::Warn, &"界".repeat(40));
+    c.detail = vec![format!("{}X", " ".repeat(60))];
+    f.at(11, 50, Change::Add { watcher: "companion".into(), concern: c }.event());
+    for i in 1..=3 {
+        f.at(
+            12,
+            i,
+            EscalationOp::Raised {
+                id: format!("e{i}"),
+                cause: Cause::Blocked,
+                concern: None,
+                challenge: None,
+                hook: Some(i),
+                title: format!("Worker blocked {i}: waiting on you"),
+                lines: vec!["Allow `rm -rf target`?".into(), "Watcher (opinion): fine, build output".into()],
+                rule: "Answer in the Worker".into(),
+            }
+            .event(),
+        );
+    }
+    f
+}
+
 fn draft_pending() -> Pending {
     Pending { id: "c2".into(), line: "pending: human draft in prompt".into(), waits: vec![at(11, 20), at(11, 40)] }
 }
@@ -237,9 +263,12 @@ fn board_goldens_at_48_64_96() {
 fn every_frame_fits_its_width_and_rows() {
     let mut debate = Fx::repetition().board();
     debate.pending = Some(draft_pending());
-    let boards = [debate, Fx::escalated().board(), Fx::new().board()];
+    let mut wide = nasty().board();
+    wide.pending = Some(draft_pending());
+    let boards = [debate, Fx::escalated().board(), Fx::new().board(), wide];
     let uis = [
         Ui::default(),
+        Ui { selected: Some("c4".into()), ..Ui::default() },
         Ui { closed: true, ..Ui::default() },
         Ui { overlay: Overlay::Stream, ..Ui::default() },
         Ui { overlay: Overlay::Help, ..Ui::default() },
@@ -290,6 +319,23 @@ fn small_pane_never_trims_needs_you_pending_or_the_selection() {
         assert!(text.contains("┃›▲"), "selection kept, rows {rows}:\n{text}");
         assert!(rows < 14 || text.contains("more lines"), "rows {rows}:\n{text}");
     }
+}
+
+#[test]
+fn too_short_a_pane_goes_compact_and_keeps_every_item() {
+    let mut b = nasty().board();
+    b.pending = Some(draft_pending());
+    let ui = Ui { selected: Some("c4".into()), ..Ui::default() };
+    let f = layout(&b, &ui, 48, 12);
+    let text = texts(&f);
+    for want in ["Worker blocked 1", "Worker blocked 2", "Worker blocked 3", "human draft in prompt", "› c4"] {
+        assert!(text.contains(want), "no {want:?} in\n{text}");
+    }
+    // Only rows actually drawn count as on screen (V69).
+    for id in &f.visible {
+        assert!(text.contains(&format!(" {id} ")), "{id} visible but not drawn:\n{text}");
+    }
+    assert!(!f.visible.contains(&"c1".to_owned()), "{text}");
 }
 
 #[test]

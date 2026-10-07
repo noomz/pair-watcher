@@ -5,6 +5,8 @@
 
 use std::collections::HashSet;
 
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
 use crate::budget::Stage;
 use crate::concern::{Concern, Severity, State, Tag};
 use crate::pane::{Board, Entry, Tone, hhmm, money};
@@ -166,8 +168,8 @@ pub fn layout(b: &Board, ui: &Ui, width: usize, rows: usize) -> Frame {
         bottom.insert(0, Line::one(Style::Dim, "─".repeat(width)));
     }
     top.truncate(rows - 1);
-    let body = match ui.overlay {
-        Overlay::None => board(b, ui, selected.as_deref(), width),
+    let mut body = match ui.overlay {
+        Overlay::None => board(b, ui, selected.as_deref(), width, false),
         Overlay::Stream => stream(b, ui, width, rows.saturating_sub(top.len() + bottom.len())),
         Overlay::Help => help(width),
     };
@@ -181,6 +183,10 @@ pub fn layout(b: &Board, ui: &Ui, width: usize, rows: usize) -> Frame {
     }
     if top.len() + keep > rows && strip_shown(b) {
         top.pop();
+    }
+    // Still too tall: every item on one line, so each keeps a row (V65).
+    if top.len() + keep > rows && ui.overlay == Overlay::None {
+        body = board(b, ui, selected.as_deref(), width, true);
     }
     let (body, visible) = fit(body, rows.saturating_sub(top.len() + bottom.len()));
     let lines = top.into_iter().chain(body).chain(bottom).collect();
@@ -333,7 +339,8 @@ fn section(name: &str, n: usize, hints: &str, width: usize) -> Line {
     }
 }
 
-fn board(b: &Board, ui: &Ui, selected: Option<&str>, width: usize) -> Vec<Row> {
+/// `compact`: one line per item (no boxes, details or wrapping) for a pane too short for them.
+fn board(b: &Board, ui: &Ui, selected: Option<&str>, width: usize, compact: bool) -> Vec<Row> {
     let mut out = Vec::new();
     let sel = |id: &str| selected == Some(id);
 
@@ -341,8 +348,13 @@ fn board(b: &Board, ui: &Ui, selected: Option<&str>, width: usize) -> Vec<Row> {
     if !needs.is_empty() {
         out.push(row(section("NEEDS YOU", needs.len(), "+", width), 0));
         for e in needs {
-            let inner = width - 4;
             let at = b.raised.get(&e.id).map(|t| b.time(*t)).unwrap_or_default();
+            if compact {
+                let mark = if sel(&e.id) { "›" } else { " " };
+                out.push(row(Line::one(Style::RedBold, cut(&format!("{mark}▲ {at} {}", e.title), width)), 0));
+                continue;
+            }
+            let inner = width - 4;
             let plus = if b.info.get(&e.id).is_some_and(|i| i.helpful) { " +" } else { "" };
             let mut body: Vec<Line> = wrap(&format!("▲ {at} {}{plus}", e.title), inner, 2)
                 .into_iter()
@@ -367,7 +379,7 @@ fn board(b: &Board, ui: &Ui, selected: Option<&str>, width: usize) -> Vec<Row> {
     if !debate.is_empty() {
         out.push(row(section("IN DEBATE", debate.len(), "⏎ log · d · +", width), 1));
         for c in debate {
-            out.extend(concern_row(b, c, sel(&c.id), width, 0));
+            out.extend(concern_row(b, c, sel(&c.id), width, 0, compact));
             let entries = b.info.get(&c.id).map(|i| i.entries.as_slice()).unwrap_or_default();
             let expanded = ui.expanded.contains(&c.id);
             let skip = if expanded { 0 } else { entries.len().saturating_sub(DEBATE_TAIL) };
@@ -384,7 +396,7 @@ fn board(b: &Board, ui: &Ui, selected: Option<&str>, width: usize) -> Vec<Row> {
                     reason.push_str(&format!(" ({} wait)", ordinal(p.waits.len())));
                 }
                 let e = Entry { t, event: "pending".to_owned(), reason };
-                out.extend(entry(b, &e, width, true, Style::Dim).into_iter().map(|l| row(l, 0)));
+                out.extend(entry(b, &e, width, !compact, Style::Dim).into_iter().map(|l| row(l, 0)));
             }
         }
     }
@@ -394,8 +406,8 @@ fn board(b: &Board, ui: &Ui, selected: Option<&str>, width: usize) -> Vec<Row> {
         out.push(row(section("OPEN", open.len(), "d · P · + · m", width), 2));
         for c in open {
             let selected = sel(&c.id);
-            out.extend(concern_row(b, c, selected, width, if selected { 0 } else { 2 }));
-            if selected {
+            out.extend(concern_row(b, c, selected, width, if selected { 0 } else { 2 }, compact));
+            if selected && !compact {
                 let refs = (!c.refs.is_empty()).then(|| format!("refs: {}", c.refs.join(", ")));
                 for d in c.detail.iter().cloned().chain(refs) {
                     out.extend(
@@ -418,7 +430,7 @@ fn board(b: &Board, ui: &Ui, selected: Option<&str>, width: usize) -> Vec<Row> {
                     .push(Style::Dim, c.headline.clone());
                 let line = clip_line(line, width);
                 out.push(Row { line, prio: if selected { 0 } else { 4 }, concern: Some(c.id.clone()) });
-                if selected {
+                if selected && !compact {
                     for e in b.info.get(&c.id).map(|i| i.entries.as_slice()).unwrap_or_default() {
                         out.extend(entry(b, e, width, true, Style::Dim).into_iter().map(|l| row(l, 1)));
                     }
@@ -429,7 +441,7 @@ fn board(b: &Board, ui: &Ui, selected: Option<&str>, width: usize) -> Vec<Row> {
     out
 }
 
-fn concern_row(b: &Board, c: &Concern, selected: bool, width: usize, prio: u8) -> Vec<Row> {
+fn concern_row(b: &Board, c: &Concern, selected: bool, width: usize, prio: u8, compact: bool) -> Vec<Row> {
     let mark = if selected { "›" } else { " " };
     let tag = match c.tag {
         Some(Tag::Conceded) => " (Worker conceded; awaiting fix)",
@@ -441,7 +453,8 @@ fn concern_row(b: &Board, c: &Concern, selected: bool, width: usize, prio: u8) -
     let text = format!("{lead}{sev} [{}] {}{tag}{plus}", c.focus, c.headline);
     let base = if selected { Style::Bold } else { Style::Plain };
     let sev_style = if c.severity == Severity::Warn { Style::Yellow } else { Style::Dim };
-    wrap(&text, width, 4)
+    let lines = if compact { vec![cut(&text, width)] } else { wrap(&text, width, 4) };
+    lines
         .into_iter()
         .enumerate()
         .map(|(i, l)| {
@@ -499,8 +512,7 @@ fn ticker(b: &Board, ui: &Ui, width: usize) -> Vec<Line> {
         let prompt = format!("remark for {} (⏎ send · esc cancel): ", input.concern);
         let text = format!("{prompt}{}▏", input.text);
         // Keep the end of a long remark in view.
-        let skip = cols(&text).saturating_sub(width);
-        out.push(Line::one(Style::Cyan, text.chars().skip(skip).collect::<String>()));
+        out.push(Line::one(Style::Cyan, tail(&text, width)));
     }
     let keep = out.len().saturating_sub(TICKER_LINES);
     out.split_off(keep)
@@ -519,6 +531,11 @@ fn fit(mut body: Vec<Row>, rows: usize) -> (Vec<Line>, Vec<String>) {
             dropped += 1;
         }
     }
+    // Last resort, all of it protected: the bottom goes, and says so.
+    if body.len() > rows {
+        dropped += body.len() - rows.saturating_sub(1);
+        body.truncate(rows.saturating_sub(1));
+    }
     let mut visible: Vec<String> = Vec::new();
     for c in body.iter().filter_map(|r| r.concern.clone()) {
         if !visible.contains(&c) {
@@ -529,7 +546,6 @@ fn fit(mut body: Vec<Row>, rows: usize) -> (Vec<Line>, Vec<String>) {
     if dropped > 0 && lines.len() < rows {
         lines.push(Line::one(Style::Dim, format!("  … {dropped} more lines")));
     }
-    lines.truncate(rows);
     lines.resize(rows, Line::default());
     (lines, visible)
 }
@@ -634,9 +650,24 @@ fn ordinal(n: usize) -> String {
     format!("{n}{suffix}")
 }
 
-/// Terminal columns: one per char (the pane draws no wide glyphs).
+/// Terminal columns (wide CJK glyphs take two).
 pub fn cols(s: &str) -> usize {
-    s.chars().count()
+    UnicodeWidthStr::width(s)
+}
+
+/// The longest prefix of at most `width` columns, and the rest. Never empty while `s` is not,
+/// so a glyph wider than `width` still makes progress.
+fn split_cols(s: &str, width: usize) -> (&str, &str) {
+    let mut used = 0;
+    for (i, c) in s.char_indices() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > width {
+            let i = if i == 0 { c.len_utf8() } else { i };
+            return s.split_at(i);
+        }
+        used += w;
+    }
+    (s, "")
 }
 
 /// At most `width` columns; a cut ends in `…`.
@@ -644,9 +675,19 @@ fn cut(s: &str, width: usize) -> String {
     if cols(s) <= width {
         return s.to_owned();
     }
-    let mut out: String = s.chars().take(width.saturating_sub(1)).collect();
-    out.push('…');
-    out
+    format!("{}…", split_cols(s, width.saturating_sub(1)).0)
+}
+
+/// The last `width` columns of `s`.
+fn tail(s: &str, width: usize) -> &str {
+    let mut used = 0;
+    for (i, c) in s.char_indices().rev() {
+        used += UnicodeWidthChar::width(c).unwrap_or(0);
+        if used > width {
+            return &s[i + c.len_utf8()..];
+        }
+    }
+    s
 }
 
 fn pad(s: &str, width: usize) -> String {
@@ -661,42 +702,42 @@ fn clip_line(line: Line, width: usize) -> Line {
     let mut left = width.saturating_sub(1);
     let mut out = Line::default();
     for s in line.0 {
-        if left == 0 {
+        let (text, _) = split_cols(&s.text, left);
+        if text.is_empty() || cols(text) > left {
             break;
         }
-        let text: String = s.text.chars().take(left).collect();
-        left -= cols(&text);
-        out.0.push(Span { style: s.style, text });
+        left -= cols(text);
+        out.0.push(Span { style: s.style, text: text.to_owned() });
     }
     out.push(Style::Plain, "…")
 }
 
-/// Word wrap to `width` columns; lines after the first are indented `indent` columns. A word
-/// longer than a line is split.
+/// Word wrap to `width` columns, a hard limit; lines after the first are indented `indent`
+/// columns. Leading spaces indent every line. A word longer than a line is split.
 pub fn wrap(text: &str, width: usize, indent: usize) -> Vec<String> {
-    let lead = text.len() - text.trim_start_matches(' ').len();
+    let width = width.max(2);
+    let lead = (text.len() - text.trim_start_matches(' ').len()).min(width / 2);
     if lead > 0 {
-        let mut lines = wrap(&text[lead..], width.saturating_sub(lead), indent.saturating_sub(lead));
-        lines[0].insert_str(0, &text[..lead]);
-        for l in &mut lines[1..] {
+        let mut lines = wrap(text[lead..].trim_start_matches(' '), width - lead, indent.saturating_sub(lead));
+        for l in &mut lines {
             l.insert_str(0, &text[..lead]);
         }
         return lines;
     }
-    let width = width.max(indent + 8);
+    let indent = indent.min(width / 2);
     let mut lines: Vec<String> = Vec::new();
     let mut cur = String::new();
     let room = |lines: &Vec<String>| if lines.is_empty() { width } else { width - indent };
     for word in text.split(' ') {
-        let mut word = word.to_owned();
+        let mut word = word;
         loop {
             let limit = room(&lines);
-            let need = if cur.is_empty() { cols(&word) } else { cols(&cur) + 1 + cols(&word) };
+            let need = if cur.is_empty() { cols(word) } else { cols(&cur) + 1 + cols(word) };
             if need <= limit {
                 if !cur.is_empty() {
                     cur.push(' ');
                 }
-                cur.push_str(&word);
+                cur.push_str(word);
                 break;
             }
             if !cur.is_empty() {
@@ -704,9 +745,9 @@ pub fn wrap(text: &str, width: usize, indent: usize) -> Vec<String> {
                 continue;
             }
             // A word longer than the whole line: split it.
-            let head: String = word.chars().take(limit).collect();
-            word = word.chars().skip(limit).collect();
-            lines.push(head);
+            let (head, rest) = split_cols(word, limit);
+            lines.push(head.to_owned());
+            word = rest;
             if word.is_empty() {
                 break;
             }

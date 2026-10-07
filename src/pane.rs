@@ -771,14 +771,19 @@ pub fn run(mailbox: &Mailbox) -> io::Result<()> {
     let mut shown = Shown::default();
     let mut drawn: Vec<String> = Vec::new();
     let mut note_at = Instant::now();
+    term::stop_on_signals();
     let _raw = term::Raw::enter()?;
     let mut out = io::stdout();
-    loop {
-        let batch = log.read_from(offset)?;
-        offset = batch.next;
+    let tail = |board: &mut Board, offset: &mut u64| -> io::Result<()> {
+        let batch = log.read_from(*offset)?;
+        *offset = batch.next;
         for r in &batch.records {
             board.apply(r);
         }
+        Ok(())
+    };
+    while !term::stopping() {
+        tail(&mut board, &mut offset)?;
         board.pending =
             delivery::pending(&board.challenges, &board.debate, board.observe_only, mailbox).unwrap_or(None);
         if ui.note.is_some() && note_at.elapsed() > NOTE_FOR {
@@ -813,6 +818,8 @@ pub fn run(mailbox: &Mailbox) -> io::Result<()> {
                     for e in events {
                         log.append(e)?;
                     }
+                    // The next key sees what this one wrote (`ZZ` = pause, then resume).
+                    tail(&mut board, &mut offset)?;
                 }
                 Effect::None => {}
             }
@@ -821,4 +828,5 @@ pub fn run(mailbox: &Mailbox) -> io::Result<()> {
             }
         }
     }
+    Ok(())
 }

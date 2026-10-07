@@ -4,6 +4,7 @@
 use std::io::{self, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,6 +57,26 @@ impl Drop for Raw {
         // SAFETY: restores the attributes read in `enter`.
         unsafe { libc::tcsetattr(io::stdin().as_raw_fd(), libc::TCSANOW, &self.orig) };
     }
+}
+
+static STOP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn stop(_: libc::c_int) {
+    STOP.store(true, Ordering::SeqCst);
+}
+
+/// SIGTERM, SIGHUP and SIGINT ask the loop to end, so [`Raw`]'s drop restores the terminal
+/// (their default action would kill the process with the terminal left raw).
+pub fn stop_on_signals() {
+    for sig in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+        // SAFETY: the handler only stores to an atomic, which is async-signal-safe.
+        unsafe { libc::signal(sig, stop as extern "C" fn(libc::c_int) as libc::sighandler_t) };
+    }
+}
+
+/// A termination signal arrived.
+pub fn stopping() -> bool {
+    STOP.load(Ordering::SeqCst)
 }
 
 /// Columns × rows of the terminal on stdout; 80 × 24 when unknown.
