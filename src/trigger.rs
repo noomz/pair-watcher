@@ -24,7 +24,8 @@ pub enum Signal {
     Blocked,
     /// Codex `PermissionRequest`: blocked unless activity follows within `CODEX_BLOCKED_MS`.
     MaybeBlocked,
-    /// Codex tool hook, or guardian review start: the Worker is not waiting on the human.
+    /// Codex tool hook, prompt submit, or guardian review start: the Worker is working, not
+    /// waiting on the human.
     Activity,
 }
 
@@ -34,7 +35,7 @@ pub fn signal(harness: Harness, event: &str) -> Option<Signal> {
         (Harness::Claude | Harness::Codex, "Stop") | (Harness::Pi, "agent_settled") => Some(Signal::TurnEnd),
         (Harness::Claude, "PermissionRequest") | (Harness::Pi, "herdr:blocked") => Some(Signal::Blocked),
         (Harness::Codex, "PermissionRequest") => Some(Signal::MaybeBlocked),
-        (Harness::Codex, "PreToolUse" | "PostToolUse") => Some(Signal::Activity),
+        (Harness::Codex, "PreToolUse" | "PostToolUse" | "UserPromptSubmit") => Some(Signal::Activity),
         _ => None,
     }
 }

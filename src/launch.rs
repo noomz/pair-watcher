@@ -18,7 +18,9 @@ use crate::hook::shell_line;
 /// Hooks reported through the shim (I5, V56). `SessionStart` carries the transcript path and the
 /// Worker session id, including the new ones after Claude `/clear` or a resume.
 pub const CLAUDE_EVENTS: [&str; 3] = ["SessionStart", "Stop", "PermissionRequest"];
-pub const CODEX_EVENTS: [&str; 5] = ["SessionStart", "Stop", "PermissionRequest", "PreToolUse", "PostToolUse"];
+/// Codex `UserPromptSubmit`: a turn started, even one that calls no tool (delivery waits, V21).
+pub const CODEX_EVENTS: [&str; 6] =
+    ["SessionStart", "Stop", "PermissionRequest", "PreToolUse", "PostToolUse", "UserPromptSubmit"];
 
 const HOOK_TIMEOUT_S: i64 = 10;
 

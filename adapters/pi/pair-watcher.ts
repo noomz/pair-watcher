@@ -75,14 +75,18 @@ export default function (pi: any) {
     if (!timer && !process.env.PAIR_WATCHER_GUARD) timer = setInterval(tick, POLL_MS);
     timer?.unref?.();
   });
+  // Bumped by each agent start: a settle whose append finishes after the next start is stale.
+  let starts = 0;
   pi.on("agent_start", () => {
     running = true;
+    starts++;
   });
   // Idle only once the turn end is in the inbox: until then the stale-check gate (V21) cannot
   // see it, and a poll would deliver ahead of the turn-end wake.
   pi.on("agent_settled", async (_e: any, ctx: any) => {
+    const at = starts;
     await forward("agent_settled", ctx ?? last);
-    running = false;
+    if (starts === at) running = false;
   });
   pi.events?.on?.("herdr:blocked", (data: any) => forward("herdr:blocked", last, { blocked: data }));
 }

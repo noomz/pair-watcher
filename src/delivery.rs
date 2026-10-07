@@ -153,8 +153,9 @@ pub fn stop_block(mailbox: &Mailbox, payload: &Value, out: &mut impl Write, now:
 }
 
 /// After the turn-end wake (V27): `<codex> queue --thread <id> --message <text>` for the next
-/// deliverable item, while the Worker is still idle. Returns the delivered id. A failed or timed
-/// out call leaves the claim to lapse, so the item is tried again after the lease.
+/// deliverable item, while the Worker is still idle. Returns the delivered id. A failed call
+/// leaves the claim to lapse, so the item is tried again after the lease; a timed-out one counts
+/// as sent.
 pub fn codex_queue(mailbox: &Mailbox, codex: &OsStr, timeout: Duration, now: u64) -> io::Result<Option<String>> {
     let view = View::read(mailbox)?;
     if view.harness != Some(Harness::Codex) || !idle_since_turn_end(mailbox, Harness::Codex)? {
@@ -176,7 +177,10 @@ pub fn codex_queue(mailbox: &Mailbox, codex: &OsStr, timeout: Duration, now: u64
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "codex queue timed out"));
+            // It may have queued before hanging: count it sent rather than risk a second copy. A
+            // lost one shows as no verdict, and the Debate re-asks (V33).
+            mailbox.outbox().ack(&claim, now)?;
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "codex queue timed out; counted as sent"));
         }
         thread::sleep(Duration::from_millis(20));
     };

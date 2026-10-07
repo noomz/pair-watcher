@@ -301,15 +301,18 @@ fn codex_queue_waits_while_a_new_turn_runs() {
     let w = world("codex", false);
     let end = w.hook_record("Stop", json!({"session_id": "019a-thread"}));
     w.mb.settle(end).unwrap();
-    w.hook_record("PreToolUse", json!({"session_id": "019a-thread"}));
     let codex = fake_codex(w.dir.path(), 0);
-    let got = delivery::codex_queue(&w.mb, codex.as_os_str(), T, now_ms()).unwrap();
-    assert_eq!(got, None, "V21: queued behind this turn it would skip its turn-end stale check");
-    assert!(!w.dir.path().join("codex.argv").exists());
+    // A text-only human turn shows only as its prompt; a tool turn as its tool hooks.
+    for event in ["UserPromptSubmit", "PreToolUse"] {
+        w.hook_record(event, json!({"session_id": "019a-thread"}));
+        let got = delivery::codex_queue(&w.mb, codex.as_os_str(), T, now_ms()).unwrap();
+        assert_eq!(got, None, "V21: queued behind this turn it would skip its turn-end stale check");
+        assert!(!w.dir.path().join("codex.argv").exists());
+    }
 }
 
 #[test]
-fn hung_codex_queue_is_killed_and_the_item_kept() {
+fn hung_codex_queue_is_killed_and_counted_sent() {
     let w = world("codex", false);
     let end = w.hook_record("Stop", json!({"session_id": "019a-thread"}));
     w.mb.settle(end).unwrap();
@@ -318,7 +321,9 @@ fn hung_codex_queue_is_killed_and_the_item_kept() {
     let err = delivery::codex_queue(&w.mb, codex.as_os_str(), Duration::from_millis(300), now_ms()).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
     assert!(started.elapsed() < Duration::from_secs(5), "the arbiter loop is not held up");
-    assert_eq!(w.mb.outbox().pending().unwrap().len(), 1);
+    // It may have queued before hanging: counted sent, never queued a second time (V28).
+    assert!(w.mb.outbox().pending().unwrap().is_empty());
+    assert_eq!(w.sync_sent().as_deref(), Some("codex-queue"));
 }
 
 #[test]

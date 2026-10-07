@@ -23,7 +23,10 @@ function world(on: any, answer: object, box: string | string[] = '', stderr = ''
     const text = boxes.length > 1 ? boxes.shift()! : boxes[0]
     return { value: { text, cursor: text.length } }
   })
-  on('prompt.submit', (_$: any, e: { text: string }) => {
+  // What lies beneath the plugins: a prompt enters after `delay` ms (slow settings hooks).
+  let delay = 0
+  on('prompt.submit', async (_$: any, e: { text: string }) => {
+    if (delay) await clock.sleep(delay)
     submits.push(e.text)
     return { text: e.text }
   })
@@ -38,7 +41,7 @@ function world(on: any, answer: object, box: string | string[] = '', stderr = ''
   on('turn.complete', () => ({ text: '' }))
   // One poll interval: the mod's own timer polls the mailbox.
   const tick = () => clock.advance(1000)
-  return { runs, submits, statuses, tick, clock }
+  return { runs, submits, statuses, tick, clock, slowSubmit: (ms: number) => (delay = ms) }
 }
 
 const start = ($: any) => $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
@@ -78,15 +81,40 @@ describe('idle delivery (V25, V26, I8)', () => {
 })
 
 describe('turn boundaries (V25, V21)', () => {
-  test('a typed prompt is busy from the moment it enters, not from turn.start', async ($, on) => {
+  test('a typed prompt is busy until its turn starts, however slow the settings hooks', async ($, on) => {
     const w = world(on, { status: null, commentary: [], item: null })
     await start($)
-    await $.prompt.submit({ text: 'human prompt' })
+    w.slowSubmit(30_000)
+    const entering = $.prompt.submit({ text: 'human prompt' })
+    await w.clock.advance(15_000)
+    expect(polls(w.runs).every(p => p.at(-1) === 'busy')).toBe(true)
+    await w.clock.advance(15_000)
+    await entering
     await w.tick()
-    expect(polls(w.runs).map(p => p.at(-1))).toEqual(['busy'])
-    // A command that enters and starts no turn holds the mod 10 s at most.
-    await w.clock.advance(10_000)
     expect(polls(w.runs).at(-1)?.at(-1)).toBe('idle')
+  })
+
+  test('a prompt queued behind the running turn keeps it busy past turn.complete', async ($, on) => {
+    const w = world(on, { status: null, commentary: [], item: null })
+    await start($)
+    await $.turn.start({ text: 'go', turnId: 'u1' })
+    await $.prompt.submit({ text: 'next, please' })
+    await $.turn.complete({ reason: 'answer', answer: 'done', durationMs: 1, isAborted: false, turnId: 'u1' } as any)
+    await w.tick()
+    await $.turn.start({ text: 'next, please', turnId: 'u2' })
+    await $.turn.complete({ reason: 'answer', answer: 'ok', durationMs: 1, isAborted: false, turnId: 'u2' } as any)
+    await w.tick()
+    expect(polls(w.runs).map(p => p.at(-1))).toEqual(['busy', 'idle'])
+  })
+
+  test('an attached session follows its new id after /clear', async ($, on) => {
+    const w = world(on, { status: null, commentary: [], item: null }, '', '', { PAIR_WATCHER_SESSION: '' })
+    const ids = ['claude-a', 'claude-b']
+    on('session.id', () => ({ value: ids.shift() }))
+    await start($)
+    await start($)
+    await w.tick()
+    expect(polls(w.runs)).toEqual([['--session', 'claude-b', '--route', 'mod', '--worker', 'idle']])
   })
 
   test('a draft typed between poll and submit wins: the claim is released', async ($, on) => {
