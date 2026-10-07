@@ -14,7 +14,12 @@ type Poll = { status: string | null; commentary: string[]; item: Item | null }
 
 let session: string | undefined
 let shim: string | undefined
+let started = false
 let running = false
+// When a prompt entered whose turn has not started: a typed prompt's turn starts ~2 s after it
+// enters, with the box already empty. Bounded, since a command may enter and start no turn.
+let entered: number | undefined
+const ENTER_MS = 10_000
 let polling = false
 let commentary: string[] = []
 let status: string | undefined
@@ -27,6 +32,10 @@ async function draft($: EngineInterface) {
   return (await $.prompt.read()).text.trim() !== ''
 }
 
+async function busy($: EngineInterface) {
+  return running || (entered !== undefined && (await $.clock.now()) - entered < ENTER_MS)
+}
+
 async function showStatus($: EngineInterface) {
   const now = await $.clock.now()
   await $.ui.status(note && now < note.until ? note.text : status)
@@ -37,7 +46,7 @@ async function tick($: EngineInterface) {
   if (!session || !shim || polling) return
   polling = true
   try {
-    const worker = running ? 'busy' : (await draft($)) ? 'draft' : 'idle'
+    const worker = (await busy($)) ? 'busy' : (await draft($)) ? 'draft' : 'idle'
     const r = await adapter($, ['poll', '--session', session, '--route', 'mod', '--worker', worker])
     if (r.exitCode !== 0 || !r.stdout.trim()) return
     const poll = JSON.parse(r.stdout) as Poll
@@ -55,18 +64,30 @@ async function tick($: EngineInterface) {
 }
 
 // Never typed into the box, never mid-turn (V25). A draft or a turn that appeared since the poll
-// wins: the claim lapses and the item waits for the next idle or `Stop`.
+// wins: the claim is handed back and the item waits for the next idle or `Stop`.
 async function deliver($: EngineInterface, item: Item) {
-  if (running || (await draft($))) return
+  const claim = ['--session', session!, '--id', item.id, '--token', item.token]
+  if ((await busy($)) || (await draft($))) {
+    await adapter($, ['release', ...claim])
+    return
+  }
+  // Our own submit skips our `prompt.submit` hook, so mark it entered here.
+  entered = await $.clock.now()
   const r = await $.prompt.submit({ text: item.text })
-  if ('drop' in r && r.drop) return
-  await adapter($, ['ack', '--session', session!, '--id', item.id, '--token', item.token])
+  if ('drop' in r && r.drop) {
+    entered = undefined
+    await adapter($, ['release', ...claim])
+    return
+  }
+  await adapter($, ['ack', ...claim])
 }
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     // A Watcher's own `claude -p` loads installed mods too; it must never deliver (V58).
-    if (await $.env.get('PAIR_WATCHER_GUARD')) return next(e)
+    // Once per load: `/clear` and resume start the session again, the timer keeps running.
+    if (started || (await $.env.get('PAIR_WATCHER_GUARD'))) return next(e)
+    started = true
     const home = await $.env.get('HOME')
     session = (await $.env.get('PAIR_WATCHER_SESSION')) ?? (await $.session.id())
     shim = home ? `${home}/.pair-watcher/bin/pw-hook` : undefined
@@ -80,13 +101,25 @@ export const register: Register = on => {
     return next(e)
   })
 
+  on('prompt.submit', async ($, e, next) => {
+    entered = await $.clock.now()
+    const r = await next(e)
+    if ('drop' in r && r.drop) entered = undefined
+    return r
+  })
+
   on('turn.start', async ($, e, next) => {
     running = true
+    entered = undefined
     return next(e)
   })
 
   on('turn.complete', async ($, e, next) => {
-    if (!e.agentId) running = false
+    if (!e.agentId) {
+      running = false
+      // A prompt queued during that turn starts next: its window opens now.
+      if (entered !== undefined) entered = await $.clock.now()
+    }
     return next(e)
   })
 

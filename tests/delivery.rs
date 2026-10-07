@@ -3,6 +3,7 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use pair_watcher::challenge::{Challenges, Origin};
 use pair_watcher::concern::{Change, Concern, Severity, State};
@@ -16,6 +17,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_pair-watcher");
+const T: Duration = Duration::from_secs(5);
 
 struct World {
     dir: TempDir,
@@ -219,9 +221,13 @@ fn no_session_start_delivers_nothing() {
 }
 
 fn fake_codex(dir: &Path, exit: i32) -> std::path::PathBuf {
+    fake_codex_script(dir, &format!("exit {exit}"))
+}
+
+fn fake_codex_script(dir: &Path, tail: &str) -> std::path::PathBuf {
     let path = dir.join("codex");
     let argv = dir.join("codex.argv");
-    fs::write(&path, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexit {exit}\n", argv.display())).unwrap();
+    fs::write(&path, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n{tail}\n", argv.display())).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     path
 }
@@ -232,16 +238,16 @@ fn codex_queue_after_stop_delivers_to_the_worker_thread() {
     let end = w.hook_record("Stop", json!({"session_id": "019a-thread"}));
     let codex = fake_codex(w.dir.path(), 0);
     let now = now_ms();
-    assert_eq!(delivery::codex_queue(&w.mb, codex.as_os_str(), now).unwrap(), None, "V21: not before settle");
+    assert_eq!(delivery::codex_queue(&w.mb, codex.as_os_str(), T, now).unwrap(), None, "V21: not before settle");
 
     w.mb.settle(end).unwrap();
-    assert_eq!(delivery::codex_queue(&w.mb, codex.as_os_str(), now).unwrap().as_deref(), Some("c1"));
+    assert_eq!(delivery::codex_queue(&w.mb, codex.as_os_str(), T, now).unwrap().as_deref(), Some("c1"));
     let argv = fs::read_to_string(w.dir.path().join("codex.argv")).unwrap();
     let argv: Vec<&str> = argv.lines().collect();
     assert_eq!(&argv[..4], ["queue", "--thread", "019a-thread", "--message"], "I7");
     assert!(argv[4].starts_with("[pair-watcher · Challenge c1"));
     assert_eq!(w.sync_sent().as_deref(), Some("codex-queue"));
-    assert_eq!(delivery::codex_queue(&w.mb, codex.as_os_str(), now).unwrap(), None, "V28: once");
+    assert_eq!(delivery::codex_queue(&w.mb, codex.as_os_str(), T, now).unwrap(), None, "V28: once");
 }
 
 #[test]
@@ -250,12 +256,12 @@ fn failed_codex_queue_keeps_the_item_for_after_the_lease() {
     let end = w.hook_record("Stop", json!({"session_id": "019a-thread"}));
     w.mb.settle(end).unwrap();
     let codex = fake_codex(w.dir.path(), 1);
-    assert!(delivery::codex_queue(&w.mb, codex.as_os_str(), now_ms()).is_err());
+    assert!(delivery::codex_queue(&w.mb, codex.as_os_str(), T, now_ms()).is_err());
     assert_eq!(w.mb.outbox().pending().unwrap().len(), 1);
     assert_eq!(w.sync_sent(), None, "not sent");
     let ok = fake_codex(w.dir.path(), 0);
     let later = now_ms() + pair_watcher::outbox::LEASE_MS;
-    assert_eq!(delivery::codex_queue(&w.mb, ok.as_os_str(), later).unwrap().as_deref(), Some("c1"));
+    assert_eq!(delivery::codex_queue(&w.mb, ok.as_os_str(), T, later).unwrap().as_deref(), Some("c1"));
 }
 
 #[test]
@@ -288,4 +294,77 @@ fn adapter_pw_runs_only_session_commands() {
     let refused = w.cmd(&["hook", "adapter", "pw", "--session", "s1", "--", "run", "--", "claude"], "", false);
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("/pw takes rule|undo|keep|mute|nochallenge|pause"));
+}
+
+#[test]
+fn codex_queue_waits_while_a_new_turn_runs() {
+    let w = world("codex", false);
+    let end = w.hook_record("Stop", json!({"session_id": "019a-thread"}));
+    w.mb.settle(end).unwrap();
+    w.hook_record("PreToolUse", json!({"session_id": "019a-thread"}));
+    let codex = fake_codex(w.dir.path(), 0);
+    let got = delivery::codex_queue(&w.mb, codex.as_os_str(), T, now_ms()).unwrap();
+    assert_eq!(got, None, "V21: queued behind this turn it would skip its turn-end stale check");
+    assert!(!w.dir.path().join("codex.argv").exists());
+}
+
+#[test]
+fn hung_codex_queue_is_killed_and_the_item_kept() {
+    let w = world("codex", false);
+    let end = w.hook_record("Stop", json!({"session_id": "019a-thread"}));
+    w.mb.settle(end).unwrap();
+    let codex = fake_codex_script(w.dir.path(), "exec sleep 30");
+    let started = Instant::now();
+    let err = delivery::codex_queue(&w.mb, codex.as_os_str(), Duration::from_millis(300), now_ms()).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    assert!(started.elapsed() < Duration::from_secs(5), "the arbiter loop is not held up");
+    assert_eq!(w.mb.outbox().pending().unwrap().len(), 1);
+}
+
+#[test]
+fn worker_session_prefers_the_workers_own_hooks() {
+    let w = world("codex", false);
+    w.hook_record("Stop", json!({"session_id": "worker-thread"}));
+    w.hook_record("PostToolUse", json!({"session_id": "other-thread"}));
+    assert_eq!(delivery::worker_session(&w.mb).unwrap().as_deref(), Some("worker-thread"));
+}
+
+#[test]
+fn released_claim_is_claimable_at_once() {
+    let w = world("claude", false);
+    let now = now_ms();
+    let item = delivery::poll(&w.mb, Route::Mod, Worker::Idle, now).unwrap().item.unwrap();
+    let release =
+        w.cmd(&["hook", "adapter", "release", "--session", "s1", "--id", &item.id, "--token", &item.token], "", false);
+    assert!(release.status.success(), "{release:?}");
+    let out = w.stop(false);
+    assert!(stdout(&out).contains("\"decision\":\"block\""), "the Stop hook need not wait out the lease: {out:?}");
+}
+
+#[test]
+fn empty_box_clears_the_draft_label_even_when_nothing_is_claimed() {
+    let w = world("claude", false);
+    let now = now_ms();
+    w.hook_record("Stop", json!({"session_id": "worker-1"}));
+    delivery::poll(&w.mb, Route::Mod, Worker::Draft, now).unwrap();
+    let poll = delivery::poll(&w.mb, Route::Mod, Worker::Idle, now).unwrap();
+    assert_eq!(poll.item, None, "not settled yet");
+    assert!(poll.commentary.contains(&"pending: Worker idle".to_owned()), "{:?}", poll.commentary);
+}
+
+#[test]
+fn stale_challenge_gets_no_held_reason() {
+    let w = world("claude", false);
+    w.mb.log()
+        .append(
+            Change::Resolve {
+                watcher: "approach".into(),
+                id: "c1".into(),
+                reason: pair_watcher::concern::Resolution::Fixed,
+            }
+            .event(),
+        )
+        .unwrap();
+    delivery::poll(&w.mb, Route::Mod, Worker::Draft, now_ms()).unwrap();
+    assert_eq!(w.mb.outbox().held("c1").unwrap(), None);
 }

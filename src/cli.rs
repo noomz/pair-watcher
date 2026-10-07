@@ -317,6 +317,15 @@ enum AdapterCmd {
         #[arg(long)]
         token: String,
     },
+    /// The claimed item was not sent (the Worker turned busy): claimable again at once
+    Release {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        token: String,
+    },
     /// `/pw <command> …`: a session command for this session
     Pw {
         #[arg(long)]
@@ -352,12 +361,16 @@ fn adapter(args: &[String]) -> ExitCode {
         Err(e) => return fail(&e.to_string()),
     };
     let session = match &cmd {
-        AdapterCmd::Poll { session, .. } | AdapterCmd::Ack { session, .. } | AdapterCmd::Pw { session, .. } => session,
+        AdapterCmd::Poll { session, .. }
+        | AdapterCmd::Ack { session, .. }
+        | AdapterCmd::Release { session, .. }
+        | AdapterCmd::Pw { session, .. } => session,
     };
     let Some(mailbox) = Home::from_env().ok().and_then(|home| Mailbox::open_registered(&home, session)) else {
         return ExitCode::SUCCESS;
     };
     let now = now_ms();
+    let ack = matches!(cmd, AdapterCmd::Ack { .. });
     let result = match cmd {
         AdapterCmd::Poll { route, worker, .. } => {
             let route = match route {
@@ -374,10 +387,11 @@ fn adapter(args: &[String]) -> ExitCode {
                 Ok(())
             })
         }
-        AdapterCmd::Ack { id, token, .. } => {
-            let pending = mailbox.outbox().pending().map(|items| items.into_iter().find(|i| i.id == id));
-            match pending {
-                Ok(Some(item)) => mailbox.outbox().ack(&Claim { item, token }, now).map(drop),
+        AdapterCmd::Ack { id, token, .. } | AdapterCmd::Release { id, token, .. } => {
+            let outbox = mailbox.outbox();
+            match outbox.pending().map(|items| items.into_iter().find(|i| i.id == id)) {
+                Ok(Some(item)) if ack => outbox.ack(&Claim { item, token }, now).map(drop),
+                Ok(Some(item)) => outbox.release(&Claim { item, token }, now).map(drop),
                 Ok(None) => Ok(()),
                 Err(e) => Err(e),
             }

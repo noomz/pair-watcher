@@ -6,7 +6,9 @@ const ITEM = { id: 'c1', text: '[pair-watcher · Challenge c1 · from the Watche
 type Run = { argv: readonly string[] }
 
 // A Worker session: the env `run` sets, the mailbox answering `poll` with `answer`.
-function world(on: any, answer: object, box = '', stderr = '', env: Record<string, string> = {}) {
+// `box`: the prompt box, or what successive reads find in it (the last one stays).
+function world(on: any, answer: object, box: string | string[] = '', stderr = '', env: Record<string, string> = {}) {
+  const boxes = Array.isArray(box) ? [...box] : [box]
   mock.env(on, { HOME: '/h', PAIR_WATCHER_SESSION: 's1', ...env })
   const clock = mock.clock(on)
   const runs: Run[] = []
@@ -17,7 +19,10 @@ function world(on: any, answer: object, box = '', stderr = '', env: Record<strin
     const stdout = e.argv[2] === 'poll' ? JSON.stringify(answer) : ''
     return { value: { exitCode: stderr ? 2 : 0, stdout, stderr, isStdoutTruncated: false, isStderrTruncated: false } }
   })
-  on('prompt.read', () => ({ value: { text: box, cursor: box.length } }))
+  on('prompt.read', () => {
+    const text = boxes.length > 1 ? boxes.shift()! : boxes[0]
+    return { value: { text, cursor: text.length } }
+  })
   on('prompt.submit', (_$: any, e: { text: string }) => {
     submits.push(e.text)
     return { text: e.text }
@@ -33,7 +38,7 @@ function world(on: any, answer: object, box = '', stderr = '', env: Record<strin
   on('turn.complete', () => ({ text: '' }))
   // One poll interval: the mod's own timer polls the mailbox.
   const tick = () => clock.advance(1000)
-  return { runs, submits, statuses, tick }
+  return { runs, submits, statuses, tick, clock }
 }
 
 const start = ($: any) => $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
@@ -69,6 +74,35 @@ describe('idle delivery (V25, V26, I8)', () => {
     await $.turn.complete({ reason: 'answer', answer: 'done', durationMs: 1, isAborted: false, turnId: 'u1' } as any)
     await w.tick()
     expect(polls(w.runs).map(p => p.at(-1))).toEqual(['busy', 'idle'])
+  })
+})
+
+describe('turn boundaries (V25, V21)', () => {
+  test('a typed prompt is busy from the moment it enters, not from turn.start', async ($, on) => {
+    const w = world(on, { status: null, commentary: [], item: null })
+    await start($)
+    await $.prompt.submit({ text: 'human prompt' })
+    await w.tick()
+    expect(polls(w.runs).map(p => p.at(-1))).toEqual(['busy'])
+    // A command that enters and starts no turn holds the mod 10 s at most.
+    await w.clock.advance(10_000)
+    expect(polls(w.runs).at(-1)?.at(-1)).toBe('idle')
+  })
+
+  test('a draft typed between poll and submit wins: the claim is released', async ($, on) => {
+    const w = world(on, { status: null, commentary: [], item: ITEM }, ['', 'half'])
+    await start($)
+    await w.tick()
+    expect(w.submits).toEqual([])
+    expect(w.runs.at(-1)?.argv.slice(2)).toEqual(['release', '--session', 's1', '--id', 'c1', '--token', 't1'])
+  })
+
+  test('a session that starts again keeps one poll timer', async ($, on) => {
+    const w = world(on, { status: null, commentary: [], item: null })
+    await start($)
+    await start($)
+    await w.tick()
+    expect(polls(w.runs).length).toBe(1)
   })
 })
 

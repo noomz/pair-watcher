@@ -8,6 +8,8 @@
 use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -16,7 +18,8 @@ use crate::challenge::Challenges;
 use crate::concern::{ConcernList, Severity, State};
 use crate::event::{Event, Kind};
 use crate::harness::Harness;
-use crate::mailbox::Mailbox;
+use crate::jsonl::Record;
+use crate::mailbox::{Hook, Mailbox};
 use crate::outbox::Claim;
 use crate::trigger::{self, Signal};
 
@@ -150,21 +153,33 @@ pub fn stop_block(mailbox: &Mailbox, payload: &Value, out: &mut impl Write, now:
 }
 
 /// After the turn-end wake (V27): `<codex> queue --thread <id> --message <text>` for the next
-/// deliverable item. Returns the delivered id. A failed call leaves the claim to lapse, so the
-/// item is tried again after the lease.
-pub fn codex_queue(mailbox: &Mailbox, codex: &OsStr, now: u64) -> io::Result<Option<String>> {
+/// deliverable item, while the Worker is still idle. Returns the delivered id. A failed or timed
+/// out call leaves the claim to lapse, so the item is tried again after the lease.
+pub fn codex_queue(mailbox: &Mailbox, codex: &OsStr, timeout: Duration, now: u64) -> io::Result<Option<String>> {
     let view = View::read(mailbox)?;
-    if view.harness != Some(Harness::Codex) {
+    if view.harness != Some(Harness::Codex) || !idle_since_turn_end(mailbox, Harness::Codex)? {
         return Ok(None);
     }
     let Some(thread) = worker_session(mailbox)? else { return Ok(None) };
     let Some(claim) = claim(mailbox, &view, Route::CodexQueue, now)? else { return Ok(None) };
-    let status = Command::new(codex)
+    let mut child = Command::new(codex)
         .args(["queue", "--thread", &thread, "--message", &claim.item.text])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()?;
+        .spawn()?;
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "codex queue timed out"));
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
     if !status.success() {
         return Err(io::Error::other(format!("codex queue: {status}")));
     }
@@ -172,10 +187,22 @@ pub fn codex_queue(mailbox: &Mailbox, codex: &OsStr, now: u64) -> io::Result<Opt
     Ok(Some(claim.item.id))
 }
 
-/// The Worker's own session id, from the latest hook payload carrying one (V58).
+/// No Worker activity (tool or permission hook) after the latest turn end: a human turn that
+/// started since would have the item queued behind it, past that turn end's stale check (V21).
+fn idle_since_turn_end(mailbox: &Mailbox, harness: Harness) -> io::Result<bool> {
+    let hooks = mailbox.read_hooks(0)?.records;
+    let mut signals = hooks.iter().filter_map(|r| trigger::signal(harness, &r.body.event));
+    Ok(signals.next_back().is_none_or(|s| s == Signal::TurnEnd))
+}
+
+/// The Worker's own session id (V58): from the latest `Stop` or `SessionStart` payload, else the
+/// latest payload carrying one.
 pub fn worker_session(mailbox: &Mailbox) -> io::Result<Option<String>> {
     let hooks = mailbox.read_hooks(0)?.records;
-    Ok(hooks.iter().rev().find_map(|r| r.body.payload.get("session_id")?.as_str().map(str::to_owned)))
+    let id = |r: &&Record<Hook>| r.body.payload.get("session_id")?.as_str().map(str::to_owned);
+    let own =
+        hooks.iter().rev().filter(|r| matches!(r.body.event.as_str(), "Stop" | "SessionStart")).find_map(|r| id(&r));
+    Ok(own.or_else(|| hooks.iter().rev().find_map(|r| id(&r))))
 }
 
 /// What an adapter's deliverer reports about its Worker each poll.
@@ -212,14 +239,15 @@ pub fn poll(mailbox: &Mailbox, route: Route, worker: Worker, now: u64) -> io::Re
     let view = View::read(mailbox)?;
     let item = match worker {
         Worker::Idle => claim(mailbox, &view, route, now)?,
-        Worker::Busy | Worker::Draft => {
-            if let Some(slot) = view.challenges.slot().filter(|s| !s.sent) {
-                let reason = (worker == Worker::Draft).then_some(DRAFT);
-                mailbox.outbox().hold(&slot.id, route.name(), reason, now)?;
-            }
-            None
-        }
+        Worker::Busy | Worker::Draft => None,
     };
+    // Why the waiting Challenge is held, for the pane; a claim clears it, an empty box too.
+    if let Some(slot) = view.challenges.slot().filter(|s| !s.sent && !s.stale)
+        && item.is_none()
+    {
+        let reason = (worker == Worker::Draft).then_some(DRAFT);
+        mailbox.outbox().hold(&slot.id, route.name(), reason, now)?;
+    }
     let pending = view.pending(mailbox)?;
     Ok(Poll {
         status: view.status_line(),

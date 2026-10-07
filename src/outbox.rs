@@ -33,10 +33,29 @@ pub struct Item {
 #[serde(tag = "k", rename_all = "kebab-case")]
 enum Entry {
     Queued(Item),
-    Claimed { id: String, route: String, token: String },
-    Acked { id: String, token: String },
-    Dropped { id: String, reason: String },
-    Held { id: String, route: String, reason: Option<String> },
+    Claimed {
+        id: String,
+        route: String,
+        token: String,
+    },
+    Acked {
+        id: String,
+        token: String,
+    },
+    Dropped {
+        id: String,
+        reason: String,
+    },
+    Held {
+        id: String,
+        route: String,
+        reason: Option<String>,
+    },
+    /// The claimer handed it back undelivered: claimable again at once.
+    Released {
+        id: String,
+        token: String,
+    },
 }
 
 /// A deliverer's verdict on one pending item at claim time.
@@ -146,6 +165,17 @@ impl Outbox {
         })
     }
 
+    /// Hands a claimed item back undelivered (the Worker turned busy between claim and send), so
+    /// the next deliverer need not wait out the lease. False if the claim is no longer this one.
+    pub fn release(&self, claim: &Claim, now: u64) -> io::Result<bool> {
+        self.transact(now, |slots| match slots.iter().find(|s| s.item.id == claim.item.id) {
+            Some(Slot { done: false, claim: Some((token, _)), .. }) if *token == claim.token => {
+                (vec![Entry::Released { id: claim.item.id.clone(), token: claim.token.clone() }], true)
+            }
+            _ => (vec![], false),
+        })
+    }
+
     /// Withdraws an undelivered item (e.g. `superseded`); false if unknown or already done.
     pub fn drop_item(&self, id: &str, reason: &str, now: u64) -> io::Result<bool> {
         self.transact(now, |slots| {
@@ -172,6 +202,10 @@ impl Outbox {
     /// Records why `route` holds pending item `id` back (`None` clears it); written only when the
     /// reason changes, so a polling deliverer adds a line per change, not per poll.
     pub fn hold(&self, id: &str, route: &str, reason: Option<&str>, now: u64) -> io::Result<()> {
+        // Unlocked look first: an unchanged reason, the common poll, never takes the lock.
+        if self.held(id)?.as_deref() == reason {
+            return Ok(());
+        }
         self.transact(now, |slots| match slots.iter().find(|s| s.item.id == id && !s.done) {
             Some(s) if s.held.as_deref() != reason => {
                 let held =
@@ -238,7 +272,8 @@ fn fold(records: Vec<Record<Entry>>) -> Vec<Slot> {
             Entry::Claimed { id, .. }
             | Entry::Acked { id, .. }
             | Entry::Dropped { id, .. }
-            | Entry::Held { id, .. } => id,
+            | Entry::Held { id, .. }
+            | Entry::Released { id, .. } => id,
         };
         let Some(slot) = slots.iter_mut().find(|s| s.item.id == *id) else { continue };
         match r.body {
@@ -248,6 +283,11 @@ fn fold(records: Vec<Record<Entry>>) -> Vec<Slot> {
                 slot.held = None;
             }
             Entry::Held { reason, .. } => slot.held = reason,
+            Entry::Released { token, .. } => {
+                if slot.claim.as_ref().is_some_and(|(t, _)| *t == token) {
+                    slot.claim = None;
+                }
+            }
             Entry::Acked { .. } => (slot.done, slot.acked) = (true, true),
             Entry::Dropped { .. } => slot.done = true,
             Entry::Queued(_) => {}

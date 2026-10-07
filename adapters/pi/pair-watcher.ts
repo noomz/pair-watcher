@@ -7,8 +7,9 @@ import { join } from "node:path";
 const shim = join(homedir(), ".pair-watcher", "bin", "pw-hook");
 const POLL_MS = 1000;
 
-function forward(event: string, ctx: any, extra: Record<string, unknown> = {}) {
-  if (process.env.PAIR_WATCHER_GUARD) return;
+// Resolves once the shim exits, so the event is in the inbox before anything that relies on it.
+function forward(event: string, ctx: any, extra: Record<string, unknown> = {}): Promise<void> {
+  if (process.env.PAIR_WATCHER_GUARD) return Promise.resolve();
   const sm = ctx?.sessionManager;
   const payload = {
     hook_event_name: event,
@@ -16,12 +17,17 @@ function forward(event: string, ctx: any, extra: Record<string, unknown> = {}) {
     session_file: sm?.getSessionFile?.(),
     ...extra,
   };
-  try {
-    const child = spawn(shim, [event], { stdio: ["pipe", "ignore", "ignore"] });
-    child.on("error", () => {});
-    child.stdin.on("error", () => {});
-    child.stdin.end(JSON.stringify(payload));
-  } catch {}
+  return new Promise((resolve) => {
+    try {
+      const child = spawn(shim, [event], { stdio: ["pipe", "ignore", "ignore"] });
+      child.on("error", () => resolve());
+      child.on("close", () => resolve());
+      child.stdin.on("error", () => {});
+      child.stdin.end(JSON.stringify(payload));
+    } catch {
+      resolve();
+    }
+  });
 }
 
 function adapter(args: string[]): Promise<string> {
@@ -38,6 +44,7 @@ export default function (pi: any) {
   let last: any;
   let running = false;
   let polling = false;
+  let timer: ReturnType<typeof setInterval> | undefined;
   const session = () => process.env.PAIR_WATCHER_SESSION ?? last?.sessionManager?.getSessionId?.();
   const idle = () => !running && last?.isIdle?.() !== false;
 
@@ -49,9 +56,12 @@ export default function (pi: any) {
     try {
       const out = await adapter(["poll", "--session", id, "--route", "pi", "--worker", idle() ? "idle" : "busy"]);
       const item = out.trim() ? JSON.parse(out).item : null;
-      if (!item || !idle()) return;
+      if (!item) return;
+      const claim = ["--session", id, "--id", item.id, "--token", item.token];
+      // The agent started since the poll: hand the claim back for the next idle.
+      if (!idle()) return void (await adapter(["release", ...claim]));
       pi.sendUserMessage(item.text, { deliverAs: "followUp" });
-      await adapter(["ack", "--session", id, "--id", item.id, "--token", item.token]);
+      await adapter(["ack", ...claim]);
     } catch {
     } finally {
       polling = false;
@@ -61,14 +71,18 @@ export default function (pi: any) {
   pi.on("session_start", (_e: any, ctx: any) => {
     last = ctx;
     forward("session_start", ctx);
-    if (!process.env.PAIR_WATCHER_GUARD) setInterval(tick, POLL_MS).unref?.();
+    // One poll timer per load, however often the session starts again.
+    if (!timer && !process.env.PAIR_WATCHER_GUARD) timer = setInterval(tick, POLL_MS);
+    timer?.unref?.();
   });
   pi.on("agent_start", () => {
     running = true;
   });
-  pi.on("agent_settled", (_e: any, ctx: any) => {
+  // Idle only once the turn end is in the inbox: until then the stale-check gate (V21) cannot
+  // see it, and a poll would deliver ahead of the turn-end wake.
+  pi.on("agent_settled", async (_e: any, ctx: any) => {
+    await forward("agent_settled", ctx ?? last);
     running = false;
-    forward("agent_settled", ctx ?? last);
   });
   pi.events?.on?.("herdr:blocked", (data: any) => forward("herdr:blocked", last, { blocked: data }));
 }

@@ -13,7 +13,8 @@ mkdirSync(join(home, ".pair-watcher", "bin"), { recursive: true });
 const shim = join(home, ".pair-watcher", "bin", "pw-hook");
 writeFileSync(
   shim,
-  `#!/bin/sh\necho "$*" >> '${calls}'\n[ "$2" = poll ] && printf '%s\\n' '${JSON.stringify({ status: null, commentary: [], item: ITEM })}'\nexit 0\n`,
+  // A slow `agent_settled` append: it lands 1.2 s after the event.
+  `#!/bin/sh\n[ "$1" = agent_settled ] && sleep 1.2\necho "$*" >> '${calls}'\n[ "$2" = poll ] && printf '%s\\n' '${JSON.stringify({ status: null, commentary: [], item: ITEM })}'\nexit 0\n`,
 );
 chmodSync(shim, 0o700);
 process.env.HOME = home;
@@ -66,6 +67,19 @@ test("a running agent is never sent to: worker=busy, nothing sent (V25)", async 
   await sleep(1500);
   assert.deepEqual(pi.sent, []);
   assert.ok(polls().length > 0 && polls().every((l) => l.endsWith("--worker busy")), polls().join("|"));
+});
+
+test("idle only after the agent_settled record has landed (V21)", async () => {
+  writeFileSync(calls, "");
+  const pi = fakePi(true);
+  pi.emit("session_start");
+  pi.emit("agent_start");
+  pi.emit("agent_settled");
+  await sleep(3000);
+  const lines = readFileSync(calls, "utf8").split("\n");
+  const settled = lines.findIndex((l) => l.startsWith("agent_settled"));
+  const firstIdle = lines.findIndex((l) => l.endsWith("--worker idle"));
+  assert.ok(settled >= 0 && firstIdle > settled, lines.join("|"));
 });
 
 test("under the Watcher guard nothing polls (V58)", async () => {
