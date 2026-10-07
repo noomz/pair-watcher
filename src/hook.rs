@@ -31,7 +31,10 @@ pub fn run(event: &str) {
         return;
     };
     if event == "Stop" {
-        let _ = delivery::stop_block(&mailbox, &payload, &mut io::stdout().lock(), now_ms());
+        // A panic must not cost the record below.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            delivery::stop_block(&mailbox, &payload, &mut io::stdout().lock(), now_ms())
+        }));
     }
     let _ = mailbox.append_hook(&Hook { event: event.to_owned(), payload });
 }

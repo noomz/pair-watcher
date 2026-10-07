@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use pair_watcher::arbiter::Watcher;
 use pair_watcher::challenge::Slot;
 use pair_watcher::challenge::{Challenges, Op as ChallengeOp, Origin};
@@ -82,7 +84,8 @@ fn turn(prompt: Option<&str>, text: &str) -> Vec<Entry> {
     let mut items: Vec<T> = prompt.map(|p| T::Prompt(p.into())).into_iter().collect();
     items.push(T::Text(text.into()));
     items.push(T::TurnEnd);
-    vec![Entry { id: "e".into(), t: 0, items }]
+    static N: AtomicUsize = AtomicUsize::new(0);
+    vec![Entry { id: format!("e{}", N.fetch_add(1, Ordering::Relaxed)), t: 0, items }]
 }
 
 impl Fx {
@@ -667,6 +670,18 @@ fn owner_that_did_not_run_still_owes() {
     assert_eq!(step, debate::Step::default());
     assert!(f.d.owes() && f.ops("decision").is_empty());
     assert_eq!(f.decide(&[]).ended, Some(Outcome::WatcherConcedes), "ran, silent: defaulted");
+
+    // Never runs: missing after two owed wakes, so the slot is not held for good.
+    let mut f = fx();
+    f.observe(&turn(None, "Challenge c1: defend — fine"));
+    let list = f.list();
+    let step = f.d.decide(&f.log, &f.outbox, &list, &others, &[], EscalateAt::Warn, 1).unwrap();
+    assert_eq!(step.ended, None);
+    let step = f.d.decide(&f.log, &f.outbox, &list, &others, &[], EscalateAt::Warn, 1).unwrap();
+    assert_eq!(step.ended, Some(Outcome::WatcherConcedes));
+    let d = &f.ops("decision")[0];
+    assert_eq!((d.str("watcher"), &d.fields["defaulted"]), (Some("arbiter"), &serde_json::json!(true)));
+    f.assert_consistent();
 }
 
 /// V34: a human prompt with no turn of its own (interrupted) is cleared by our next delivered
@@ -696,4 +711,65 @@ fn resolved_concern_is_not_tagged() {
     assert_eq!(f.decide(&[]).ended, Some(Outcome::WorkerConcedes));
     let c = f.list().get("c1").unwrap().clone();
     assert_eq!((c.state, c.tag), (State::Resolved, None));
+}
+
+/// Review round 2: a human prompt that started the `Stop`-blocked turn is not a human turn
+/// mid-Debate; a silent reply is "no answer".
+#[test]
+fn stop_route_blocked_turn_started_by_the_human() {
+    let mut f = fx_route(Severity::Warn, "stop");
+    f.observe(&turn(Some("write the file"), "Wrote it."));
+    assert!(f.ops("human-prompt").is_empty());
+    f.observe(&turn(None, "Done."));
+    assert_eq!(f.ops("exchange")[0].str("verdict"), Some("none"));
+    assert!(f.ops("human-turn").is_empty());
+    f.assert_consistent();
+}
+
+/// V10, V92: a replayed slice never reads a turn end twice.
+#[test]
+fn replayed_slice_is_idempotent() {
+    let mut f = fx_route(Severity::Warn, "stop");
+    let blocked = turn(None, "Wrote it.");
+    f.observe(&blocked);
+    f.observe(&blocked);
+    assert!(f.ops("exchange").is_empty(), "the skipped turn end stays skipped");
+    let reply = turn(None, "Challenge c1: defend — fine");
+    f.observe(&[blocked[0].clone(), reply[0].clone()]);
+    f.observe(&reply);
+    assert_eq!(f.ops("exchange").len(), 1);
+    f.assert_consistent();
+}
+
+/// V37: ending while exchange 2 is queued withdraws it, whatever move ended it.
+#[test]
+fn switched_while_queued_withdraws() {
+    let mut f = fx();
+    f.observe(&turn(None, "Challenge c1: defend — fine"));
+    f.decide(&[("approach", line(Decision::Rebut, "new ground"))]);
+    assert_eq!(f.outbox.pending().unwrap().len(), 1);
+    assert_eq!(f.decide(&[("approach", line(Decision::Switched, "moved on"))]).ended, Some(Outcome::WorkerConcedes));
+    assert!(f.outbox.pending().unwrap().is_empty());
+}
+
+/// Both verdict words before the reason: no verdict; "or" alone is fine.
+#[test]
+fn verdict_both_words_is_no_verdict() {
+    let v = |t: &str| debate::verdict(t, "c1");
+    assert_eq!(v("Challenge c1: defend, or concede"), None);
+    assert_eq!(
+        v("Challenge c1: defend or rather hold — it is cached"),
+        Some((Verdict::Defend, "or rather hold — it is cached".into()))
+    );
+    assert_eq!(
+        v("Challenge c1: concede — I will not defend it"),
+        Some((Verdict::Concede, "I will not defend it".into()))
+    );
+}
+
+/// A human prompt quoting our header further down stays the human's.
+#[test]
+fn quoted_header_stays_human() {
+    assert!(!history::is_own("what does this mean?\n\n[pair-watcher · Challenge c1 · from the Watcher]"));
+    assert!(!history::is_own("this is a long human sentence that ends in a colon:\n[pair-watcher · Challenge c1"));
 }
