@@ -3,6 +3,7 @@ pub mod adapters;
 pub mod approval;
 pub mod arbiter;
 pub mod budget;
+pub mod challenge;
 pub mod cli;
 pub mod clip;
 pub mod concern;

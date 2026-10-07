@@ -48,6 +48,7 @@ fn ops(m: &Merged) -> Vec<String> {
             Change::Resolve { id, .. } => format!("resolve {id}"),
             Change::Duplicate { id, of, .. } => format!("duplicate {id} of {of}"),
             Change::Trimmed { headline, id, .. } => format!("trimmed {}", id.as_deref().unwrap_or(headline)),
+            Change::Unverifiable { id, .. } => format!("unverifiable {id}"),
         })
         .collect()
 }
