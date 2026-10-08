@@ -304,11 +304,11 @@ fn ruling_in_debate_ends_it_at_once() {
         let r = fx.rule("c2", side).unwrap();
         assert_eq!(r.stage, Stage::Debate);
 
-        // Before the arbiter answers: gone from IN DEBATE, the rebuttal never goes out.
+        // Before the arbiter answers: gone from IN DEBATE, the rebuttal is held.
         assert_eq!(fx.board().in_debate(), None);
         let view = delivery::View::read(&fx.mb).unwrap();
         let rebuttal = Item { id: "c2/2".into(), kind: ItemKind::Challenge, text: String::new() };
-        assert_eq!(view.gate(&rebuttal), Gate::Drop);
+        assert_eq!(view.gate(&rebuttal), Gate::Skip);
 
         fx.answer();
         let end = &fx.op(Kind::Debate, "end")[0];
@@ -695,23 +695,98 @@ fn prompt_first_holds_through_a_claim_and_before_the_queue() {
     assert!(fx.ruling_items().is_empty() && fx.op(Kind::Ruling, "queued").is_empty());
 }
 
-/// Review #3: `y` IN DEBATE, a claim drops the waiting rebuttal, `u` before the arbiter
-/// answers: the still-open Debate is owed its move again, not stuck on a dropped item.
+/// Review #3, round 4: `y` IN DEBATE holds the waiting rebuttal; `u` before the arbiter
+/// answers lets it go out as it was.
 #[test]
-fn undo_before_the_end_recovers_a_dropped_rebuttal() {
+fn undo_before_the_end_releases_the_held_rebuttal() {
     let fx = Fx::new();
     fx.rebuttal_queued();
     fx.rule("c2", Side::Watcher).unwrap();
     let view = delivery::View::read(&fx.mb).unwrap();
-    assert!(delivery::claim(&fx.mb, &view, Route::Mod, now_ms()).unwrap().is_none());
-    assert!(!fx.mb.outbox().pending().unwrap().iter().any(|i| i.id == "c2/2"), "gate dropped it");
+    assert!(delivery::claim(&fx.mb, &view, Route::Mod, now_ms()).unwrap().is_none(), "held");
+    assert!(fx.mb.outbox().pending().unwrap().iter().any(|i| i.id == "c2/2"), "not dropped");
     fx.undo();
     fx.answer();
-    assert!(fx.op(Kind::Debate, "end").is_empty());
-    assert_eq!(fx.op(Kind::Debate, "reopened").len(), 1);
-    let d = fx.debate();
-    assert_eq!(d.open().map(|o| (o.n, o.phase.clone())), Some((1, Phase::Owed(Verdict::Defend))));
+    assert!(fx.op(Kind::Debate, "end").is_empty() && fx.op(Kind::Debate, "reopened").is_empty());
+    let view = delivery::View::read(&fx.mb).unwrap();
+    let claim = delivery::claim(&fx.mb, &view, Route::Mod, now_ms()).unwrap().expect("released");
+    assert_eq!(claim.item.id, "c2/2");
     assert!(fx.ruling_items().is_empty(), "the undone Ruling is never queued");
+}
+
+/// Round 4 #1: a ruling holds the unsent Challenge; `u` before the arbiter answers releases it.
+#[test]
+fn undo_before_the_answer_releases_the_held_challenge() {
+    let fx = Fx::new();
+    let mut ch = Challenges::rebuild(&fx.events());
+    ch.queue(&fx.mb.log(), &fx.mb.outbox(), &concern("c2"), Origin::Auto, None, now_ms()).unwrap();
+    fx.rule("c2", Side::Worker).unwrap();
+    let view = delivery::View::read(&fx.mb).unwrap();
+    assert!(delivery::claim(&fx.mb, &view, Route::Mod, now_ms()).unwrap().is_none(), "held");
+    fx.undo();
+    fx.answer();
+    let view = delivery::View::read(&fx.mb).unwrap();
+    let claim = delivery::claim(&fx.mb, &view, Route::Mod, now_ms()).unwrap().expect("released");
+    assert_eq!(claim.item.id, "c2");
+    assert!(fx.op(Kind::Challenge, "stale-dropped").is_empty());
+}
+
+/// Round 4 #2: exchange 2 under a claim when the ruling ended the Debate; `u`, reopen, then
+/// the late ack: the Debate keeps it out and logs it sent.
+#[test]
+fn reopen_keeps_a_rebuttal_still_under_claim() {
+    let fx = Fx::new();
+    fx.rebuttal_queued();
+    let outbox = fx.mb.outbox();
+    let claim = outbox.claim("mod", now_ms(), |i| if i.id == "c2/2" { Gate::Deliver } else { Gate::Skip }).unwrap();
+    let claim = claim.expect("claimed before the ruling");
+    fx.rule("c2", Side::Watcher).unwrap();
+    fx.answer();
+    fx.undo();
+    fx.answer();
+    assert_eq!(fx.op(Kind::Debate, "reopened")[0].fields["kept"], true);
+    assert!(outbox.ack(&claim, now_ms()).unwrap());
+    let mut d = fx.debate();
+    assert_eq!(d.sync_sent(&fx.mb.log(), &outbox).unwrap().as_deref(), Some("mod"));
+    assert_eq!(d.open().map(|o| (o.n, o.phase.clone())), Some((2, Phase::Awaiting)));
+}
+
+/// Round 4 #3: ruled before its notification went out, an Escalation is neither notified nor
+/// dropped stale; undone, it is back in NEEDS YOU and notified once.
+#[test]
+fn a_ruling_before_notification_keeps_the_escalation_for_undo() {
+    let fx = Fx::new();
+    fx.challenge();
+    fx.exchange(2, Verdict::Defend, "t2");
+    let end = DebateOp::End {
+        challenge: "c2".into(),
+        concern: "c2".into(),
+        outcome: Outcome::Unresolved,
+        escalated: Some(true),
+        withdrawn: None,
+    };
+    fx.log(end.event());
+    let raised = EscalationOp::Raised {
+        id: "e1".into(),
+        cause: Cause::Unresolved,
+        concern: Some("c2".into()),
+        challenge: Some("c2".into()),
+        hook: None,
+        title: "Debate unresolved (c2)".into(),
+        lines: vec![],
+        rule: String::new(),
+    };
+    fx.log(raised.event());
+    fx.rule("e1", Side::Worker).unwrap();
+    let deliver = |fx: &Fx| {
+        let mut esc = Escalations::rebuild(&fx.events());
+        esc.deliver(&fx.mb.log(), &fx.list(), |_| Ok(false), &pair_watcher::escalation::Notifier::None).unwrap()
+    };
+    assert!(deliver(&fx).is_empty());
+    assert!(fx.kind(Kind::Escalation).iter().all(|e| e.str("op") == Some("raised")), "no drop, no ping");
+    fx.undo();
+    assert_eq!(fx.board().needs_you().count(), 1);
+    assert_eq!(deliver(&fx), ["e1"]);
 }
 
 /// Review #4: the undo lands between the arbiter reading the ruling and writing `debate end`;
@@ -787,7 +862,7 @@ fn a_stale_undo_never_lifts_a_newer_ruling() {
     assert_eq!(fx.board().in_debate(), None);
     let view = delivery::View::read(&fx.mb).unwrap();
     let rebuttal = Item { id: "c2/2".into(), kind: ItemKind::Challenge, text: String::new() };
-    assert_eq!(view.gate(&rebuttal), Gate::Drop);
+    assert_eq!(view.gate(&rebuttal), Gate::Skip);
     let r = fx.rulings();
     assert_eq!((r.last().unwrap().nth, r.last().unwrap().ruled.side), (1, Side::Worker));
     fx.answer();
@@ -829,7 +904,7 @@ fn undo_after_the_end_keeps_a_delivered_rebuttal() {
     fx.undo();
     fx.answer();
     let reopened = &fx.op(Kind::Debate, "reopened")[0];
-    assert_eq!(reopened.fields["delivered"], true);
+    assert_eq!(reopened.fields["kept"], true);
     let mut d = fx.debate();
     assert_eq!(d.open().map(|o| o.phase.clone()), Some(Phase::Queued("c2/2".into())));
     assert_eq!(d.sync_sent(&fx.mb.log(), &outbox).unwrap().as_deref(), Some("mod"));

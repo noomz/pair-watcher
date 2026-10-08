@@ -517,7 +517,10 @@ impl Challenges {
     pub fn gate(&self, item: &Item) -> Gate {
         match &self.slot {
             _ if item.kind != ItemKind::Challenge => Gate::Deliver,
-            Some(s) if s.id == item.id && (s.stale || s.ruled) => Gate::Drop,
+            Some(s) if s.id == item.id && s.stale => Gate::Drop,
+            // Held while a ruling stands: the arbiter withdraws it, unless the ruling is undone
+            // first (V73, V75).
+            Some(s) if s.id == item.id && s.ruled => Gate::Skip,
             Some(s) if s.id == item.id => Gate::Deliver,
             _ => Gate::Skip,
         }

@@ -348,7 +348,11 @@ impl Escalations {
                 _ => None,
             };
             if let Some(why) = stale {
-                self.commit(log, &Op::DroppedStale { id: e.id, why })?;
+                // The human ruled before it went out: no ping, and kept for `u` (V75).
+                let ruled = e.concern.as_deref().and_then(|c| list.get(c)).is_some_and(|c| c.state == State::Ruled);
+                if !ruled {
+                    self.commit(log, &Op::DroppedStale { id: e.id, why })?;
+                }
                 continue;
             }
             let via = notifier.name().to_owned();

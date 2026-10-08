@@ -572,14 +572,9 @@ impl Rulings {
                         self.commit(log, now, &op)?;
                     }
                 }
-                // Back IN DEBATE only while the slot is free, or still held by this Debate when
-                // only its exchange 2 was lost to the ruling (V75).
-                let ours = debate.open().is_some_and(|o| o.challenge == challenge);
-                if r.ruled.stage == Stage::Debate
-                    && !r.restored
-                    && !r.slot_lost
-                    && (ours || challenges.slot().is_none())
-                {
+                // Back IN DEBATE only while the slot is free (V75). Undone before the arbiter
+                // answered, nothing was withdrawn: the held items go out as they were.
+                if r.ruled.stage == Stage::Debate && !r.restored && !r.slot_lost && challenges.slot().is_none() {
                     let open = list.get(&concern).is_some_and(|c| c.state == State::Open);
                     if let Some(e) = debate.reopen(log, outbox, &challenge)? {
                         fold(Some(e), debate, challenges, self);
