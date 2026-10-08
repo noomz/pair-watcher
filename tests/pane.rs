@@ -58,6 +58,7 @@ fn wake(n: u64, outcome: Outcome) -> Event {
         model: "gpt-6.1-sol".into(),
         spend: 0.23,
         replayed: false,
+        rulings: vec![],
     }
     .event()
 }

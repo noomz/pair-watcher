@@ -4,6 +4,8 @@
 
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use crate::provider::ProviderError;
 use crate::status::Class;
 
@@ -75,7 +77,7 @@ pub enum Effect {
 }
 
 /// One Watcher's failure state (Swarm: per Focus, V89).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Health {
     pub lagging_since: Option<u64>,
     /// Next lagging or held-slice re-wake; a real trigger wakes sooner (V87).
@@ -161,7 +163,7 @@ impl Health {
 }
 
 /// `fallback_model` (V51): which model the next wake uses.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Fallback {
     /// Why the fallback runs; `None` = on the primary.
     pub active: Option<Class>,

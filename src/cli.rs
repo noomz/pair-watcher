@@ -135,6 +135,9 @@ pub enum Command {
         #[arg(long)]
         worker_pid: i32,
     },
+    /// The Watcher process, run by the session's supervisor
+    #[command(hide = true)]
+    Watch { session: String },
 }
 
 #[derive(Args, Debug)]
@@ -282,7 +285,8 @@ fn dispatch(command: Command, via: Via) -> ExitCode {
         // Approval is per file hash, read by every session in the repo; `--session` names none.
         Command::Focus { action: FocusAction::Approve { name, .. } } => run::focus_approve(&name),
         Command::Supervise { session, worker_pid } => supervise(&session, worker_pid),
-        Command::Attach { .. } => later("T15"),
+        Command::Attach { session } => attach(&session),
+        Command::Watch { session } => watch(&session),
         Command::Pane(arg) => pane(arg),
         Command::Mute { focus, session } => session_fact(&session, |m| mute(m, &focus)),
         Command::Nochallenge(session) => session_fact(&session, |m| {
@@ -679,6 +683,27 @@ fn confirm(question: &str) -> bool {
     let _ = std::io::stdout().flush();
     let mut line = String::new();
     std::io::stdin().lock().read_line(&mut line).is_ok() && line.trim().eq_ignore_ascii_case("y")
+}
+
+fn attach(session: &str) -> ExitCode {
+    let result = Home::from_env().map_err(|e| e.to_string()).and_then(|home| {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        supervisor::attach(&home, session, &exe)
+    });
+    match result {
+        Ok(msg) => {
+            println!("{session}: {msg}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&e),
+    }
+}
+
+fn watch(session: &str) -> ExitCode {
+    match Home::from_env().and_then(|home| crate::watch::watch(&home, session)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => fail(&format!("watch {session}: {e}")),
+    }
 }
 
 fn supervise(session: &str, worker_pid: i32) -> ExitCode {

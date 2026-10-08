@@ -114,6 +114,8 @@ pub struct Board {
     pub lagging: BTreeMap<Option<String>, u64>,
     pub blind: BTreeMap<Option<String>, (u64, String)>,
     pub fallback: Option<String>,
+    /// The session's one BLIND notification went out (V41).
+    pub blind_notified: bool,
     pub nochallenge: bool,
     pub muted: Vec<String>,
     pub lost_ms: u64,
@@ -155,6 +157,7 @@ impl Board {
             lagging: BTreeMap::new(),
             blind: BTreeMap::new(),
             fallback: None,
+            blind_notified: false,
             nochallenge: false,
             muted: Vec::new(),
             lost_ms: 0,
@@ -632,7 +635,7 @@ impl Board {
                 self.fallback = None;
                 self.tick(t, "back on the primary model".to_owned(), Tone::Plain);
             }
-            StatusOp::BlindNotified { .. } => {}
+            StatusOp::BlindNotified { .. } => self.blind_notified = true,
         }
     }
 
@@ -930,6 +933,29 @@ impl Shown {
     }
 }
 
+/// A dead supervisor (V90): its heartbeat silent on a live session. The pane shows `BLIND
+/// supervisor gone` and sends the session's one BLIND notification if none went out (V41).
+/// Returns whether it logged it now.
+pub fn supervisor_gone(
+    mailbox: &Mailbox,
+    board: &Board,
+    now: u64,
+    notifier: &escalation::Notifier,
+) -> io::Result<bool> {
+    let beat = crate::watch::beat_of(&mailbox.dir().join(crate::supervisor::HEARTBEAT_FILE_SUPERVISOR));
+    let gone = mailbox.is_live() && beat.is_some_and(|b| now.saturating_sub(b) >= crate::supervisor::SILENT_MS);
+    let logged = board.blind.get(&None).is_some_and(|(_, r)| r == crate::supervisor::GONE);
+    if !gone || logged {
+        return Ok(false);
+    }
+    let log = mailbox.log();
+    log.append(WatcherOp::SupervisorGone.event())?;
+    log.append(StatusOp::Blind { focus: None, reason: crate::supervisor::GONE.to_owned() }.event())?;
+    let now_board = Board::rebuild(board.tz, &log.read_from(0)?.records);
+    crate::supervisor::notify_first_blind(&now_board, &log, notifier, "pane")?;
+    Ok(true)
+}
+
 const TICK: Duration = Duration::from_millis(250);
 /// A local note (refused key) stays this long.
 const NOTE_FOR: Duration = Duration::from_secs(4);
@@ -958,8 +984,13 @@ pub fn run(mailbox: &Mailbox) -> io::Result<()> {
         }
         Ok(())
     };
+    let env = |k: &str| std::env::var(k).ok();
+    let notifier = escalation::Notifier::detect(&env);
     while !term::stopping() {
         tail(&mut board, &mut offset)?;
+        if supervisor_gone(mailbox, &board, crate::jsonl::now_ms(), &notifier)? {
+            tail(&mut board, &mut offset)?;
+        }
         board.pending =
             delivery::pending(&board.challenges, &board.debate, board.observe_only, mailbox).unwrap_or(None);
         if ui.overlay == Overlay::Rulings {

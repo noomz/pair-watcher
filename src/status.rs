@@ -50,6 +50,9 @@ pub struct Wake {
     /// Recovery replay of a held slice: reviewed late (V92).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub replayed: bool,
+    /// Standing rulings the Watcher held a Concern back for (`held_back`, V78, V94).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rulings: Vec<String>,
 }
 
 impl Wake {

@@ -87,6 +87,8 @@ fn prepare(harness: Harness, worker: &[OsString], flags: &[String], only: &[Stri
         worker,
         cwd: &cwd,
         loaded: &loaded,
+        flags,
+        only,
     };
     let wired = wire(&launch);
     if wired.is_err() {
@@ -114,12 +116,16 @@ struct Launch<'a> {
     worker: &'a [OsString],
     cwd: &'a Path,
     loaded: &'a Loaded,
+    flags: &'a [String],
+    only: &'a [String],
 }
 
 /// Shim, adapters, per-harness flags, `session` start event, supervisor. Returns the plan and
 /// pane notes.
 fn wire(l: &Launch) -> io::Result<(Plan, Vec<String>)> {
     let Launch { home, mailbox, harness, worker, cwd, .. } = *l;
+    let launch = crate::watch::Launch { flags: l.flags.to_vec(), only: l.only.to_vec() };
+    crate::watch::write_json(&mailbox.dir().join(crate::watch::LAUNCH_FILE), &launch)?;
     let support = Support::of(harness, l.version);
     let exe = std::env::current_exe()?;
     let shim = hook::write_shim(home, &exe)?;

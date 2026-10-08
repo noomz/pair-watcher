@@ -43,3 +43,4 @@ pub mod term;
 pub mod tools;
 pub mod trigger;
 pub mod wake;
+pub mod watch;

@@ -87,9 +87,14 @@ fn hook_is_silent_and_later_commands_name_their_task() {
     let out = pw(t.path(), t.path(), &["hook", "Stop", "--anything"]);
     assert!(out.status.success() && out.stdout.is_empty() && out.stderr.is_empty());
 
-    let out = pw(t.path(), t.path(), &["attach", "s1"]);
+    let out = pw(t.path(), t.path(), &["doctor"]);
     assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("(T15)"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("(T16)"));
+
+    // V90: `attach` re-adopts a live session only.
+    let out = pw(t.path(), t.path(), &["attach", "s1"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("is not live"));
 }
 
 #[test]
