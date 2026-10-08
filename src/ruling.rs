@@ -318,6 +318,8 @@ pub struct Cx<'a> {
 pub struct Rulings {
     all: Vec<Ruling>,
     standing: Live,
+    /// What the last event applied did to the standing rulings.
+    changed: Option<Standing>,
     /// Escalation id → when raised.
     raised: HashMap<String, u64>,
     /// Escalations closed by `answered`, `closed-stale` or `unruled`.
@@ -349,10 +351,17 @@ impl Rulings {
         &self.all
     }
 
+    /// What the last event applied did to the standing rulings: `None` for a stale undo or any
+    /// other event, `Void` for a ruling that came second.
+    pub fn changed(&self) -> Option<&Standing> {
+        self.changed.as_ref()
+    }
+
     pub fn apply(&mut self, t: u64, event: &Event) {
         self.seq += 1;
         let seq = self.seq;
         let standing = self.standing.apply(event);
+        self.changed = standing.clone();
         match event.k {
             Kind::Ruled => {
                 if let Some(ruled) = event.parse::<Ruled>() {
@@ -434,7 +443,7 @@ impl Rulings {
                 Some(DebateOp::Exchange { challenge, reason: Some(reason), .. }) => {
                     self.reasons.insert(challenge, reason);
                 }
-                Some(DebateOp::Reopened { challenge }) => {
+                Some(DebateOp::Reopened { challenge, .. }) => {
                     for r in self.all.iter_mut().filter(|r| r.undone) {
                         if r.ruled.challenge.as_deref() == Some(challenge.as_str()) {
                             r.restored = true;

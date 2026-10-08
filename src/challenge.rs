@@ -360,10 +360,12 @@ impl Challenges {
                     self.freed = self.slot.take();
                 }
             }
-            Kind::Debate if event.str("op") == Some("reopened") => {
-                if self.slot.is_none() && self.freed.as_ref().map(|s| s.id.as_str()) == event.str("challenge") {
-                    self.slot = self.freed.take();
-                }
+            Kind::Debate
+                if event.str("op") == Some("reopened")
+                    && self.slot.is_none()
+                    && self.freed.as_ref().map(|s| s.id.as_str()) == event.str("challenge") =>
+            {
+                self.slot = self.freed.take();
             }
             _ => {}
         }

@@ -812,3 +812,54 @@ fn a_concurrent_second_ruling_is_void() {
     fx.undo();
     assert_eq!(fx.board().needs_you().count(), 1, "undoing the standing one reopens it");
 }
+
+/// Review round 3 #1: the ruling's end could not withdraw a claimed rebuttal, which was then
+/// delivered; `u` reopens the Debate with exchange 2 out, not owed again.
+#[test]
+fn undo_after_the_end_keeps_a_delivered_rebuttal() {
+    let fx = Fx::new();
+    fx.rebuttal_queued();
+    let outbox = fx.mb.outbox();
+    let claim = outbox.claim("mod", now_ms(), |i| if i.id == "c2/2" { Gate::Deliver } else { Gate::Skip }).unwrap();
+    let claim = claim.expect("claimed before the ruling");
+    fx.rule("c2", Side::Watcher).unwrap();
+    fx.answer();
+    assert_eq!(fx.op(Kind::Debate, "end").len(), 1);
+    assert!(outbox.ack(&claim, now_ms()).unwrap());
+    fx.undo();
+    fx.answer();
+    let reopened = &fx.op(Kind::Debate, "reopened")[0];
+    assert_eq!(reopened.fields["delivered"], true);
+    let mut d = fx.debate();
+    assert_eq!(d.open().map(|o| o.phase.clone()), Some(Phase::Queued("c2/2".into())));
+    assert_eq!(d.sync_sent(&fx.mb.log(), &outbox).unwrap().as_deref(), Some("mod"));
+    assert_eq!(d.open().map(|o| (o.n, o.phase.clone())), Some((2, Phase::Awaiting)));
+}
+
+/// Review round 3 #2: the pane shows only rulings and undos that took effect.
+#[test]
+fn pane_ignores_void_rulings_and_stale_undos() {
+    let fx = Fx::new();
+    fx.rebuttal_queued();
+    fx.rule("c2", Side::Watcher).unwrap();
+    let b = fx.board();
+    let first = pane::undo(&b, &fx.mb.outbox(), Via::Key, Surface::Pane).unwrap();
+    let stale = pane::undo(&b, &fx.mb.outbox(), Via::Cli, Surface::Cli).unwrap();
+    fx.log(first);
+    fx.rule("c2", Side::Worker).unwrap();
+    fx.log(stale);
+    let b = fx.board();
+    assert_eq!(b.closed_as("c2").as_deref(), Some("ruled: sided with the Worker"));
+    assert!(b.ticker.last().unwrap().text.contains("sided with the Worker · u undo"));
+
+    let fx = Fx::new();
+    fx.escalated();
+    let b = fx.board();
+    let y = Rulings::rule(&b.cx(), "e1", Side::Watcher, Via::Key, Surface::Pane, now_ms()).unwrap();
+    let n = Rulings::rule(&b.cx(), "e1", Side::Worker, Via::Cli, Surface::Cli, now_ms()).unwrap();
+    fx.log(y.event());
+    fx.log(n.event());
+    let b = fx.board();
+    assert_eq!(b.closed_as("c2").as_deref(), Some("escalated → ruled: sided with the Watcher"));
+    assert_eq!(b.ticker.last().unwrap().text, "e1 was already ruled: sided with the Worker ignored");
+}

@@ -148,9 +148,13 @@ pub enum Op {
     Queued { challenge: String, item: String, second: Second },
     /// Exchange 2 delivered by `route`.
     Sent { challenge: String, item: String, route: String },
-    /// The human undid the ruling that ended it, while the Challenge slot was free (V75): owed
-    /// again on the Worker's last answer.
-    Reopened { challenge: String },
+    /// The human undid the ruling on it (V75): owed again on the Worker's last answer, unless its
+    /// exchange 2 reached the Worker anyway (`delivered`: still queued, `sent` follows).
+    Reopened {
+        challenge: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        delivered: bool,
+    },
     /// Frees the Challenge slot (V19). `escalated` on `unresolved` (V36); `withdrawn` says why.
     End {
         challenge: String,
@@ -390,8 +394,8 @@ impl Debate {
         if let Op::End { challenge, .. } = &op {
             self.ended.insert(challenge.clone());
         }
-        if let Op::Reopened { challenge } = &op {
-            self.reopen_from_ruling(challenge);
+        if let Op::Reopened { challenge, delivered } = &op {
+            self.reopen_from_ruling(challenge, *delivered);
             return;
         }
         let Some(o) = self.open.as_mut() else { return };
@@ -717,17 +721,20 @@ impl Debate {
     /// still-open Debate its move again if the ruling cost it its queued exchange 2 (the gate
     /// dropped it). Returns the `reopened` event written.
     pub fn reopen(&mut self, log: &EventLog, outbox: &Outbox, challenge: &str) -> io::Result<Option<Event>> {
+        let acked = |item: &str| -> io::Result<bool> { Ok(outbox.delivered()?.iter().any(|d| d.item.id == item)) };
+        let mut delivered = false;
         let due = match &self.open {
-            None => self
-                .ruled_end
-                .as_ref()
-                .is_some_and(|o| o.challenge == challenge && !self.closed.contains_key(&o.concern)),
+            None => match self.ruled_end.as_ref() {
+                Some(o) if o.challenge == challenge && !self.closed.contains_key(&o.concern) => {
+                    // Acked after the ruling's end withdrew nothing (a claim was in flight).
+                    delivered = matches!(&o.phase, Phase::Queued(item) if acked(item)?);
+                    true
+                }
+                _ => false,
+            },
             Some(o) if o.challenge == challenge && !self.closed.contains_key(&o.concern) => match &o.phase {
                 // Dropped by the gate, not delivered: an acked one is the Debate's `sent` to log.
-                Phase::Queued(item) => {
-                    !outbox.pending()?.iter().any(|i| i.id == *item)
-                        && !outbox.delivered()?.iter().any(|d| d.item.id == *item)
-                }
+                Phase::Queued(item) => !outbox.pending()?.iter().any(|i| i.id == *item) && !acked(item)?,
                 _ => false,
             },
             Some(_) => false,
@@ -735,7 +742,7 @@ impl Debate {
         if !due {
             return Ok(None);
         }
-        let event = Op::Reopened { challenge: challenge.to_owned() }.event();
+        let event = Op::Reopened { challenge: challenge.to_owned(), delivered }.event();
         log.append(event.clone())?;
         self.apply(&event);
         Ok(Some(event))
@@ -743,8 +750,8 @@ impl Debate {
 
     /// Restores the Debate a ruling ended (or keeps the open one), owed again on the Worker's last
     /// answer: a logged move or a queued exchange 2 was cancelled with the ruling, so the owner
-    /// decides again.
-    fn reopen_from_ruling(&mut self, challenge: &str) {
+    /// decides again. An exchange 2 that was `delivered` stays queued for its `sent`.
+    fn reopen_from_ruling(&mut self, challenge: &str, delivered: bool) {
         let o = match self.open.take() {
             Some(o) if o.challenge == challenge => Some(o),
             Some(other) => {
@@ -754,7 +761,12 @@ impl Debate {
             None => self.ruled_end.take().filter(|o| o.challenge == challenge),
         };
         let Some(mut o) = o else { return };
-        if matches!(o.phase, Phase::Queued(_) | Phase::Decided(..)) {
+        let cancelled = match o.phase {
+            Phase::Queued(_) => !delivered,
+            Phase::Decided(..) => true,
+            _ => false,
+        };
+        if cancelled {
             (o.n, o.phase) = match o.last {
                 Some((n, v)) => (n, Phase::Owed(v)),
                 None => (o.n, Phase::Awaiting),

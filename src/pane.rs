@@ -19,7 +19,7 @@ use crate::jsonl::Record;
 use crate::layout::{Frame, Input, Overlay, Ui, layout};
 use crate::mailbox::Mailbox;
 use crate::outbox::Outbox;
-use crate::ruling::{self, Cx, Op as RulingOp, Ruled, Rulings, Side, Stage as RulingStage, Surface, Via};
+use crate::ruling::{self, Cx, Op as RulingOp, Ruled, Rulings, Side, Stage as RulingStage, Standing, Surface, Via};
 use crate::standing;
 use crate::status::{Coverage, Op as StatusOp, Outcome, Wake, WatcherOp};
 use crate::term::{self, Key};
@@ -287,6 +287,11 @@ impl Board {
 
     fn ruled(&mut self, t: u64, e: &Event) {
         let Some(r) = e.parse::<Ruled>() else { return };
+        // Another surface ruled first: this one counts for nothing.
+        if let Some(Standing::Void { .. }) = self.rulings.changed() {
+            self.tick(t, format!("{} was already ruled: {} ignored", r.id, r.side.words()), Tone::Plain);
+            return;
+        }
         let inferred = r.via == Via::Prompt;
         let words = r.side.words();
         if let Some(concern) = &r.concern {
@@ -314,6 +319,8 @@ impl Board {
 
     fn ruling(&mut self, t: u64, e: &Event) {
         match e.parse::<RulingOp>() {
+            // A stale undo (its ruling already undone) changes nothing.
+            Some(RulingOp::Undone { .. }) if !matches!(self.rulings.changed(), Some(Standing::Undone { .. })) => {}
             Some(RulingOp::Undone { ruled, concern, delivered, .. }) => {
                 if let Some(c) = &concern {
                     self.info.entry(c.clone()).or_default().end = None;
@@ -484,7 +491,7 @@ impl Board {
             DebateOp::Sent { challenge, route, .. } => {
                 self.entry(t, &challenge, "2/2 sent".to_owned(), format!("via {route}"));
             }
-            DebateOp::Reopened { challenge } => {
+            DebateOp::Reopened { challenge, .. } => {
                 self.entry(t, &challenge, "reopened".to_owned(), "owed again on the Worker's last answer".to_owned());
             }
             DebateOp::End { challenge, concern, outcome, escalated, withdrawn } => {
