@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthChar;
 
 use crate::budget::Stage;
 use crate::concern::{Concern, Severity, State, Tag};
@@ -141,10 +141,12 @@ struct Row {
     line: Line,
     prio: u8,
     concern: Option<String>,
+    /// A NEEDS YOU item: outranks the `… more` marker when even protected rows overflow.
+    needs: bool,
 }
 
 fn row(line: Line, prio: u8) -> Row {
-    Row { line, prio, concern: None }
+    Row { line, prio, concern: None, needs: false }
 }
 
 pub fn layout(b: &Board, ui: &Ui, width: usize, rows: usize) -> Frame {
@@ -346,12 +348,14 @@ fn board(b: &Board, ui: &Ui, selected: Option<&str>, width: usize, compact: bool
 
     let needs: Vec<_> = b.needs_you().collect();
     if !needs.is_empty() {
-        out.push(row(section("NEEDS YOU", needs.len(), "+", width), 0));
+        // The header goes before any item does (V65).
+        out.push(row(section("NEEDS YOU", needs.len(), "+", width), 1));
         for e in needs {
             let at = b.raised.get(&e.id).map(|t| b.time(*t)).unwrap_or_default();
             if compact {
                 let mark = if sel(&e.id) { "›" } else { " " };
-                out.push(row(Line::one(Style::RedBold, cut(&format!("{mark}▲ {at} {}", e.title), width)), 0));
+                let line = Line::one(Style::RedBold, cut(&format!("{mark}▲ {at} {}", e.title), width));
+                out.push(Row { needs: true, ..row(line, 0) });
                 continue;
             }
             let inner = width - 4;
@@ -429,7 +433,7 @@ fn board(b: &Board, ui: &Ui, selected: Option<&str>, width: usize, compact: bool
                     .push(Style::Dim, format!("{end} "))
                     .push(Style::Dim, c.headline.clone());
                 let line = clip_line(line, width);
-                out.push(Row { line, prio: if selected { 0 } else { 4 }, concern: Some(c.id.clone()) });
+                out.push(Row { line, prio: if selected { 0 } else { 4 }, concern: Some(c.id.clone()), needs: false });
                 if selected && !compact {
                     for e in b.info.get(&c.id).map(|i| i.entries.as_slice()).unwrap_or_default() {
                         out.extend(entry(b, e, width, true, Style::Dim).into_iter().map(|l| row(l, 1)));
@@ -463,7 +467,7 @@ fn concern_row(b: &Board, c: &Concern, selected: bool, width: usize, prio: u8, c
             } else {
                 Line::one(base, l)
             };
-            Row { line, prio, concern: Some(c.id.clone()) }
+            Row { line, prio, concern: Some(c.id.clone()), needs: false }
         })
         .collect()
 }
@@ -531,10 +535,12 @@ fn fit(mut body: Vec<Row>, rows: usize) -> (Vec<Line>, Vec<String>) {
             dropped += 1;
         }
     }
-    // Last resort, all of it protected: the bottom goes, and says so.
+    // Last resort, all of it protected: the bottom goes, and says so, unless the marker would
+    // take a NEEDS YOU item's row.
     if body.len() > rows {
-        dropped += body.len() - rows.saturating_sub(1);
-        body.truncate(rows.saturating_sub(1));
+        let keep = if body[rows.saturating_sub(1)].needs { rows } else { rows.saturating_sub(1) };
+        dropped += body.len() - keep;
+        body.truncate(keep);
     }
     let mut visible: Vec<String> = Vec::new();
     for c in body.iter().filter_map(|r| r.concern.clone()) {
@@ -650,9 +656,15 @@ fn ordinal(n: usize) -> String {
     format!("{n}{suffix}")
 }
 
-/// Terminal columns (wide CJK glyphs take two).
+/// Terminal columns of one char as drawn: wide CJK glyphs take two, and a control char is
+/// drawn as one space (`Line::push`).
+fn char_cols(c: char) -> usize {
+    if c.is_control() { 1 } else { UnicodeWidthChar::width(c).unwrap_or(0) }
+}
+
+/// Terminal columns as drawn.
 pub fn cols(s: &str) -> usize {
-    UnicodeWidthStr::width(s)
+    s.chars().map(char_cols).sum()
 }
 
 /// The longest prefix of at most `width` columns, and the rest. Never empty while `s` is not,
@@ -660,7 +672,7 @@ pub fn cols(s: &str) -> usize {
 fn split_cols(s: &str, width: usize) -> (&str, &str) {
     let mut used = 0;
     for (i, c) in s.char_indices() {
-        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        let w = char_cols(c);
         if used + w > width {
             let i = if i == 0 { c.len_utf8() } else { i };
             return s.split_at(i);
@@ -682,7 +694,7 @@ fn cut(s: &str, width: usize) -> String {
 fn tail(s: &str, width: usize) -> &str {
     let mut used = 0;
     for (i, c) in s.char_indices().rev() {
-        used += UnicodeWidthChar::width(c).unwrap_or(0);
+        used += char_cols(c);
         if used > width {
             return &s[i + c.len_utf8()..];
         }

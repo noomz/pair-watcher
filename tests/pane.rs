@@ -203,7 +203,7 @@ impl Fx {
 /// Review findings: wide glyphs, a detail of leading spaces, three Escalations at once.
 fn nasty() -> Fx {
     let mut f = Fx::repetition();
-    let mut c = concern("c4", "approach", Severity::Warn, &"界".repeat(40));
+    let mut c = concern("c4", "approach", Severity::Warn, &format!("{}{}", "界".repeat(40), "\r\n".repeat(40)));
     c.detail = vec![format!("{}X", " ".repeat(60))];
     f.at(11, 50, Change::Add { watcher: "companion".into(), concern: c }.event());
     for i in 1..=3 {
@@ -336,6 +336,11 @@ fn too_short_a_pane_goes_compact_and_keeps_every_item() {
         assert!(text.contains(&format!(" {id} ")), "{id} visible but not drawn:\n{text}");
     }
     assert!(!f.visible.contains(&"c1".to_owned()), "{text}");
+    // Status line + one row per Escalation: headers go first.
+    let text = texts(&layout(&nasty().board(), &Ui::default(), 48, 4));
+    for want in ["Worker blocked 1", "Worker blocked 2", "Worker blocked 3"] {
+        assert!(text.contains(want), "no {want:?} in\n{text}");
+    }
 }
 
 #[test]
