@@ -221,6 +221,7 @@ pub struct Live {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Standing {
     Ruled {
+        id: String,
         concern: Option<String>,
         side: Side,
         nth: usize,
@@ -248,8 +249,8 @@ impl Live {
                 if self.on.contains_key(&key) {
                     return Some(Standing::Void { nth });
                 }
-                self.on.insert(key, (r.id, nth));
-                Some(Standing::Ruled { concern: r.concern, side: r.side, nth })
+                self.on.insert(key, (r.id.clone(), nth));
+                Some(Standing::Ruled { id: r.id, concern: r.concern, side: r.side, nth })
             }
             Kind::Ruling => match event.parse::<Op>()? {
                 Op::Undone { ruled, nth, concern, .. } => {

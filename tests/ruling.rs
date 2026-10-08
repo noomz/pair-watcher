@@ -938,3 +938,80 @@ fn pane_ignores_void_rulings_and_stale_undos() {
     assert_eq!(b.closed_as("c2").as_deref(), Some("escalated → ruled: sided with the Watcher"));
     assert_eq!(b.ticker.last().unwrap().text, "e1 was already ruled: sided with the Worker ignored");
 }
+
+/// Round 5 #1: `reopen` reads exchange 2 and logs `reopened` under the outbox lock; a claim
+/// (whose gate reads the log) waits until both are done.
+#[test]
+fn while_out_holds_claims_off() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let fx = Fx::new();
+    let outbox = fx.mb.outbox();
+    assert!(outbox.queue(Item { id: "x".into(), kind: ItemKind::Challenge, text: String::new() }, now_ms()).unwrap());
+    let done = Arc::new(AtomicBool::new(false));
+    let claimer = outbox
+        .while_out("x", |out| {
+            assert!(out);
+            let (ob, seen) = (fx.mb.outbox(), done.clone());
+            let h = std::thread::spawn(move || {
+                ob.claim("mod", now_ms(), |_| if seen.load(Ordering::SeqCst) { Gate::Deliver } else { Gate::Drop })
+                    .unwrap()
+            });
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            done.store(true, Ordering::SeqCst);
+            h
+        })
+        .unwrap();
+    assert!(claimer.join().unwrap().is_some(), "the claim ran only after the locked step");
+    assert!(!fx.mb.outbox().while_out("nope", |out| out).unwrap());
+}
+
+/// Round 5 #2: the Worker's `concede` read while a ruling stands does not override it; the
+/// arbiter ends it as ruled, and `u` reopens it.
+#[test]
+fn a_worker_concession_never_overrides_a_standing_ruling() {
+    let fx = Fx::new();
+    fx.challenge();
+    fx.rule("c2", Side::Worker).unwrap();
+    let turn = Entry {
+        id: "t9".into(),
+        t: now_ms(),
+        items: vec![TItem::Text("Fine.\nChallenge c2: concede — you are right".into()), TItem::TurnEnd],
+    };
+    let mut d = fx.debate();
+    d.observe(&fx.mb.log(), &fx.mb.outbox(), &[turn], now_ms()).unwrap();
+    assert!(fx.op(Kind::Debate, "end").is_empty());
+    fx.answer();
+    assert_eq!(fx.op(Kind::Debate, "end")[0].str("outcome"), Some("sided-worker"));
+    fx.undo();
+    fx.answer();
+    assert_eq!(fx.op(Kind::Debate, "reopened").len(), 1);
+    assert_eq!(fx.board().in_debate(), Some("c2"));
+}
+
+/// Round 5 #3: a blocked Escalation dismissed before its notification never pings; undone, it
+/// is notified once.
+#[test]
+fn a_blocked_escalation_dismissed_before_notification_never_pings() {
+    let fx = Fx::new();
+    let raised = EscalationOp::Raised {
+        id: "e1".into(),
+        cause: Cause::Blocked,
+        concern: None,
+        challenge: None,
+        hook: Some(5),
+        title: "Worker blocked".into(),
+        lines: vec![],
+        rule: String::new(),
+    };
+    fx.log(raised.event());
+    fx.rule("e1", Side::Dismissed).unwrap();
+    let deliver = |fx: &Fx| {
+        let mut esc = Escalations::rebuild(&fx.events());
+        esc.deliver(&fx.mb.log(), &fx.list(), |_| Ok(false), &pair_watcher::escalation::Notifier::None).unwrap()
+    };
+    assert!(deliver(&fx).is_empty());
+    assert!(fx.op(Kind::Escalation, "sending").is_empty() && fx.op(Kind::Escalation, "dropped-stale").is_empty());
+    fx.undo();
+    assert_eq!(deliver(&fx), ["e1"]);
+}

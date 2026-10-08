@@ -549,7 +549,9 @@ impl Debate {
             Some((v, reason)) => {
                 let n = open.n;
                 self.commit(log, &Op::Exchange { challenge, n, verdict: v, reason: Some(reason), entry, turn })?;
-                if v == Verdict::Concede {
+                // A ruling standing on it has the last word: the arbiter ends it as ruled (V73).
+                let ruled = matches!(self.closed.get(&open.concern), Some(Closed::Ruled(_)));
+                if v == Verdict::Concede && !ruled {
                     self.end(log, outbox, Outcome::WorkerConcedes, None, None, now)?;
                 }
             }
@@ -729,16 +731,20 @@ impl Debate {
             return Ok(None);
         };
         // The end could not withdraw exchange 2 under a live claim: still pending or delivered,
-        // it stays out; only a withdrawn one is re-decided.
-        let kept = match &o.phase {
-            Phase::Queued(item) => {
-                outbox.pending()?.iter().any(|i| i.id == *item)
-                    || outbox.delivered()?.iter().any(|d| d.item.id == *item)
-            }
-            _ => false,
+        // it stays out; only a withdrawn one is re-decided. Read and logged under the outbox
+        // lock, so no claim drops it in between (claims read the log under that lock).
+        let item = match &o.phase {
+            Phase::Queued(item) => Some(item.clone()),
+            _ => None,
         };
-        let event = Op::Reopened { challenge: challenge.to_owned(), kept }.event();
-        log.append(event.clone())?;
+        let append = |kept: bool| {
+            let event = Op::Reopened { challenge: challenge.to_owned(), kept }.event();
+            log.append(event.clone()).map(|()| event)
+        };
+        let event = match item {
+            Some(item) => outbox.while_out(&item, append)??,
+            None => append(false)?,
+        };
         self.apply(&event);
         Ok(Some(event))
     }

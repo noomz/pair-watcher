@@ -26,6 +26,7 @@ use crate::event::{Event, EventLog, Kind};
 use crate::harness::Harness;
 use crate::mailbox::Mailbox;
 use crate::output::Line;
+use crate::ruling::{Live, Standing};
 use crate::trigger::{self, Signal};
 
 /// The Watcher line of an unresolved Escalation: alternative + strongest evidence (I13).
@@ -149,6 +150,9 @@ pub struct Escalations {
     /// Challenges and blocked hooks already raised.
     challenges: HashSet<String>,
     hooks: HashSet<u64>,
+    /// Blocked Escalations the human dismissed (`d`, V72), unless undone (V75).
+    rulings: Live,
+    dismissed: HashSet<String>,
 }
 
 impl Escalations {
@@ -169,6 +173,15 @@ impl Escalations {
     }
 
     pub fn apply(&mut self, event: &Event) {
+        match self.rulings.apply(event) {
+            Some(Standing::Ruled { id, concern: None, .. }) => {
+                self.dismissed.insert(id);
+            }
+            Some(Standing::Undone { ruled, concern: None, .. }) => {
+                self.dismissed.remove(&ruled);
+            }
+            _ => {}
+        }
         match event.k {
             Kind::Debate => match event.parse::<DebateOp>() {
                 Some(DebateOp::Exchange { challenge, reason: Some(reason), .. }) => {
@@ -340,6 +353,10 @@ impl Escalations {
         let pending: Vec<Escalation> = self.all.iter().filter(|e| e.stage == Stage::Raised).cloned().collect();
         let mut notified = Vec::new();
         for e in pending {
+            // Dismissed before it went out: not worth the ping (V72); kept for `u` (V75).
+            if self.dismissed.contains(&e.id) {
+                continue;
+            }
             let stale = match (e.cause, &e.concern, e.hook) {
                 (Cause::Unresolved, Some(c), _) if list.get(c).is_none_or(|c| c.state != State::Open) => {
                     Some(format!("{c} no longer open"))

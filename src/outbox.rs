@@ -218,6 +218,15 @@ impl Outbox {
         })
     }
 
+    /// Runs `f` under the outbox lock with whether item `id` is still out (pending or
+    /// delivered): no claim can drop or deliver it until `f` returns.
+    pub fn while_out<R>(&self, id: &str, f: impl FnOnce(bool) -> R) -> io::Result<R> {
+        self.transact(0, |slots| {
+            let out = slots.iter().any(|s| s.item.id == id && (!s.done || s.acked));
+            (vec![], f(out))
+        })
+    }
+
     /// Why a deliverer holds pending item `id` back, if it says.
     pub fn held(&self, id: &str) -> io::Result<Option<String>> {
         let records = jsonl::read_from::<Record<Entry>>(&self.path, 0)?.records;
