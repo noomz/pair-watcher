@@ -24,7 +24,7 @@ use crate::event::{Event, EventLog, Kind};
 use crate::history;
 use crate::outbox::{Gate, Item, ItemKind, Outbox, Withdraw};
 use crate::output::{Decision, Line};
-use crate::ruling::{Op as RulingOp, Ruled, Side};
+use crate::ruling::{Live, Side, Standing};
 use crate::tailer::{Entry, Item as TItem};
 
 /// Exchange 2's outbox id is the Challenge id plus this.
@@ -266,6 +266,7 @@ pub struct Debate {
     ended: HashSet<String>,
     /// The Debate a ruling ended, until another Challenge is queued: `u` may reopen it (V75).
     ruled_end: Option<Open>,
+    rulings: Live,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -317,6 +318,17 @@ impl Debate {
     }
 
     pub fn apply(&mut self, event: &Event) {
+        match self.rulings.apply(event) {
+            Some(Standing::Ruled { concern: Some(c), side, .. }) => {
+                self.closed.entry(c).or_insert(Closed::Ruled(side));
+            }
+            Some(Standing::Undone { concern: Some(c), .. }) => {
+                if matches!(self.closed.get(&c), Some(Closed::Ruled(_))) {
+                    self.closed.remove(&c);
+                }
+            }
+            _ => {}
+        }
         match event.k {
             Kind::Challenge => match event.parse::<ChallengeOp>() {
                 Some(ChallengeOp::Queued { id, concern, focus, .. }) => {
@@ -363,18 +375,6 @@ impl Debate {
             Kind::Human if event.str("action") == Some("dismiss") => {
                 if let Some(id) = event.str("id") {
                     self.closed.entry(id.to_owned()).or_insert(Closed::Withdrawn(Withdrawal::Dismissed));
-                }
-            }
-            Kind::Ruled => {
-                if let Some(Ruled { concern: Some(concern), side, .. }) = event.parse::<Ruled>() {
-                    self.closed.entry(concern).or_insert(Closed::Ruled(side));
-                }
-            }
-            Kind::Ruling => {
-                if let Some(RulingOp::Undone { concern: Some(concern), .. }) = event.parse::<RulingOp>()
-                    && matches!(self.closed.get(&concern), Some(Closed::Ruled(_)))
-                {
-                    self.closed.remove(&concern);
                 }
             }
             Kind::Debate => {
@@ -723,7 +723,11 @@ impl Debate {
                 .as_ref()
                 .is_some_and(|o| o.challenge == challenge && !self.closed.contains_key(&o.concern)),
             Some(o) if o.challenge == challenge && !self.closed.contains_key(&o.concern) => match &o.phase {
-                Phase::Queued(item) => !outbox.pending()?.iter().any(|i| i.id == *item),
+                // Dropped by the gate, not delivered: an acked one is the Debate's `sent` to log.
+                Phase::Queued(item) => {
+                    !outbox.pending()?.iter().any(|i| i.id == *item)
+                        && !outbox.delivered()?.iter().any(|d| d.item.id == *item)
+                }
                 _ => false,
             },
             Some(_) => false,

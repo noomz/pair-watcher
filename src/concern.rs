@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::event::{Event, Kind};
 use crate::human::Act;
+use crate::ruling::{Live, Standing};
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -150,6 +151,7 @@ pub fn dismissal(id: &str) -> Event {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ConcernList {
     concerns: Vec<Concern>,
+    rulings: Live,
 }
 
 impl ConcernList {
@@ -176,6 +178,16 @@ impl ConcernList {
     }
 
     pub fn apply(&mut self, event: &Event) {
+        // A ruling closes its Concern; undoing it reopens the Concern (V73, V75).
+        match self.rulings.apply(event) {
+            Some(Standing::Ruled { concern: Some(id), .. }) => self.close(&id, State::Ruled),
+            Some(Standing::Undone { concern: Some(id), .. }) => {
+                if let Some(c) = self.find(&id).filter(|c| c.state == State::Ruled) {
+                    c.state = State::Open;
+                }
+            }
+            _ => {}
+        }
         match event.k {
             Kind::Concern => match event.parse::<Change>() {
                 Some(Change::Add { concern, .. }) => self.concerns.push(concern),
@@ -196,17 +208,6 @@ impl ConcernList {
             Kind::Human if event.str("action") == Some("dismiss") => {
                 if let Some(id) = event.str("id") {
                     self.close(id, State::Dismissed);
-                }
-            }
-            // A ruling closes its Concern; undoing it reopens the Concern (V75).
-            Kind::Ruled => {
-                if let Some(id) = event.str("concern") {
-                    self.close(id, State::Ruled);
-                }
-            }
-            Kind::Ruling if event.str("op") == Some("undone") => {
-                if let Some(c) = event.str("concern").and_then(|id| self.find(id)).filter(|c| c.state == State::Ruled) {
-                    c.state = State::Open;
                 }
             }
             Kind::Debate if event.str("op") == Some("end") => {

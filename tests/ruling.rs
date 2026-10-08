@@ -749,3 +749,66 @@ fn inference_ignores_prompts_from_before_the_escalation() {
     assert!(dropped[0].contains("since it was raised"), "{dropped:?}");
     assert!(fx.kind(Kind::Ruled).is_empty());
 }
+
+/// Review round 2 #1: exchange 2 delivered while `y` then `u` were logged is the Debate's to
+/// log `sent`, not a dropped rebuttal to re-decide.
+#[test]
+fn undo_leaves_a_delivered_rebuttal_alone() {
+    let fx = Fx::new();
+    fx.rebuttal_queued();
+    let outbox = fx.mb.outbox();
+    let claim = outbox.claim("mod", now_ms(), |i| if i.id == "c2/2" { Gate::Deliver } else { Gate::Skip }).unwrap();
+    let claim = claim.expect("claimed before the ruling");
+    fx.rule("c2", Side::Watcher).unwrap();
+    fx.undo();
+    assert!(outbox.ack(&claim, now_ms()).unwrap());
+    fx.answer();
+    assert!(fx.op(Kind::Debate, "reopened").is_empty());
+    let mut d = fx.debate();
+    assert_eq!(d.sync_sent(&fx.mb.log(), &outbox).unwrap().as_deref(), Some("mod"));
+    assert_eq!(d.open().map(|o| (o.n, o.phase.clone())), Some((2, Phase::Awaiting)));
+}
+
+/// Review round 2 #2: two surfaces undo the same ruling; the second, logged after a fresh
+/// ruling, changes nothing in any fold.
+#[test]
+fn a_stale_undo_never_lifts_a_newer_ruling() {
+    let fx = Fx::new();
+    fx.rebuttal_queued();
+    fx.rule("c2", Side::Watcher).unwrap();
+    let b = fx.board();
+    let first = pane::undo(&b, &fx.mb.outbox(), Via::Key, Surface::Pane).unwrap();
+    let second = pane::undo(&b, &fx.mb.outbox(), Via::Cli, Surface::Cli).unwrap();
+    fx.log(first);
+    fx.rule("c2", Side::Worker).unwrap();
+    fx.log(second);
+
+    assert_eq!(fx.list().get("c2").unwrap().state, State::Ruled);
+    assert_eq!(fx.board().in_debate(), None);
+    let view = delivery::View::read(&fx.mb).unwrap();
+    let rebuttal = Item { id: "c2/2".into(), kind: ItemKind::Challenge, text: String::new() };
+    assert_eq!(view.gate(&rebuttal), Gate::Drop);
+    let r = fx.rulings();
+    assert_eq!((r.last().unwrap().nth, r.last().unwrap().ruled.side), (1, Side::Worker));
+    fx.answer();
+    assert_eq!(fx.op(Kind::Debate, "end")[0].str("outcome"), Some("sided-worker"));
+}
+
+/// Two surfaces rule the same item at once: the first stands, the second is void.
+#[test]
+fn a_concurrent_second_ruling_is_void() {
+    let fx = Fx::new();
+    fx.escalated();
+    let b = fx.board();
+    let y = Rulings::rule(&b.cx(), "e1", Side::Watcher, Via::Key, Surface::Pane, now_ms()).unwrap();
+    let n = Rulings::rule(&b.cx(), "e1", Side::Worker, Via::Cli, Surface::Cli, now_ms()).unwrap();
+    fx.log(y.event());
+    fx.log(n.event());
+    let r = fx.rulings();
+    assert!(!r.all()[0].void && r.all()[1].void);
+    assert_eq!(r.last().unwrap().ruled.side, Side::Watcher);
+    fx.answer();
+    assert_eq!(fx.ruling_items().len(), 1);
+    fx.undo();
+    assert_eq!(fx.board().needs_you().count(), 1, "undoing the standing one reopens it");
+}

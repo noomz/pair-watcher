@@ -18,6 +18,7 @@ use crate::history::{self, History};
 use crate::human::Act;
 use crate::outbox::{Gate, Item, ItemKind, Outbox, Withdraw};
 use crate::output;
+use crate::ruling::{Live, Standing};
 use crate::snapshot::Store;
 use crate::tailer::{self, Entry};
 
@@ -291,6 +292,7 @@ pub struct Challenges {
     /// The slot a `debate end` freed, until the next Challenge is queued: `debate reopened`
     /// takes it back (V75).
     freed: Option<Slot>,
+    rulings: Live,
 }
 
 impl Challenges {
@@ -310,6 +312,15 @@ impl Challenges {
     /// engine's `debate {op: end, challenge}`, which frees the slot. A `queued` while the slot is
     /// held is ignored (`queue` never writes one).
     pub fn apply(&mut self, event: &Event) {
+        // A ruling before delivery drops the waiting Challenge; undone, it waits again (V73, V75).
+        let (concern, ruled) = match self.rulings.apply(event) {
+            Some(Standing::Ruled { concern: Some(c), .. }) => (Some(c), true),
+            Some(Standing::Undone { concern: Some(c), .. }) => (Some(c), false),
+            _ => (None, false),
+        };
+        if let Some(s) = self.slot.as_mut().filter(|s| !s.sent && concern.as_deref() == Some(s.concern.as_str())) {
+            s.ruled = ruled;
+        }
         if event.k == Kind::Challenge
             && let Some(Op::Queued { concern, origin: Origin::Promoted, .. } | Op::PromotionRefused { concern, .. }) =
                 event.parse::<Op>()
@@ -352,16 +363,6 @@ impl Challenges {
             Kind::Debate if event.str("op") == Some("reopened") => {
                 if self.slot.is_none() && self.freed.as_ref().map(|s| s.id.as_str()) == event.str("challenge") {
                     self.slot = self.freed.take();
-                }
-            }
-            // A ruling before delivery drops the waiting Challenge; undone, it waits again.
-            Kind::Ruled | Kind::Ruling => {
-                let undone = event.k == Kind::Ruling && event.str("op") == Some("undone");
-                if (event.k == Kind::Ruled || undone)
-                    && let Some(s) =
-                        self.slot.as_mut().filter(|s| !s.sent && Some(s.concern.as_str()) == event.str("concern"))
-                {
-                    s.ruled = !undone;
                 }
             }
             _ => {}

@@ -205,6 +205,68 @@ pub fn text(challenge: &str, alternative: &str) -> String {
     )
 }
 
+/// Which ruling stands on each item (its Concern, else the Escalation id): the first `ruled`
+/// while none stands; an `undone` naming exactly that ruling (id + nth) lifts it. A second
+/// ruling racing the first (two surfaces), or a stale undo, changes nothing (V43, V75). Every
+/// fold a ruling touches reads rulings through this, so they agree.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Live {
+    /// `ruled` events so far per ruled id: the next one's `nth`.
+    count: HashMap<String, usize>,
+    /// Item key → the standing ruling (ruled id, nth).
+    on: HashMap<String, (String, usize)>,
+}
+
+/// What one event did to the standing rulings.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Standing {
+    Ruled {
+        concern: Option<String>,
+        side: Side,
+        nth: usize,
+    },
+    Undone {
+        concern: Option<String>,
+        ruled: String,
+        nth: usize,
+    },
+    /// A `ruled` on an item already ruled: void.
+    Void {
+        nth: usize,
+    },
+}
+
+impl Live {
+    pub fn apply(&mut self, event: &Event) -> Option<Standing> {
+        match event.k {
+            Kind::Ruled => {
+                let r = event.parse::<Ruled>()?;
+                let count = self.count.entry(r.id.clone()).or_default();
+                let nth = *count;
+                *count += 1;
+                let key = r.concern.clone().unwrap_or_else(|| r.id.clone());
+                if self.on.contains_key(&key) {
+                    return Some(Standing::Void { nth });
+                }
+                self.on.insert(key, (r.id, nth));
+                Some(Standing::Ruled { concern: r.concern, side: r.side, nth })
+            }
+            Kind::Ruling => match event.parse::<Op>()? {
+                Op::Undone { ruled, nth, concern, .. } => {
+                    let key = concern.clone().unwrap_or_else(|| ruled.clone());
+                    if self.on.get(&key) != Some(&(ruled.clone(), nth)) {
+                        return None;
+                    }
+                    self.on.remove(&key);
+                    Some(Standing::Undone { concern, ruled, nth })
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+}
+
 /// One ruling as the log has it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Ruling {
@@ -213,6 +275,8 @@ pub struct Ruling {
     pub nth: usize,
     pub t: u64,
     pub undone: bool,
+    /// Another ruling stood on the item when this one was logged: it counts for nothing.
+    pub void: bool,
     /// Its Ruling message's outbox id, once queued.
     pub item: Option<String>,
     pub delivered: bool,
@@ -228,7 +292,7 @@ pub struct Ruling {
 
 impl Ruling {
     fn live(&self) -> bool {
-        !self.undone
+        !self.undone && !self.void
     }
 }
 
@@ -253,6 +317,7 @@ pub struct Cx<'a> {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Rulings {
     all: Vec<Ruling>,
+    standing: Live,
     /// Escalation id → when raised.
     raised: HashMap<String, u64>,
     /// Escalations closed by `answered`, `closed-stale` or `unruled`.
@@ -287,15 +352,21 @@ impl Rulings {
     pub fn apply(&mut self, t: u64, event: &Event) {
         self.seq += 1;
         let seq = self.seq;
+        let standing = self.standing.apply(event);
         match event.k {
             Kind::Ruled => {
                 if let Some(ruled) = event.parse::<Ruled>() {
-                    let nth = self.all.iter().filter(|r| r.ruled.id == ruled.id).count();
+                    let (nth, void) = match standing {
+                        Some(Standing::Ruled { nth, .. }) => (nth, false),
+                        Some(Standing::Void { nth }) => (nth, true),
+                        _ => return,
+                    };
                     let r = Ruling {
                         ruled,
                         nth,
                         t,
                         undone: false,
+                        void,
                         item: None,
                         delivered: false,
                         dropped: false,
@@ -322,8 +393,10 @@ impl Rulings {
                         r.dropped = true;
                     }
                 }
-                Some(Op::Undone { ruled, nth, .. }) => {
-                    if let Some(r) = self.at(&ruled, nth) {
+                Some(Op::Undone { .. }) => {
+                    if let Some(Standing::Undone { ruled, nth, .. }) = standing
+                        && let Some(r) = self.at(&ruled, nth)
+                    {
                         r.undone = true;
                     }
                 }
