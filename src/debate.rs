@@ -445,8 +445,11 @@ impl Debate {
                 o.log.push("   Exchange 2 sent.".to_owned());
                 (o.phase, o.stop_turn) = (Phase::Awaiting, route == STOP);
             }
-            Op::End { challenge, concern, .. } if ours(&challenge) => {
-                let ruled = matches!(self.closed.get(&concern), Some(Closed::Ruled(_)));
+            // Only a ruling ends it sided or dismissed (V73): kept for `u`, even when the undo
+            // was logged before this end (V75).
+            Op::End { challenge, outcome, withdrawn, .. } if ours(&challenge) => {
+                let ruled = matches!(outcome, Outcome::SidedWatcher | Outcome::SidedWorker)
+                    || withdrawn == Some(Withdrawal::Dismissed);
                 let open = self.open.take();
                 self.ruled_end = if ruled { open } else { None };
             }
@@ -709,14 +712,22 @@ impl Debate {
         self.end(log, outbox, outcome, None, why, now).map(Some)
     }
 
-    /// `u` undid the ruling that ended `challenge`'s Debate (V75): reopens it, unless another
-    /// Challenge was queued since or a Debate is open. Returns the `reopened` event written.
-    pub fn reopen(&mut self, log: &EventLog, challenge: &str) -> io::Result<Option<Event>> {
-        let due = self.open.is_none()
-            && self
+    /// `u` undid the ruling on `challenge`'s Debate (V75): reopens the Debate the ruling ended,
+    /// unless another Challenge was queued since; or, when the undo came before the end, owes the
+    /// still-open Debate its move again if the ruling cost it its queued exchange 2 (the gate
+    /// dropped it). Returns the `reopened` event written.
+    pub fn reopen(&mut self, log: &EventLog, outbox: &Outbox, challenge: &str) -> io::Result<Option<Event>> {
+        let due = match &self.open {
+            None => self
                 .ruled_end
                 .as_ref()
-                .is_some_and(|o| o.challenge == challenge && !self.closed.contains_key(&o.concern));
+                .is_some_and(|o| o.challenge == challenge && !self.closed.contains_key(&o.concern)),
+            Some(o) if o.challenge == challenge && !self.closed.contains_key(&o.concern) => match &o.phase {
+                Phase::Queued(item) => !outbox.pending()?.iter().any(|i| i.id == *item),
+                _ => false,
+            },
+            Some(_) => false,
+        };
         if !due {
             return Ok(None);
         }
@@ -726,13 +737,19 @@ impl Debate {
         Ok(Some(event))
     }
 
-    /// Restores the Debate a ruling ended, owed again on the Worker's last answer: a logged move
-    /// or a queued exchange 2 was cancelled with the ruling, so the owner decides again.
+    /// Restores the Debate a ruling ended (or keeps the open one), owed again on the Worker's last
+    /// answer: a logged move or a queued exchange 2 was cancelled with the ruling, so the owner
+    /// decides again.
     fn reopen_from_ruling(&mut self, challenge: &str) {
-        if self.open.is_some() {
-            return;
-        }
-        let Some(mut o) = self.ruled_end.take().filter(|o| o.challenge == challenge) else { return };
+        let o = match self.open.take() {
+            Some(o) if o.challenge == challenge => Some(o),
+            Some(other) => {
+                self.open = Some(other);
+                return;
+            }
+            None => self.ruled_end.take().filter(|o| o.challenge == challenge),
+        };
+        let Some(mut o) = o else { return };
         if matches!(o.phase, Phase::Queued(_) | Phase::Decided(..)) {
             (o.n, o.phase) = match o.last {
                 Some((n, v)) => (n, Phase::Owed(v)),

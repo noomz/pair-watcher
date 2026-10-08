@@ -330,7 +330,7 @@ impl Board {
                 }
                 self.tick(t, format!("{ruled} ruling undone: {back}{sent}"), Tone::Plain);
             }
-            Some(RulingOp::Delivered { id, route }) => {
+            Some(RulingOp::Delivered { id, route, .. }) => {
                 self.tick(t, format!("{id} delivered via {route}"), Tone::Plain);
             }
             Some(RulingOp::Dropped { why, .. }) if why == ruling::PROMPTED_FIRST => {

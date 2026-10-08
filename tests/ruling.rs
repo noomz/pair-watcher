@@ -360,7 +360,8 @@ fn ruling_on_an_unsent_challenge_drops_it() {
 #[test]
 fn inferred_ruling_is_checked_by_code() {
     let line = |side, r: &str| Line::InferredRuling { escalation: "e1".into(), side, prompt_ref: r.into() };
-    let entries = [prompt("p1", 1, "reviewbot is broken, I'll merge it myself.\nDraft the squash message")];
+    let entries =
+        [prompt("p1", now_ms() + 60_000, "reviewbot is broken, I'll merge it myself.\nDraft the squash message")];
     let infer = |fx: &Fx, lines: &[(String, Line)], turn_end: bool, enabled: bool| {
         let (esc, list) = (Escalations::rebuild(&fx.events()), fx.list());
         fx.rulings().infer(&fx.mb.log(), lines, turn_end, enabled, &entries, &esc, &list, now_ms()).unwrap()
@@ -378,7 +379,7 @@ fn inferred_ruling_is_checked_by_code() {
     let fx = Fx::new();
     fx.escalated();
     let made_up = vec![("companion".to_owned(), line(OutSide::Watcher, "keep requesting reviews"))];
-    assert!(infer(&fx, &made_up, true, true)[0].contains("not in the human's prompt"));
+    assert!(infer(&fx, &made_up, true, true)[0].contains("not in a human prompt since it was raised"));
     let split = vec![
         ("approach".to_owned(), line(OutSide::Watcher, "merge it myself")),
         ("correctness".to_owned(), line(OutSide::Worker, "reviewbot is broken")),
@@ -422,10 +423,12 @@ fn undo_reopens_needs_you_and_withdraws_the_queued_ruling() {
     assert!(fx.ruling_items().is_empty());
     assert!(pane::undo(&fx.board(), &fx.mb.outbox(), Via::Key, Surface::Pane).is_err(), "nothing left to undo");
 
-    // Ruled again: a fresh Ruling under the same outbox id (the dropped one never went out).
+    // Ruled again: a fresh Ruling under its own outbox id; the undone one's state never gates it.
     fx.rule("e1", Side::Watcher).unwrap();
     fx.answer();
-    assert_eq!(fx.ruling_items()[0].id, item.id);
+    let fresh = fx.ruling_items().remove(0);
+    assert_eq!((item.id.as_str(), fresh.id.as_str()), ("ruling/e1.0", "ruling/e1.1"));
+    assert_eq!(delivery::View::read(&fx.mb).unwrap().gate(&fresh), Gate::Deliver);
 }
 
 /// V75: a delivered Ruling stays sent; the undo record says so.
@@ -631,4 +634,118 @@ fn turn_end_input_shows_escalations_awaiting_a_ruling() {
 
     fx.rule("e1", Side::Dismissed).unwrap();
     assert!(fx.rulings().awaiting(&Escalations::rebuild(&fx.events())).is_none());
+}
+
+/// Review #1: an arbiter answer from a view older than `u` + `n` queues the Watcher Ruling for
+/// the undone `y`, never for the later `n`; it is dropped, not delivered.
+#[test]
+fn a_stale_answer_never_sends_a_ruling_for_a_later_worker_ruling() {
+    let fx = Fx::new();
+    fx.escalated();
+    fx.rule("e1", Side::Watcher).unwrap();
+    let events = fx.events();
+    let (mut stale, mut d, mut c) = (fx.rulings(), Debate::rebuild(&events), Challenges::rebuild(&events));
+    let (list, esc) = (ConcernList::rebuild(&events), Escalations::rebuild(&events));
+    fx.undo();
+    fx.rule("e1", Side::Worker).unwrap();
+    stale.answer(&fx.mb.log(), &fx.mb.outbox(), &mut d, &mut c, &list, &esc, now_ms()).unwrap();
+    let queued = &fx.op(Kind::Ruling, "queued")[0];
+    assert_eq!((queued.str("id"), queued.fields["nth"].as_u64()), (Some("ruling/e1.0"), Some(0)));
+
+    let item = fx.ruling_items().remove(0);
+    assert_eq!(delivery::View::read(&fx.mb).unwrap().gate(&item), Gate::Drop);
+    let view = delivery::View::read(&fx.mb).unwrap();
+    assert!(delivery::claim(&fx.mb, &view, Route::Mod, now_ms()).unwrap().is_none());
+    fx.answer();
+    assert!(fx.ruling_items().is_empty());
+    let r = fx.rulings();
+    assert!(r.all()[0].undone && r.all()[0].dropped && !r.all()[1].ruled.ruling_sent);
+}
+
+/// Review #2: a prompt first drops the Ruling even under a live claim (the release does not
+/// bring it back) and before the arbiter queued it.
+#[test]
+fn prompt_first_holds_through_a_claim_and_before_the_queue() {
+    let fx = Fx::new();
+    fx.escalated();
+    fx.rule("e1", Side::Watcher).unwrap();
+    fx.answer();
+    let view = delivery::View::read(&fx.mb).unwrap();
+    let claim = delivery::claim(&fx.mb, &view, Route::Mod, now_ms()).unwrap().expect("claimed");
+    let t = fx.rulings().last().unwrap().t;
+    let after = [prompt("p2", t + 1, "also bump the version")];
+    let ticker = fx.rulings().drop_on_prompt(&fx.mb.log(), &fx.mb.outbox(), &after, now_ms()).unwrap();
+    assert_eq!(ticker.len(), 1);
+    assert!(fx.mb.outbox().release(&claim, now_ms()).unwrap());
+    let view = delivery::View::read(&fx.mb).unwrap();
+    assert!(delivery::claim(&fx.mb, &view, Route::Mod, now_ms()).unwrap().is_none(), "never after the prompt");
+    fx.answer();
+    assert!(fx.ruling_items().is_empty());
+
+    // Not yet queued: dropped, and never queued.
+    let fx = Fx::new();
+    fx.escalated();
+    fx.rule("e1", Side::Watcher).unwrap();
+    let t = fx.rulings().last().unwrap().t;
+    let after = [prompt("p2", t + 1, "also bump the version")];
+    fx.rulings().drop_on_prompt(&fx.mb.log(), &fx.mb.outbox(), &after, now_ms()).unwrap();
+    let dropped = &fx.op(Kind::Ruling, "dropped")[0];
+    assert!(dropped.str("id").is_none());
+    fx.answer();
+    assert!(fx.ruling_items().is_empty() && fx.op(Kind::Ruling, "queued").is_empty());
+}
+
+/// Review #3: `y` IN DEBATE, a claim drops the waiting rebuttal, `u` before the arbiter
+/// answers: the still-open Debate is owed its move again, not stuck on a dropped item.
+#[test]
+fn undo_before_the_end_recovers_a_dropped_rebuttal() {
+    let fx = Fx::new();
+    fx.rebuttal_queued();
+    fx.rule("c2", Side::Watcher).unwrap();
+    let view = delivery::View::read(&fx.mb).unwrap();
+    assert!(delivery::claim(&fx.mb, &view, Route::Mod, now_ms()).unwrap().is_none());
+    assert!(!fx.mb.outbox().pending().unwrap().iter().any(|i| i.id == "c2/2"), "gate dropped it");
+    fx.undo();
+    fx.answer();
+    assert!(fx.op(Kind::Debate, "end").is_empty());
+    assert_eq!(fx.op(Kind::Debate, "reopened").len(), 1);
+    let d = fx.debate();
+    assert_eq!(d.open().map(|o| (o.n, o.phase.clone())), Some((1, Phase::Owed(Verdict::Defend))));
+    assert!(fx.ruling_items().is_empty(), "the undone Ruling is never queued");
+}
+
+/// Review #4: the undo lands between the arbiter reading the ruling and writing `debate end`;
+/// replay still keeps the ended Debate for `u` and reopens it.
+#[test]
+fn undo_racing_the_end_still_reopens() {
+    let fx = Fx::new();
+    fx.rebuttal_queued();
+    fx.rule("c2", Side::Worker).unwrap();
+    let events = fx.events();
+    let (mut d, mut c) = (Debate::rebuild(&events), Challenges::rebuild(&events));
+    let (list, esc) = (ConcernList::rebuild(&events), Escalations::rebuild(&events));
+    let mut stale = fx.rulings();
+    fx.undo();
+    stale.answer(&fx.mb.log(), &fx.mb.outbox(), &mut d, &mut c, &list, &esc, now_ms()).unwrap();
+    assert_eq!(fx.op(Kind::Debate, "end").len(), 1);
+    fx.answer();
+    assert_eq!(fx.op(Kind::Debate, "reopened").len(), 1);
+    assert_eq!(fx.board().in_debate(), Some("c2"));
+}
+
+/// Review #6: a prompt that arrived before the Escalation was raised cannot rule on it.
+#[test]
+fn inference_ignores_prompts_from_before_the_escalation() {
+    let fx = Fx::new();
+    fx.escalated();
+    let raised = fx.rulings().raised("e1").unwrap();
+    let entries = [prompt("p0", raised - 1, "reviewbot is broken, I'll merge it myself")];
+    let lines = vec![(
+        "companion".to_owned(),
+        Line::InferredRuling { escalation: "e1".into(), side: OutSide::Watcher, prompt_ref: "merge it myself".into() },
+    )];
+    let (esc, list) = (Escalations::rebuild(&fx.events()), fx.list());
+    let dropped = fx.rulings().infer(&fx.mb.log(), &lines, true, true, &entries, &esc, &list, now_ms()).unwrap();
+    assert!(dropped[0].contains("since it was raised"), "{dropped:?}");
+    assert!(fx.kind(Kind::Ruled).is_empty());
 }

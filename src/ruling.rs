@@ -135,27 +135,37 @@ impl Ruled {
     }
 }
 
-/// `ruling` event payload (V94): the Ruling message's life, and the human's undo.
+/// `ruling` event payload (V94): the Ruling message's life, and the human's undo. Each names
+/// its ruling as `ruled` (the item id) + `nth` (0 = the first ruling on that id), so a write
+/// racing a later ruling on the same item never lands on it.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "op", rename_all = "kebab-case")]
 pub enum Op {
-    /// Outbox item `id` holds the Ruling text for the ruling on `ruled`.
+    /// Outbox item `id` holds the Ruling text.
     Queued {
         id: String,
         ruled: String,
+        nth: usize,
     },
     Delivered {
         id: String,
         route: String,
+        ruled: String,
+        nth: usize,
     },
+    /// Never to be delivered; `id` = the outbox item, if one was queued.
     Dropped {
-        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        ruled: String,
+        nth: usize,
         why: String,
     },
-    /// `u` (V75): the last live ruling on `ruled` is undone. `delivered` = its Ruling reached the
-    /// Worker already and stays sent.
+    /// `u` (V75): the ruling is undone. `delivered` = its Ruling reached the Worker already and
+    /// stays sent.
     Undone {
         ruled: String,
+        nth: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         concern: Option<String>,
         via: Via,
@@ -199,6 +209,8 @@ pub fn text(challenge: &str, alternative: &str) -> String {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Ruling {
     pub ruled: Ruled,
+    /// Rulings on the same item before this one.
+    pub nth: usize,
     pub t: u64,
     pub undone: bool,
     /// Its Ruling message's outbox id, once queued.
@@ -278,8 +290,10 @@ impl Rulings {
         match event.k {
             Kind::Ruled => {
                 if let Some(ruled) = event.parse::<Ruled>() {
+                    let nth = self.all.iter().filter(|r| r.ruled.id == ruled.id).count();
                     let r = Ruling {
                         ruled,
+                        nth,
                         t,
                         undone: false,
                         item: None,
@@ -293,23 +307,23 @@ impl Rulings {
                 }
             }
             Kind::Ruling => match event.parse::<Op>() {
-                Some(Op::Queued { id, ruled }) => {
-                    if let Some(r) = self.last_live_mut(&ruled) {
+                Some(Op::Queued { id, ruled, nth }) => {
+                    if let Some(r) = self.at(&ruled, nth) {
                         r.item = Some(id);
                     }
                 }
-                Some(Op::Delivered { id, .. }) => {
-                    if let Some(r) = self.by_item(&id) {
+                Some(Op::Delivered { ruled, nth, .. }) => {
+                    if let Some(r) = self.at(&ruled, nth) {
                         r.delivered = true;
                     }
                 }
-                Some(Op::Dropped { id, .. }) => {
-                    if let Some(r) = self.by_item(&id) {
+                Some(Op::Dropped { ruled, nth, .. }) => {
+                    if let Some(r) = self.at(&ruled, nth) {
                         r.dropped = true;
                     }
                 }
-                Some(Op::Undone { ruled, .. }) => {
-                    if let Some(r) = self.last_live_mut(&ruled) {
+                Some(Op::Undone { ruled, nth, .. }) => {
+                    if let Some(r) = self.at(&ruled, nth) {
                         r.undone = true;
                     }
                 }
@@ -372,12 +386,8 @@ impl Rulings {
         }
     }
 
-    fn last_live_mut(&mut self, id: &str) -> Option<&mut Ruling> {
-        self.all.iter_mut().rev().find(|r| r.live() && r.ruled.id == id)
-    }
-
-    fn by_item(&mut self, item: &str) -> Option<&mut Ruling> {
-        self.all.iter_mut().rev().find(|r| r.item.as_deref() == Some(item))
+    fn at(&mut self, ruled: &str, nth: usize) -> Option<&mut Ruling> {
+        self.all.iter_mut().find(|r| r.ruled.id == ruled && r.nth == nth)
     }
 
     /// The live ruling on `id` (an Escalation or Challenge id).
@@ -463,27 +473,33 @@ impl Rulings {
                         self.apply(now, &e);
                     }
                 }
-                if r.ruled.ruling_sent && r.item.is_none() {
+                // Not when a human prompt went first (`drop_on_prompt` may come before the queue).
+                if r.ruled.ruling_sent && r.item.is_none() && !r.dropped {
                     let alternative =
                         list.get(&concern).and_then(|c| c.alternative.clone().or(Some(c.headline.clone())));
-                    let item =
-                        self.queue(log, outbox, &r.ruled.id, &challenge, alternative.as_deref().unwrap_or(""), now)?;
+                    let item = self.queue(log, outbox, &r, &challenge, alternative.as_deref().unwrap_or(""), now)?;
                     ticker.push(format!("Ruling {challenge} queued for the Worker's next idle ({item})"));
                 }
             } else {
                 if let Some(item) = r.item.clone().filter(|_| !r.delivered && !r.dropped) {
-                    match outbox.withdraw(&item, UNDONE, now)? {
-                        Withdraw::Withdrawn | Withdraw::AlreadyDropped | Withdraw::Missing => {
-                            self.commit(log, now, &Op::Dropped { id: item, why: UNDONE.to_owned() })?;
-                        }
-                        // Delivered: the sync below logs it; claimed: next loop.
-                        Withdraw::Acked | Withdraw::Claimed => {}
+                    // Delivered stays sent (the sync below logs it). A claim in flight: the gate
+                    // drops it from now on, and a later loop withdraws it.
+                    if outbox.withdraw(&item, UNDONE, now)? != Withdraw::Acked {
+                        let (ruled, nth) = (r.ruled.id.clone(), r.nth);
+                        let op = Op::Dropped { id: Some(item), ruled, nth, why: UNDONE.to_owned() };
+                        self.commit(log, now, &op)?;
                     }
                 }
-                // Back IN DEBATE only while the slot is free (V75).
-                if r.ruled.stage == Stage::Debate && !r.restored && !r.slot_lost && challenges.slot().is_none() {
+                // Back IN DEBATE only while the slot is free, or still held by this Debate when
+                // only its exchange 2 was lost to the ruling (V75).
+                let ours = debate.open().is_some_and(|o| o.challenge == challenge);
+                if r.ruled.stage == Stage::Debate
+                    && !r.restored
+                    && !r.slot_lost
+                    && (ours || challenges.slot().is_none())
+                {
                     let open = list.get(&concern).is_some_and(|c| c.state == State::Open);
-                    if let Some(e) = debate.reopen(log, &challenge)? {
+                    if let Some(e) = debate.reopen(log, outbox, &challenge)? {
                         fold(Some(e), debate, challenges, self);
                         ticker.push(format!("{concern} back in Debate"));
                     } else if open
@@ -511,19 +527,26 @@ impl Rulings {
                 }
             }
         }
-        // What the outbox did with each Ruling (V28): delivered, or dropped at a claim.
+        // What the outbox did with each Ruling (V28): delivered (even one dropped while a claim
+        // was in flight: it went out), or dropped at a claim. A dropped one still pending is
+        // withdrawn once no claim holds it.
         let delivered = outbox.delivered()?;
         let pending = outbox.pending()?;
-        let open_items: Vec<(String, bool)> = self
+        let items: Vec<(String, String, usize, bool)> = self
             .all
             .iter()
-            .filter_map(|r| r.item.clone().filter(|_| !r.delivered && !r.dropped).map(|i| (i, r.undone)))
+            .filter(|r| !r.delivered)
+            .filter_map(|r| Some((r.item.clone()?, r.ruled.id.clone(), r.nth, r.dropped)))
             .collect();
-        for (item, _) in open_items {
+        for (item, ruled, nth, dropped) in items {
             if let Some(d) = delivered.iter().find(|d| d.item.id == item) {
-                self.commit(log, now, &Op::Delivered { id: item, route: d.route.clone() })?;
+                self.commit(log, now, &Op::Delivered { id: item, route: d.route.clone(), ruled, nth })?;
             } else if !pending.iter().any(|p| p.id == item) {
-                self.commit(log, now, &Op::Dropped { id: item, why: "stale".to_owned() })?;
+                if !dropped {
+                    self.commit(log, now, &Op::Dropped { id: Some(item), ruled, nth, why: "stale".to_owned() })?;
+                }
+            } else if dropped {
+                let _ = outbox.withdraw(&item, "dropped", now)?;
             }
         }
         // An Escalation whose Concern stopped applying closes stale (V71).
@@ -548,24 +571,26 @@ impl Rulings {
         &mut self,
         log: &EventLog,
         outbox: &Outbox,
-        ruled: &str,
+        r: &Ruling,
         challenge: &str,
         alternative: &str,
         now: u64,
     ) -> io::Result<String> {
-        let mut n = 1;
-        let id = loop {
-            let id = if n == 1 { format!("{ITEM}{challenge}") } else { format!("{ITEM}{challenge}-{n}") };
-            match outbox.withdraw(&id, "orphan", now)? {
-                Withdraw::Acked | Withdraw::Claimed => n += 1,
-                Withdraw::Withdrawn | Withdraw::AlreadyDropped | Withdraw::Missing => break id,
+        // One id per ruling, never reused: no earlier ruling's state can gate it.
+        let id = format!("{ITEM}{}.{}", r.ruled.id, r.nth);
+        // Left by a crash before `queued` was logged: no claim delivers an unknown item.
+        match outbox.withdraw(&id, "orphan", now)? {
+            Withdraw::Acked | Withdraw::Claimed => {
+                return Err(io::Error::other(format!("{id} is being delivered outside its ruling")));
             }
-        };
+            Withdraw::Withdrawn | Withdraw::AlreadyDropped | Withdraw::Missing => {}
+        }
         let item = Item { id: id.clone(), kind: ItemKind::Ruling, text: text(challenge, alternative) };
         if !outbox.queue(item, now)? {
             return Err(io::Error::other(format!("outbox already holds {id}")));
         }
-        if let Err(e) = self.commit(log, now, &Op::Queued { id: id.clone(), ruled: ruled.to_owned() }) {
+        let op = Op::Queued { id: id.clone(), ruled: r.ruled.id.clone(), nth: r.nth };
+        if let Err(e) = self.commit(log, now, &op) {
             let _ = outbox.withdraw(&id, "unlogged", now);
             return Err(e);
         }
@@ -586,21 +611,27 @@ impl Rulings {
                 .iter()
                 .any(|e| e.t > after && e.items.iter().any(|i| matches!(i, TItem::Prompt(p) if !history::is_own(p))))
         };
-        let due: Vec<(String, String)> = self
+        // Queued or not yet: once dropped, it is never queued, and the gate stops any claim.
+        let due: Vec<Ruling> = self
             .all
             .iter()
-            .filter(|r| r.live() && !r.delivered && !r.dropped && prompted(r.t))
-            .filter_map(|r| Some((r.item.clone()?, r.ruled.challenge.clone().unwrap_or_default())))
+            .filter(|r| r.live() && r.ruled.ruling_sent && !r.delivered && !r.dropped && prompted(r.t))
+            .cloned()
             .collect();
         let mut ticker = Vec::new();
-        for (item, challenge) in due {
-            match outbox.withdraw(&item, PROMPTED_FIRST, now)? {
-                Withdraw::Withdrawn | Withdraw::AlreadyDropped | Withdraw::Missing => {
-                    self.commit(log, now, &Op::Dropped { id: item, why: PROMPTED_FIRST.to_owned() })?;
-                    ticker.push(format!("Ruling {challenge} not sent: your prompt went first"));
-                }
-                Withdraw::Acked | Withdraw::Claimed => {}
+        for r in due {
+            let op = Op::Dropped {
+                id: r.item.clone(),
+                ruled: r.ruled.id.clone(),
+                nth: r.nth,
+                why: PROMPTED_FIRST.to_owned(),
+            };
+            self.commit(log, now, &op)?;
+            if let Some(item) = &r.item {
+                // A claim in flight is withdrawn by `answer` once it lapses or is released.
+                let _ = outbox.withdraw(item, PROMPTED_FIRST, now)?;
             }
+            ticker.push(format!("Ruling {} not sent: your prompt went first", r.ruled.challenge.unwrap_or_default()));
         }
         Ok(ticker)
     }
@@ -622,11 +653,12 @@ impl Rulings {
         now: u64,
     ) -> io::Result<Vec<String>> {
         let mut dropped = Vec::new();
-        let prompts: Vec<String> = entries
+        // Human prompts with their arrival: only one after the Escalation answers it (V71).
+        let prompts: Vec<(u64, String)> = entries
             .iter()
-            .flat_map(|e| &e.items)
-            .filter_map(|i| match i {
-                TItem::Prompt(p) if !history::is_own(p) => Some(norm(p)),
+            .flat_map(|e| e.items.iter().map(move |i| (e.t, i)))
+            .filter_map(|(t, i)| match i {
+                TItem::Prompt(p) if !history::is_own(p) => Some((t, norm(p))),
                 _ => None,
             })
             .collect();
@@ -643,9 +675,9 @@ impl Rulings {
             } else if open.is_none() {
                 Some(format!("{escalation} is not waiting on a ruling"))
             } else if reference.chars().filter(|c| c.is_alphanumeric()).count() < PROMPT_REF_MIN
-                || !prompts.iter().any(|p| p.contains(&reference))
+                || !prompts.iter().any(|(t, p)| *t > self.raised(escalation).unwrap_or(0) && p.contains(&reference))
             {
-                Some(format!("prompt_ref for {escalation} is not in the human's prompt"))
+                Some(format!("prompt_ref for {escalation} is not in a human prompt since it was raised"))
             } else {
                 None
             };
@@ -841,7 +873,14 @@ impl Rulings {
             Some(item) => outbox.delivered().map_err(|e| e.to_string())?.iter().any(|d| d.item.id == *item),
             None => false,
         };
-        Ok(Op::Undone { ruled: r.ruled.id.clone(), concern: r.ruled.concern.clone(), via, surface, delivered })
+        Ok(Op::Undone {
+            ruled: r.ruled.id.clone(),
+            nth: r.nth,
+            concern: r.ruled.concern.clone(),
+            via,
+            surface,
+            delivered,
+        })
     }
 
     /// What `s` keeps (V77): the selected Concern if it was ruled or dismissed this session,
