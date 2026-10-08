@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, IsTerminal, Write};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::budget::{self, Budget, Stage};
@@ -11,12 +12,15 @@ use crate::challenge::{Challenges, Op as ChallengeOp, Origin};
 use crate::concern::{Change, ConcernList, Resolution, State, Tag};
 use crate::debate::{Debate, Op as DebateOp, Outcome as DebateOutcome, Second, Verdict};
 use crate::delivery::{self, Pending};
-use crate::escalation::{self, Escalations, Op as EscalationOp, Stage as EscalationStage};
+use crate::escalation::{self, Escalations, Op as EscalationOp};
 use crate::event::{Event, Kind};
 use crate::human::{self, Act};
 use crate::jsonl::Record;
 use crate::layout::{Frame, Input, Overlay, Ui, layout};
 use crate::mailbox::Mailbox;
+use crate::outbox::Outbox;
+use crate::ruling::{self, Cx, Op as RulingOp, Ruled, Rulings, Side, Stage as RulingStage, Surface, Via};
+use crate::standing;
 use crate::status::{Coverage, Op as StatusOp, Outcome, Wake, WatcherOp};
 use crate::term::{self, Key};
 
@@ -89,8 +93,8 @@ pub struct Board {
     pub focuses: Vec<String>,
     pub observe_only: bool,
     pub ended: bool,
-    /// Standing rulings loaded at start (V78; T14 logs the count).
-    pub rulings: usize,
+    /// Standing rulings held: loaded at start (V78; T14 logs the count) + kept since (V77).
+    pub rulings_held: usize,
     pub budget: Budget,
     pub concerns: ConcernList,
     pub challenges: Challenges,
@@ -99,8 +103,8 @@ pub struct Board {
     pub info: HashMap<String, Info>,
     /// When each Escalation was raised.
     pub raised: HashMap<String, u64>,
-    /// Escalations closed by a ruling, an answer, staleness or session end (T13 events).
-    pub closed_escalations: HashSet<String>,
+    /// Rulings, undos, and what closed each Escalation (V71–V75).
+    pub rulings: Rulings,
     /// Model per Watcher, with its notes.
     pub models: BTreeMap<String, (String, bool, bool)>,
     pub user_paused: bool,
@@ -134,7 +138,7 @@ impl Board {
             focuses: Vec::new(),
             observe_only: false,
             ended: false,
-            rulings: 0,
+            rulings_held: 0,
             budget: Budget::new(budget::RAISE_USD),
             concerns: ConcernList::default(),
             challenges: Challenges::default(),
@@ -142,7 +146,7 @@ impl Board {
             escalations: Escalations::default(),
             info: HashMap::new(),
             raised: HashMap::new(),
-            closed_escalations: HashSet::new(),
+            rulings: Rulings::default(),
             models: BTreeMap::new(),
             user_paused: false,
             lagging: BTreeMap::new(),
@@ -176,15 +180,26 @@ impl Board {
 
     /// The Escalations still waiting on the human (NEEDS YOU), oldest first.
     pub fn needs_you(&self) -> impl Iterator<Item = &escalation::Escalation> {
-        self.escalations
-            .all()
-            .iter()
-            .filter(|e| e.stage != EscalationStage::Dropped && !self.closed_escalations.contains(&e.id))
+        self.escalations.all().iter().filter(|e| self.rulings.is_open(e))
     }
 
-    /// The Concern holding the Challenge slot (IN DEBATE).
+    /// The open Concern holding the Challenge slot (IN DEBATE); a ruled one has left it (V73).
     pub fn in_debate(&self) -> Option<&str> {
-        self.challenges.slot().filter(|s| !s.stale || s.sent).map(|s| s.concern.as_str())
+        self.challenges
+            .slot()
+            .filter(|s| (!s.stale && !s.ruled) || s.sent)
+            .filter(|s| self.concerns.get(&s.concern).is_some_and(|c| c.state == State::Open))
+            .map(|s| s.concern.as_str())
+    }
+
+    /// The folds a ruling is checked against.
+    pub fn cx(&self) -> Cx<'_> {
+        Cx {
+            concerns: &self.concerns,
+            challenges: &self.challenges,
+            escalations: &self.escalations,
+            rulings: &self.rulings,
+        }
     }
 
     pub fn apply(&mut self, r: &Record<Event>) {
@@ -194,6 +209,7 @@ impl Board {
         self.challenges.apply(e);
         self.debate.apply(e);
         self.escalations.apply(e);
+        self.rulings.apply(t, e);
         match e.k {
             Kind::Session => self.session(t, e),
             Kind::Concern => self.concern(t, e),
@@ -206,16 +222,22 @@ impl Board {
             Kind::Challenge => self.challenge(t, e),
             Kind::Debate => self.debate_op(t, e),
             Kind::Escalation => self.escalation(t, e),
-            Kind::Ruled | Kind::Answered | Kind::ClosedStale | Kind::Unruled => {
-                if let Some(id) = e.str("id") {
-                    self.closed_escalations.insert(id.to_owned());
-                }
+            Kind::Ruled => self.ruled(t, e),
+            Kind::Ruling => self.ruling(t, e),
+            Kind::Answered => {
+                let id = e.str("id").unwrap_or_default();
+                self.tick(t, format!("{id} closed: you answered in the Worker"), Tone::Plain);
             }
+            Kind::ClosedStale => {
+                let (id, concern) = (e.str("id").unwrap_or_default(), e.str("concern").unwrap_or_default());
+                self.tick(t, format!("{id} closed: {concern} no longer applies"), Tone::Plain);
+            }
+            Kind::Unruled => {}
             Kind::Wake => self.wake(t, e),
             Kind::Status => self.status(t, e),
             Kind::Coverage => self.coverage(t, e),
             Kind::Watcher => self.watcher(t, e),
-            Kind::Ruling | Kind::Audit => {}
+            Kind::Audit => {}
         }
         let now = self.budget.stage();
         if now != stage {
@@ -263,6 +285,61 @@ impl Board {
         }
     }
 
+    fn ruled(&mut self, t: u64, e: &Event) {
+        let Some(r) = e.parse::<Ruled>() else { return };
+        let inferred = r.via == Via::Prompt;
+        let words = r.side.words();
+        if let Some(concern) = &r.concern {
+            let how = if inferred { " (inferred)" } else { "" };
+            let end = match r.stage {
+                RulingStage::Escalation => format!("escalated → ruled: {words}{how}"),
+                _ => format!("ruled: {words}{how}"),
+            };
+            self.end(concern, end);
+            let focus = self.focus_of(concern);
+            self.stream(t, focus.as_deref(), false, '⚖', format!("{} {words}{how}", r.id));
+        }
+        if r.stage == RulingStage::Debate {
+            self.entry(t, &r.id, "human ruled".to_owned(), words.to_owned());
+        }
+        let text = match (r.stage, inferred) {
+            (RulingStage::Blocked, _) => {
+                format!("{} dismissed (the Worker still waits on its question) · u undo", r.id)
+            }
+            (_, true) => format!("{} ruled by your prompt (inferred): {words} · u undo · s keep for this repo", r.id),
+            (_, false) => format!("{} {words} · u undo · s keep for this repo", r.id),
+        };
+        self.tick(t, text, Tone::Plain);
+    }
+
+    fn ruling(&mut self, t: u64, e: &Event) {
+        match e.parse::<RulingOp>() {
+            Some(RulingOp::Undone { ruled, concern, delivered, .. }) => {
+                if let Some(c) = &concern {
+                    self.info.entry(c.clone()).or_default().end = None;
+                }
+                let stage =
+                    self.rulings.all().iter().rev().find(|r| r.undone && r.ruled.id == ruled).map(|r| r.ruled.stage);
+                let back = match stage {
+                    Some(RulingStage::Debate) => "back IN DEBATE",
+                    _ => "back in NEEDS YOU",
+                };
+                let sent = if delivered { " (its Ruling was already delivered)" } else { "" };
+                if stage == Some(RulingStage::Debate) {
+                    self.entry(t, &ruled, "ruling undone".to_owned(), String::new());
+                }
+                self.tick(t, format!("{ruled} ruling undone: {back}{sent}"), Tone::Plain);
+            }
+            Some(RulingOp::Delivered { id, route }) => {
+                self.tick(t, format!("{id} delivered via {route}"), Tone::Plain);
+            }
+            Some(RulingOp::Dropped { why, .. }) if why == ruling::PROMPTED_FIRST => {
+                self.tick(t, "Ruling not sent: your prompt went first".to_owned(), Tone::Plain);
+            }
+            _ => {}
+        }
+    }
+
     fn session(&mut self, t: u64, e: &Event) {
         match e.str("phase") {
             Some("start") => {
@@ -270,7 +347,7 @@ impl Board {
                 self.swarm = e.str("mode") == Some("swarm");
                 self.focuses = strings(e.fields.get("focuses"));
                 self.observe_only = e.fields.get("observe_only").and_then(|v| v.as_bool()).unwrap_or(false);
-                self.rulings = e.fields.get("rulings").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                self.rulings_held = e.fields.get("rulings").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let ceiling = e.fields.get("ceiling_usd").and_then(|v| v.as_f64()).unwrap_or(budget::RAISE_USD);
                 self.budget = Budget::new(ceiling);
                 for note in strings(e.fields.get("notes")) {
@@ -326,7 +403,7 @@ impl Board {
                 self.end(&id, "dismissed".to_owned());
                 let focus = self.focus_of(&id);
                 self.stream(t, focus.as_deref(), false, '✗', format!("{id} dismissed by you (final)"));
-                self.tick(t, format!("{id} dismissed"), Tone::Plain);
+                self.tick(t, format!("{id} dismissed · s keep for this repo"), Tone::Plain);
             }
             Some(Act::Promote { id, remark }) => {
                 let focus = self.focus_of(&id);
@@ -346,6 +423,10 @@ impl Board {
             Some(Act::Nochallenge) => {
                 self.nochallenge = true;
                 self.tick(t, "no auto-Challenge (this session)".to_owned(), Tone::Plain);
+            }
+            Some(Act::RulingRemembered { id, ruling }) => {
+                self.rulings_held += 1;
+                self.tick(t, format!("{id} kept for this repo as Standing ruling {ruling}"), Tone::Plain);
             }
             None => {}
         }
@@ -402,6 +483,9 @@ impl Board {
             }
             DebateOp::Sent { challenge, route, .. } => {
                 self.entry(t, &challenge, "2/2 sent".to_owned(), format!("via {route}"));
+            }
+            DebateOp::Reopened { challenge } => {
+                self.entry(t, &challenge, "reopened".to_owned(), "owed again on the Worker's last answer".to_owned());
             }
             DebateOp::End { challenge, concern, outcome, escalated, withdrawn } => {
                 let words = |v: serde_json::Value| v.as_str().unwrap_or_default().replace('-', " ");
@@ -577,14 +661,9 @@ impl Board {
         }
         match c.tag {
             Some(Tag::UnresolvedQuiet) => Some("unresolved quiet".to_owned()),
-            Some(Tag::Escalated) => {
-                let mut ours = self.escalations.all().iter().filter(|e| e.concern.as_deref() == Some(id));
-                match ours.find(|e| self.needs_you().any(|n| n.id == e.id) || self.closed_escalations.contains(&e.id)) {
-                    Some(e) if self.closed_escalations.contains(&e.id) => Some("escalated → ruled".to_owned()),
-                    Some(_) => None,
-                    None => Some("escalated".to_owned()),
-                }
-            }
+            // Waiting in NEEDS YOU, else closed without a ruling (answered stale, never ruled).
+            Some(Tag::Escalated) if self.needs_you().any(|e| e.concern.as_deref() == Some(id)) => None,
+            Some(Tag::Escalated) => Some("escalated".to_owned()),
             _ => None,
         }
     }
@@ -634,10 +713,15 @@ pub enum Effect {
     Quit,
     /// Human facts to append to the session log (V43).
     Append(Vec<Event>),
+    /// `u`: undo the last ruling (V75); the runtime reads the outbox.
+    Undo,
+    /// `s`: keep a ruling or dismissal for this repo (V77): the selected row, else the last.
+    Keep(Option<String>),
 }
 
 /// One key on the Board (I17). Pure: `ui` changes, events are returned for the caller to log.
-pub fn key(b: &Board, ui: &mut Ui, frame: &Frame, k: Key) -> Effect {
+/// `now` stamps a ruling's `after_s`.
+pub fn key(b: &Board, ui: &mut Ui, frame: &Frame, k: Key, now: u64) -> Effect {
     ui.note = None;
     if let Some(input) = ui.input.as_mut() {
         match k {
@@ -685,12 +769,19 @@ pub fn key(b: &Board, ui: &mut Ui, frame: &Frame, k: Key) -> Effect {
             };
             ui.filter = next.cloned();
         }
+        // On NEEDS YOU or IN DEBATE `d` is a ruling (V72, V73); on OPEN, the final dismissal.
+        Key::Char('d') if selected.as_deref().is_some_and(|id| ruled_here(b, id)) => {
+            return rule(b, ui, selected.as_deref(), Side::Dismissed, now);
+        }
         Key::Char('d') => match concern {
             Some(c) if c.state == State::Open => return append(Act::Dismiss { id: c.id.clone() }),
             Some(c) => ui.note = Some(format!("{} is already {}", c.id, c.state.name())),
-            None if selected.is_some() => ui.note = Some("rulings on NEEDS YOU are not available yet".to_owned()),
             None => ui.note = Some("nothing selected".to_owned()),
         },
+        Key::Char('y') => return rule(b, ui, selected.as_deref(), Side::Watcher, now),
+        Key::Char('n') => return rule(b, ui, selected.as_deref(), Side::Worker, now),
+        Key::Char('u') => return Effect::Undo,
+        Key::Char('s') => return Effect::Keep(selected),
         Key::Char('P') => match concern {
             Some(c) if c.state == State::Open => ui.input = Some(Input { concern: c.id.clone(), text: String::new() }),
             Some(c) => ui.note = Some(format!("{} is {}: cannot be promoted", c.id, c.state.name())),
@@ -715,6 +806,41 @@ pub fn key(b: &Board, ui: &mut Ui, frame: &Frame, k: Key) -> Effect {
         _ => {}
     }
     Effect::None
+}
+
+/// A NEEDS YOU Escalation or the IN DEBATE Concern: where `y`/`n`/`d` rule.
+fn ruled_here(b: &Board, id: &str) -> bool {
+    b.needs_you().any(|e| e.id == id) || b.in_debate() == Some(id)
+}
+
+fn rule(b: &Board, ui: &mut Ui, selected: Option<&str>, side: Side, now: u64) -> Effect {
+    let Some(id) = selected.filter(|id| ruled_here(b, id)) else {
+        ui.note = Some("y / n / d rule on a NEEDS YOU or IN DEBATE item".to_owned());
+        return Effect::None;
+    };
+    match Rulings::rule(&b.cx(), id, side, Via::Key, Surface::Pane, now) {
+        Ok(r) => Effect::Append(vec![r.event()]),
+        Err(why) => {
+            ui.note = Some(why);
+            Effect::None
+        }
+    }
+}
+
+/// `u` / `/pw undo` / `pair-watcher undo` (V75): the `ruling undone` fact.
+pub fn undo(b: &Board, outbox: &Outbox, via: Via, surface: Surface) -> Result<Event, String> {
+    b.rulings.undo(outbox, via, surface).map(|op| op.event())
+}
+
+/// `s` / `/pw keep` / `pair-watcher keep` (V77): writes the Standing ruling to `store` (V78),
+/// returns the `human ruling-remembered` fact; refused at the cap.
+pub fn keep(b: &Board, store: &Path, selected: Option<&str>, now: u64) -> Result<Event, String> {
+    let keep = b.rulings.keep(&b.concerns, selected)?;
+    match standing::remember(store, &keep, &standing::date(now, b.tz)) {
+        Ok(Ok(ruling)) => Ok(Act::RulingRemembered { id: keep.concern, ruling }.event()),
+        Ok(Err(why)) => Err(format!("keep refused: {why}")),
+        Err(e) => Err(format!("keep failed: {e}")),
+    }
 }
 
 fn toggle(now: Overlay, to: Overlay) -> Overlay {
@@ -765,6 +891,7 @@ pub fn run(mailbox: &Mailbox) -> io::Result<()> {
         return Err(io::Error::other("the pane needs a terminal"));
     }
     let log = mailbox.log();
+    let store = standing::session_path(mailbox);
     let mut board = Board::new(term::local_offset());
     let mut ui = Ui::default();
     let mut offset = 0;
@@ -812,16 +939,27 @@ pub fn run(mailbox: &Mailbox) -> io::Result<()> {
         }
         for k in term::keys(TICK)? {
             let frame = layout(&board, &ui, w, h);
-            match key(&board, &mut ui, &frame, k) {
+            let now = crate::jsonl::now_ms();
+            let events = match key(&board, &mut ui, &frame, k, now) {
                 Effect::Quit => return Ok(()),
-                Effect::Append(events) => {
+                Effect::Append(events) => Ok(events),
+                Effect::Undo => undo(&board, &mailbox.outbox(), Via::Key, Surface::Pane).map(|e| vec![e]),
+                Effect::Keep(selected) => match &store {
+                    Some(store) => keep(&board, store, selected.as_deref(), now).map(|e| vec![e]),
+                    None => Err("keep: the session's repo is unknown".to_owned()),
+                },
+                Effect::None => Ok(vec![]),
+            };
+            match events {
+                Ok(events) if !events.is_empty() => {
                     for e in events {
                         log.append(e)?;
                     }
                     // The next key sees what this one wrote (`ZZ` = pause, then resume).
                     tail(&mut board, &mut offset)?;
                 }
-                Effect::None => {}
+                Ok(_) => {}
+                Err(why) => ui.note = Some(why),
             }
             if ui.note.is_some() {
                 note_at = Instant::now();

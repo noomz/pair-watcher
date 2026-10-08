@@ -277,6 +277,8 @@ pub struct Slot {
     pub sent: bool,
     /// Its Concern was updated, resolved or dismissed while it waited for delivery (V21).
     pub stale: bool,
+    /// The human ruled on it before delivery (V73): dropped like a stale one, unless undone (V75).
+    pub ruled: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -286,6 +288,9 @@ pub struct Challenges {
     count: HashMap<String, usize>,
     /// The human's `promote` requests not yet answered, oldest first: (Concern, remark) (V43).
     requests: Vec<(String, Option<String>)>,
+    /// The slot a `debate end` freed, until the next Challenge is queued: `debate reopened`
+    /// takes it back (V75).
+    freed: Option<Slot>,
 }
 
 impl Challenges {
@@ -315,7 +320,8 @@ impl Challenges {
             Kind::Challenge => match event.parse::<Op>() {
                 Some(Op::Queued { id, concern, origin, .. }) if self.slot.is_none() => {
                     *self.count.entry(concern.clone()).or_default() += 1;
-                    self.slot = Some(Slot { id, concern, origin, sent: false, stale: false });
+                    self.freed = None;
+                    self.slot = Some(Slot { id, concern, origin, sent: false, stale: false, ruled: false });
                 }
                 // Delivered: the Debate owns it now, whatever changed while it was claimed.
                 Some(Op::Sent { id, .. }) => {
@@ -337,8 +343,25 @@ impl Challenges {
                 _ => {}
             },
             Kind::Debate if event.str("op") == Some("end") => {
-                if let Some(id) = event.str("challenge") {
-                    self.free(id);
+                if let Some(id) = event.str("challenge")
+                    && self.slot.as_ref().is_some_and(|s| s.id == id)
+                {
+                    self.freed = self.slot.take();
+                }
+            }
+            Kind::Debate if event.str("op") == Some("reopened") => {
+                if self.slot.is_none() && self.freed.as_ref().map(|s| s.id.as_str()) == event.str("challenge") {
+                    self.slot = self.freed.take();
+                }
+            }
+            // A ruling before delivery drops the waiting Challenge; undone, it waits again.
+            Kind::Ruled | Kind::Ruling => {
+                let undone = event.k == Kind::Ruling && event.str("op") == Some("undone");
+                if (event.k == Kind::Ruled || undone)
+                    && let Some(s) =
+                        self.slot.as_mut().filter(|s| !s.sent && Some(s.concern.as_str()) == event.str("concern"))
+                {
+                    s.ruled = !undone;
                 }
             }
             _ => {}
@@ -491,7 +514,7 @@ impl Challenges {
     pub fn gate(&self, item: &Item) -> Gate {
         match &self.slot {
             _ if item.kind != ItemKind::Challenge => Gate::Deliver,
-            Some(s) if s.id == item.id && s.stale => Gate::Drop,
+            Some(s) if s.id == item.id && (s.stale || s.ruled) => Gate::Drop,
             Some(s) if s.id == item.id => Gate::Deliver,
             _ => Gate::Skip,
         }
@@ -502,7 +525,7 @@ impl Challenges {
     /// Returns the ticker line. An item delivered or under a live claim stays: its `sent` may be
     /// due and the Debate would own it; a later call settles it once the lease runs out.
     pub fn drop_stale(&mut self, log: &EventLog, outbox: &Outbox, now: u64) -> io::Result<Option<String>> {
-        let Some(Slot { id, concern, .. }) = self.slot.clone().filter(|s| s.stale && !s.sent) else {
+        let Some(Slot { id, concern, .. }) = self.slot.clone().filter(|s| (s.stale || s.ruled) && !s.sent) else {
             return Ok(None);
         };
         match outbox.withdraw(&id, "stale", now)? {

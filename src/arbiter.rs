@@ -155,6 +155,7 @@ fn own<'l>(list: &'l ConcernList, w: &Watcher, id: &str, touched: &HashSet<&str>
     }
     match c.state {
         State::Dismissed => Err(format!("{id}: dismissed, never reopens")),
+        State::Ruled => Err(format!("{id}: the human ruled on it")),
         State::Resolved => Err(format!("{id}: already resolved")),
         State::Open if touched.contains(id) => Err(format!("{id}: already changed this wake")),
         State::Open => Ok(c),
@@ -193,6 +194,7 @@ fn added(list: &ConcernList, pending: &[Candidate], w: &Watcher, line: &Line) ->
         match c.state {
             State::Open => return Err(format!("repeat of {}", c.id)),
             State::Dismissed => return Err(format!("repeat of dismissed {}", c.id)),
+            State::Ruled => return Err(format!("repeat of {}, which the human ruled on", c.id)),
             State::Resolved if same => return Err(format!("re-raise of {} without new evidence", c.id)),
             State::Resolved => {}
         }

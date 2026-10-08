@@ -364,7 +364,7 @@ fn debate_log_shows_last_two_until_enter() {
     assert!(text.contains("earlier [enter]"), "{text}");
     assert!(!text.contains("Challenge queued"), "{text}");
     let mut ui = Ui::default();
-    assert_eq!(pane::key(&b2, &mut ui, &f, Key::Enter), Effect::None);
+    assert_eq!(pane::key(&b2, &mut ui, &f, Key::Enter, 0), Effect::None);
     let text = texts(&layout(&b2, &ui, 96, 40));
     assert!(text.contains("Challenge queued") && !text.contains("earlier [enter]"), "{text}");
     // Ended: the Concern left IN DEBATE.
@@ -493,7 +493,7 @@ fn keys_write_human_facts_only() {
     let press = |b: &Board, ui: &mut Ui, k: Key| {
         let f = layout(b, ui, 64, 30);
         ui.selected = f.selected.clone();
-        pane::key(b, ui, &f, k)
+        pane::key(b, ui, &f, k, 0)
     };
     // Selection starts at IN DEBATE c2, then OPEN c1.
     assert_eq!(press(&b, &mut ui, Key::Char('j')), Effect::None);

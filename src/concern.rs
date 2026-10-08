@@ -1,7 +1,7 @@
 //! Concerns (I10) and their one lifecycle (V13, V18). The list is a fold over the session event
-//! log (V93): the arbiter writes `concern` changes, the human writes `human dismiss`, the Debate
-//! engine writes `debate end` (V35); anything that reads the log (pane, restart) rebuilds the same
-//! list.
+//! log (V93): the arbiter writes `concern` changes, the human writes `human dismiss`, `ruled` and
+//! `ruling undone` (V43, V75), the Debate engine writes `debate end` (V35); anything that reads the
+//! log (pane, restart) rebuilds the same list.
 
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +21,8 @@ pub enum State {
     Open,
     Dismissed,
     Resolved,
+    /// The human ruled on it (V71, V73): closed for good, unless the ruling is undone (V75).
+    Ruled,
 }
 
 /// How a Debate left its Concern open (V35).
@@ -196,6 +198,17 @@ impl ConcernList {
                     self.close(id, State::Dismissed);
                 }
             }
+            // A ruling closes its Concern; undoing it reopens the Concern (V75).
+            Kind::Ruled => {
+                if let Some(id) = event.str("concern") {
+                    self.close(id, State::Ruled);
+                }
+            }
+            Kind::Ruling if event.str("op") == Some("undone") => {
+                if let Some(c) = event.str("concern").and_then(|id| self.find(id)).filter(|c| c.state == State::Ruled) {
+                    c.state = State::Open;
+                }
+            }
             Kind::Debate if event.str("op") == Some("end") => {
                 let Some(id) = event.str("concern") else { return };
                 let escalated = event.fields.get("escalated").and_then(serde_json::Value::as_bool);
@@ -222,7 +235,8 @@ impl ConcernList {
         self.concerns.iter_mut().find(|c| c.id == id)
     }
 
-    /// Only an open Concern closes; a closed one never changes state again.
+    /// Only an open Concern closes; a closed one never changes state again, except a ruled one
+    /// whose ruling is undone (V75).
     fn close(&mut self, id: &str, state: State) {
         if let Some(c) = self.find(id).filter(|c| c.state == State::Open) {
             c.state = state;
@@ -255,6 +269,7 @@ impl State {
             State::Open => "open",
             State::Dismissed => "dismissed",
             State::Resolved => "resolved",
+            State::Ruled => "ruled",
         }
     }
 }

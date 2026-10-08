@@ -53,6 +53,9 @@ pub struct Context<'a> {
     /// Oldest first, all Focuses (V44).
     pub concerns: &'a [Concern],
     pub debate: Option<&'a str>,
+    /// Escalations awaiting the human's ruling (`Rulings::awaiting`): turn-end wakes show them
+    /// with the open Debate, so a Watcher can infer a ruling from the human's prompt (V71).
+    pub awaiting: Option<&'a str>,
     /// Standing rulings as rendered by their store; never trimmed (V7, V78).
     pub rulings: &'a str,
     pub instructions: &'a [String],
@@ -121,7 +124,7 @@ pub fn normal(
         ("Task", task_section(&next, ctx.instructions), TASK_CAP),
         ("Standing rulings", ctx.rulings.trim().to_owned(), RULINGS_CAP),
         ("Concerns", concern_section(ctx.concerns, false), CONCERNS_CAP),
-        ("Open Debate", ctx.debate.map(|d| clip::middle(d.trim(), DEBATE_CAP)).unwrap_or_default(), DEBATE_CAP),
+        ("Open Debate", clip::middle(debate_section(trigger, ctx).trim(), DEBATE_CAP), DEBATE_CAP),
         ("History", history_section(history, &next), DIGEST_CAP),
         ("Diff", diff_body, DIFF_CAP + STAT_CAP),
     ];
@@ -134,6 +137,12 @@ pub fn normal(
     sections.push(Section { title: "Turn", body: turn });
     sections.extend(diff_part.into_iter().map(|(title, body, _)| Section { title, body }));
     (Input { sections, diff_bytes }, next)
+}
+
+/// The open Debate, then (turn end only) the Escalations awaiting a ruling (V7 Open Debate cap).
+fn debate_section(trigger: Trigger, ctx: &Context) -> String {
+    let awaiting = ctx.awaiting.filter(|_| trigger == Trigger::TurnEnd);
+    [ctx.debate, awaiting].into_iter().flatten().map(str::trim).collect::<Vec<_>>().join("\n\n")
 }
 
 /// Slim blocked wake: question + task + rulings + open Concerns + digest; no turn content, no
@@ -244,7 +253,8 @@ fn concern_section(concerns: &[Concern], open_only: bool) -> String {
     }
     let mut lines: Vec<Option<String>> = list.iter().map(|c| Some(concern_line(c, true))).collect();
     let size = |lines: &[Option<String>]| lines.iter().flatten().map(|l| l.len() + 1).sum::<usize>();
-    let steps: [(State, bool); 3] = [(State::Resolved, false), (State::Open, true), (State::Dismissed, false)];
+    let steps: [(State, bool); 4] =
+        [(State::Resolved, false), (State::Open, true), (State::Dismissed, false), (State::Ruled, false)];
     for (state, collapse) in steps {
         for (i, c) in list.iter().enumerate() {
             if size(&lines) <= CONCERNS_CAP {

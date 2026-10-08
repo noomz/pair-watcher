@@ -9,6 +9,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::budget::Stage;
 use crate::concern::{Concern, Severity, State, Tag};
+use crate::escalation::Cause;
 use crate::pane::{Board, Entry, Tone, hhmm, money};
 
 /// Width of the Debate log's event column (V63 fixed columns).
@@ -274,8 +275,8 @@ fn header(b: &Board, ui: &Ui, width: usize) -> Vec<Line> {
     if let Some(m) = &b.fallback {
         rest.push(format!("fallback {m} (primary failing)"));
     }
-    if b.rulings > 0 {
-        rest.push(format!("rulings {}", b.rulings));
+    if b.rulings_held > 0 {
+        rest.push(format!("rulings {}", b.rulings_held));
     }
     if b.lost_ms >= 60_000 {
         rest.push(format!("lost {}m", b.lost_ms / 60_000));
@@ -349,7 +350,10 @@ fn board(b: &Board, ui: &Ui, selected: Option<&str>, width: usize, compact: bool
     let needs: Vec<_> = b.needs_you().collect();
     if !needs.is_empty() {
         // The header goes before any item does (V65).
-        out.push(row(section("NEEDS YOU", needs.len(), "+", width), 1));
+        // `y`/`n` rule an unresolved Debate only; a blocked one is answered in the Worker (V72).
+        let unresolved = needs.iter().any(|e| e.cause == Cause::Unresolved);
+        let hints = if unresolved { "y · n · d · u · +" } else { "d · u · +" };
+        out.push(row(section("NEEDS YOU", needs.len(), hints, width), 1));
         for e in needs {
             let at = b.raised.get(&e.id).map(|t| b.time(*t)).unwrap_or_default();
             if compact {
@@ -381,7 +385,7 @@ fn board(b: &Board, ui: &Ui, selected: Option<&str>, width: usize, compact: bool
 
     let debate: Vec<&Concern> = debating(b, ui).collect();
     if !debate.is_empty() {
-        out.push(row(section("IN DEBATE", debate.len(), "⏎ log · d · +", width), 1));
+        out.push(row(section("IN DEBATE", debate.len(), "y · n · d · ⏎ log · +", width), 1));
         for c in debate {
             out.extend(concern_row(b, c, sel(&c.id), width, 0, compact));
             let entries = b.info.get(&c.id).map(|i| i.entries.as_slice()).unwrap_or_default();
@@ -424,7 +428,7 @@ fn board(b: &Board, ui: &Ui, selected: Option<&str>, width: usize, compact: bool
 
     let closed = closed(b, ui);
     if !closed.is_empty() {
-        out.push(row(section("CLOSED", closed.len(), "c", width), 4));
+        out.push(row(section("CLOSED", closed.len(), "c · s", width), 4));
         if ui.closed {
             for (c, end) in closed {
                 let selected = sel(&c.id);
@@ -621,10 +625,14 @@ fn stream(b: &Board, ui: &Ui, width: usize, rows: usize) -> Vec<Row> {
         .collect()
 }
 
-const KEYS: [(&str, &str); 14] = [
+const KEYS: [(&str, &str); 18] = [
     ("j k ↑ ↓", "select"),
     ("⏎", "expand / collapse the Debate log"),
-    ("d", "dismiss the Concern (final)"),
+    ("y", "NEEDS YOU / IN DEBATE: side with the Watcher (it tells the Worker)"),
+    ("n", "NEEDS YOU / IN DEBATE: side with the Worker"),
+    ("d", "dismiss: the Concern (final), or a NEEDS YOU / IN DEBATE item"),
+    ("u", "undo the last ruling"),
+    ("s", "keep the last ruling or dismissal (or the selected CLOSED row) for this repo"),
     ("P", "promote to a Challenge, with a remark"),
     ("+", "mark helpful"),
     ("f", "Focus filter"),

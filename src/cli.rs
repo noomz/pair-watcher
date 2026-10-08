@@ -12,8 +12,9 @@ use crate::jsonl::now_ms;
 use crate::mailbox::Mailbox;
 use crate::outbox::Claim;
 use crate::problem::{Problem, tilde};
+use crate::ruling::{self, Rulings, Surface, Via};
 use crate::status::Op as StatusOp;
-use crate::{config, hook, mailbox, models, pane, repo, run, supervisor};
+use crate::{config, hook, mailbox, models, pane, repo, run, standing, supervisor};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -262,10 +263,11 @@ pub enum PrefilterAction {
 }
 
 pub fn main() -> ExitCode {
-    dispatch(Cli::parse().command)
+    dispatch(Cli::parse().command, Via::Cli)
 }
 
-fn dispatch(command: Command) -> ExitCode {
+/// `via` = how a session command reached us: the terminal (`cli`) or the mod's `/pw` (`command`).
+fn dispatch(command: Command, via: Via) -> ExitCode {
     match command {
         Command::Hook { event, rest } if event == ADAPTER => adapter(&rest),
         // Hooks never fail the Worker (V58).
@@ -285,7 +287,9 @@ fn dispatch(command: Command) -> ExitCode {
             m.log().append(Act::Nochallenge.event()).map(|()| "no auto-Challenge".to_owned())
         }),
         Command::Pause(session) => session_fact(&session, pause),
-        Command::Rule { .. } | Command::Undo(_) | Command::Keep(_) => later("T13"),
+        Command::Rule { id, side, session } => session_fact(&session, |m| rule(m, &id, side, via)),
+        Command::Undo(session) => session_fact(&session, |m| undo(m, via)),
+        Command::Keep(session) => session_fact(&session, keep),
         Command::Rulings { .. } => later("T14"),
         Command::Install { .. } | Command::Uninstall { .. } | Command::Auth | Command::Doctor => later("T16"),
         Command::Models { action } => models_cmd(action),
@@ -409,7 +413,7 @@ fn adapter(args: &[String]) -> ExitCode {
             }
             let argv = std::iter::once("pair-watcher".to_owned()).chain(args).chain(["--session".to_owned(), session]);
             return match Cli::try_parse_from(argv) {
-                Ok(cli) => dispatch(cli.command),
+                Ok(cli) => dispatch(cli.command, Via::Command),
                 Err(e) => fail(e.to_string().lines().next().unwrap_or("bad /pw command")),
             };
         }
@@ -460,6 +464,49 @@ fn mute(m: &Mailbox, focus: &str) -> std::io::Result<String> {
     }
     m.log().append(Act::Mute { focus: focus.to_owned() }.event())?;
     Ok(format!("muted {focus}"))
+}
+
+fn surface(via: Via) -> Surface {
+    if via == Via::Command { Surface::Mod } else { Surface::Cli }
+}
+
+fn board(m: &Mailbox) -> std::io::Result<pane::Board> {
+    Ok(pane::Board::rebuild(crate::term::local_offset(), &m.log().read_from(0)?.records))
+}
+
+/// `rule <id> watcher|worker|dismiss` (V71–V73): the `ruled` fact.
+fn rule(m: &Mailbox, id: &str, side: Side, via: Via) -> std::io::Result<String> {
+    let b = board(m)?;
+    let side = match side {
+        Side::Watcher => ruling::Side::Watcher,
+        Side::Worker => ruling::Side::Worker,
+        Side::Dismiss => ruling::Side::Dismissed,
+    };
+    let ruled = Rulings::rule(&b.cx(), id, side, via, surface(via), now_ms()).map_err(std::io::Error::other)?;
+    m.log().append(ruled.event())?;
+    let sent = if ruled.ruling_sent { "; the Worker is told at its next idle" } else { "" };
+    Ok(format!("{} {}{sent}", ruled.id, side.words()))
+}
+
+/// `undo` (V75): the last ruling of any origin.
+fn undo(m: &Mailbox, via: Via) -> std::io::Result<String> {
+    let event = pane::undo(&board(m)?, &m.outbox(), via, surface(via)).map_err(std::io::Error::other)?;
+    let ruled = event.str("ruled").unwrap_or_default().to_owned();
+    m.log().append(event)?;
+    Ok(format!("ruling on {ruled} undone"))
+}
+
+/// `keep` (V77): the last ruling or dismissal as a Standing ruling for this repo.
+fn keep(m: &Mailbox) -> std::io::Result<String> {
+    let b = board(m)?;
+    // Nothing to keep says so before a missing store does.
+    b.rulings.keep(&b.concerns, None).map_err(std::io::Error::other)?;
+    let store = standing::session_path(m).ok_or_else(|| std::io::Error::other("the session's repo is unknown"))?;
+    let event = pane::keep(&b, &store, None, now_ms()).map_err(std::io::Error::other)?;
+    let (id, ruling) =
+        (event.str("id").unwrap_or_default().to_owned(), event.str("ruling").unwrap_or_default().to_owned());
+    m.log().append(event)?;
+    Ok(format!("{id} kept for this repo as Standing ruling {ruling}"))
 }
 
 /// `pause` pauses a running Watcher and resumes a paused one (V70).

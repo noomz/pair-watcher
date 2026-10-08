@@ -24,6 +24,7 @@ use crate::event::{Event, EventLog, Kind};
 use crate::history;
 use crate::outbox::{Gate, Item, ItemKind, Outbox, Withdraw};
 use crate::output::{Decision, Line};
+use crate::ruling::{Op as RulingOp, Ruled, Side};
 use crate::tailer::{Entry, Item as TItem};
 
 /// Exchange 2's outbox id is the Challenge id plus this.
@@ -147,6 +148,9 @@ pub enum Op {
     Queued { challenge: String, item: String, second: Second },
     /// Exchange 2 delivered by `route`.
     Sent { challenge: String, item: String, route: String },
+    /// The human undid the ruling that ended it, while the Challenge slot was free (V75): owed
+    /// again on the Worker's last answer.
+    Reopened { challenge: String },
     /// Frees the Challenge slot (V19). `escalated` on `unresolved` (V36); `withdrawn` says why.
     End {
         challenge: String,
@@ -230,6 +234,8 @@ pub struct Open {
     pub partial: String,
     /// One line per step, for the wake input.
     pub log: Vec<String>,
+    /// The Worker's last answer: exchange and verdict. A reopened Debate is owed on it (V75).
+    pub last: Option<(u8, Verdict)>,
 }
 
 impl Open {
@@ -258,12 +264,29 @@ pub struct Debate {
     /// Concerns closed for good, with what that means for a Debate on them (V100).
     closed: HashMap<String, Closed>,
     ended: HashSet<String>,
+    /// The Debate a ruling ended, until another Challenge is queued: `u` may reopen it (V75).
+    ruled_end: Option<Open>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Closed {
     Fixed,
     Withdrawn(Withdrawal),
+    /// The human ruled (V73); undone, it is no longer closed (V75).
+    Ruled(Side),
+}
+
+impl Closed {
+    /// How a Debate on a Concern closed this way ends (V35, V73, V100).
+    fn outcome(self) -> (Outcome, Option<Withdrawal>) {
+        match self {
+            Closed::Fixed => (Outcome::WorkerConcedes, None),
+            Closed::Withdrawn(w) => (Outcome::Withdrawn, Some(w)),
+            Closed::Ruled(Side::Watcher) => (Outcome::SidedWatcher, None),
+            Closed::Ruled(Side::Worker) => (Outcome::SidedWorker, None),
+            Closed::Ruled(Side::Dismissed) => (Outcome::Withdrawn, Some(Withdrawal::Dismissed)),
+        }
+    }
 }
 
 impl Debate {
@@ -297,6 +320,8 @@ impl Debate {
         match event.k {
             Kind::Challenge => match event.parse::<ChallengeOp>() {
                 Some(ChallengeOp::Queued { id, concern, focus, .. }) => {
+                    // The slot moved on: a ruled Debate can no longer come back.
+                    self.ruled_end = None;
                     self.queued.insert(id, (concern, focus));
                 }
                 Some(ChallengeOp::Sent { id, route }) if self.open.is_none() && !self.ended.contains(&id) => {
@@ -316,6 +341,7 @@ impl Debate {
                             seen: HashSet::new(),
                             partial: String::new(),
                             log,
+                            last: None,
                         });
                     }
                 }
@@ -339,6 +365,18 @@ impl Debate {
                     self.closed.entry(id.to_owned()).or_insert(Closed::Withdrawn(Withdrawal::Dismissed));
                 }
             }
+            Kind::Ruled => {
+                if let Some(Ruled { concern: Some(concern), side, .. }) = event.parse::<Ruled>() {
+                    self.closed.entry(concern).or_insert(Closed::Ruled(side));
+                }
+            }
+            Kind::Ruling => {
+                if let Some(RulingOp::Undone { concern: Some(concern), .. }) = event.parse::<RulingOp>()
+                    && matches!(self.closed.get(&concern), Some(Closed::Ruled(_)))
+                {
+                    self.closed.remove(&concern);
+                }
+            }
             Kind::Debate => {
                 if let Some(op) = event.parse::<Op>() {
                     self.apply_op(op);
@@ -352,6 +390,10 @@ impl Debate {
         if let Op::End { challenge, .. } = &op {
             self.ended.insert(challenge.clone());
         }
+        if let Op::Reopened { challenge } = &op {
+            self.reopen_from_ruling(challenge);
+            return;
+        }
         let Some(o) = self.open.as_mut() else { return };
         let ours = |c: &str| c == o.challenge;
         match op {
@@ -363,6 +405,7 @@ impl Debate {
                 });
                 // An answer came after all: adjudicated.
                 (o.n, o.phase, o.human, o.preempted) = (n, Phase::Owed(verdict), false, false);
+                o.last = Some((n, verdict));
                 if reason.is_some() {
                     o.reason = reason;
                 }
@@ -402,7 +445,11 @@ impl Debate {
                 o.log.push("   Exchange 2 sent.".to_owned());
                 (o.phase, o.stop_turn) = (Phase::Awaiting, route == STOP);
             }
-            Op::End { challenge, .. } if ours(&challenge) => self.open = None,
+            Op::End { challenge, concern, .. } if ours(&challenge) => {
+                let ruled = matches!(self.closed.get(&concern), Some(Closed::Ruled(_)));
+                let open = self.open.take();
+                self.ruled_end = if ruled { open } else { None };
+            }
             _ => {}
         }
     }
@@ -551,10 +598,7 @@ impl Debate {
 
         if let Some(closed) = self.closed.get(&open.concern).copied() {
             step.dropped.extend(mine.map(|(w, ..)| format!("{w}: {} closed", open.concern)));
-            let (outcome, why) = match closed {
-                Closed::Fixed => (Outcome::WorkerConcedes, None),
-                Closed::Withdrawn(w) => (Outcome::Withdrawn, Some(w)),
-            };
+            let (outcome, why) = closed.outcome();
             self.conclude(&cx, outcome, why, &mut step)?;
             return Ok(step);
         }
@@ -654,6 +698,51 @@ impl Debate {
         self.end(cx.log, cx.outbox, outcome, escalated, why, cx.now)?;
         step.ended = Some(outcome);
         Ok(())
+    }
+
+    /// The human ruled on the open Debate's Concern: it ends at once, sided or withdrawn, and a
+    /// queued exchange 2 is withdrawn (V73). Returns the `end` event written.
+    pub fn end_ruled(&mut self, log: &EventLog, outbox: &Outbox, now: u64) -> io::Result<Option<Event>> {
+        let Some(open) = self.open.as_ref() else { return Ok(None) };
+        let Some(closed @ Closed::Ruled(_)) = self.closed.get(&open.concern).copied() else { return Ok(None) };
+        let (outcome, why) = closed.outcome();
+        self.end(log, outbox, outcome, None, why, now).map(Some)
+    }
+
+    /// `u` undid the ruling that ended `challenge`'s Debate (V75): reopens it, unless another
+    /// Challenge was queued since or a Debate is open. Returns the `reopened` event written.
+    pub fn reopen(&mut self, log: &EventLog, challenge: &str) -> io::Result<Option<Event>> {
+        let due = self.open.is_none()
+            && self
+                .ruled_end
+                .as_ref()
+                .is_some_and(|o| o.challenge == challenge && !self.closed.contains_key(&o.concern));
+        if !due {
+            return Ok(None);
+        }
+        let event = Op::Reopened { challenge: challenge.to_owned() }.event();
+        log.append(event.clone())?;
+        self.apply(&event);
+        Ok(Some(event))
+    }
+
+    /// Restores the Debate a ruling ended, owed again on the Worker's last answer: a logged move
+    /// or a queued exchange 2 was cancelled with the ruling, so the owner decides again.
+    fn reopen_from_ruling(&mut self, challenge: &str) {
+        if self.open.is_some() {
+            return;
+        }
+        let Some(mut o) = self.ruled_end.take().filter(|o| o.challenge == challenge) else { return };
+        if matches!(o.phase, Phase::Queued(_) | Phase::Decided(..)) {
+            (o.n, o.phase) = match o.last {
+                Some((n, v)) => (n, Phase::Owed(v)),
+                None => (o.n, Phase::Awaiting),
+            };
+        }
+        o.absent = 0;
+        o.log.push("   Ruling undone: the Debate resumes.".to_owned());
+        self.ended.remove(challenge);
+        self.open = Some(o);
     }
 
     /// Ends the open Debate without a ruling on it: budget (V35, V48) or session end.
@@ -757,14 +846,15 @@ impl Debate {
         escalated: Option<bool>,
         withdrawn: Option<Withdrawal>,
         now: u64,
-    ) -> io::Result<()> {
-        let Some(open) = self.open.clone() else { return Ok(()) };
+    ) -> io::Result<Event> {
+        let open = self.open.clone().expect("end runs on an open Debate");
         let item = format!("{}{SECOND}", open.challenge);
-        self.commit(log, &Op::End { challenge: open.challenge, concern: open.concern, outcome, escalated, withdrawn })?;
+        let op = Op::End { challenge: open.challenge, concern: open.concern, outcome, escalated, withdrawn };
+        self.commit(log, &op)?;
         // Best effort, whatever the phase (a logged move may sit over a queued item): the end
         // stands, and the gate drops what this misses.
         let _ = outbox.withdraw(&item, "debate ended", now);
-        Ok(())
+        Ok(op.event())
     }
 
     fn commit(&mut self, log: &EventLog, op: &Op) -> io::Result<()> {

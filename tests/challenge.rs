@@ -574,7 +574,14 @@ fn delivered_is_never_stale() {
     f.log(&mut list, &mut ch, challenge::Op::Sent { id: "c1".into(), route: "claude-stop".into() }.event());
     assert_eq!(
         ch.slot(),
-        Some(&Slot { id: "c1".into(), concern: "c1".into(), origin: Origin::Auto, sent: true, stale: false })
+        Some(&Slot {
+            id: "c1".into(),
+            concern: "c1".into(),
+            origin: Origin::Auto,
+            sent: true,
+            stale: false,
+            ruled: false
+        })
     );
     assert_eq!(ch.drop_stale(&f.log, &f.outbox, 5).unwrap(), None);
     assert_eq!(f.pick(&ch, &list), None);

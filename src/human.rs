@@ -24,6 +24,8 @@ pub enum Act {
     Mute { focus: String },
     /// `a`: no auto-Challenges for the session (V23).
     Nochallenge,
+    /// `s` (V77): the ruling or dismissal on Concern `id` kept as Standing ruling `ruling` (V78).
+    RulingRemembered { id: String, ruling: String },
 }
 
 impl Act {

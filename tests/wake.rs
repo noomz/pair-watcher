@@ -45,7 +45,7 @@ fn ctx<'a>(
     rulings: &'a str,
     instructions: &'a [String],
 ) -> Context<'a> {
-    Context { concerns, debate, rulings, instructions }
+    Context { concerns, debate, awaiting: None, rulings, instructions }
 }
 
 fn entry(items: Vec<Item>) -> Entry {

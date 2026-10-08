@@ -68,6 +68,11 @@ impl Home {
         self.root.join("credentials")
     }
 
+    /// Per-repo files: overrides, Standing rulings (I2).
+    pub fn repos_dir(&self) -> PathBuf {
+        self.root.join("repos")
+    }
+
     /// User per-repo overrides + tool-written `[approved_focus]`.
     pub fn repo_config(&self, root_commit: &str) -> PathBuf {
         self.root.join("repos").join(format!("{root_commit}.toml"))

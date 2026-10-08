@@ -1,13 +1,13 @@
 ● watching $1.15/$5 · gpt-6.1-sol · Companion
   wakes ·■■·· · last 11:40 silent
-IN DEBATE 1 ────────────────────────────────────── ⏎ log · d · +
+IN DEBATE 1 ────────────────────────────── y · n · d · ⏎ log · +
 › c2 warn [approach] 5th review round, 0 new findings since
     round 1; edits are cosmetic
   11:00 Challenge queued  approach-level · evidence ✓
   11:40 pending           human draft in prompt (2nd wait)
 OPEN 1 ─────────────────────────────────────────── d · P · + · m
   c1 note [correctness] Retry loop swallows the timeout error
-CLOSED 1 ───────────────────────────────────────────────────── c
+CLOSED 1 ───────────────────────────────────────────────── c · s
 
 
 
@@ -21,4 +21,4 @@ CLOSED 1 ───────────────────────�
 
 
 ────────────────────────────────────────────────────────────────
-11:12 c3 dismissed
+11:12 c3 dismissed · s keep for this repo

@@ -21,7 +21,8 @@ use crate::event::{Event, Kind};
 use crate::harness::Harness;
 use crate::jsonl::Record;
 use crate::mailbox::{Hook, Mailbox};
-use crate::outbox::{Claim, Gate, Item};
+use crate::outbox::{Claim, Gate, Item, ItemKind};
+use crate::ruling::Rulings;
 use crate::trigger::{self, Signal};
 
 /// Held reason a deliverer records while the human has a draft in the prompt box (V26).
@@ -65,11 +66,13 @@ pub struct View {
     pub challenges: Challenges,
     pub debate: Debate,
     pub concerns: ConcernList,
+    pub rulings: Rulings,
 }
 
 impl View {
     pub fn read(mailbox: &Mailbox) -> io::Result<View> {
-        let events: Vec<Event> = mailbox.log().read_from(0)?.records.into_iter().map(|r| r.body).collect();
+        let records = mailbox.log().read_from(0)?.records;
+        let events: Vec<Event> = records.iter().map(|r| r.body.clone()).collect();
         let start = events.iter().find(|e| e.k == Kind::Session && e.str("phase") == Some("start"));
         Ok(View {
             harness: start.and_then(|e| e.str("harness")).and_then(|h| Harness::from_program(OsStr::new(h))),
@@ -77,12 +80,17 @@ impl View {
             challenges: Challenges::rebuild(&events),
             debate: Debate::rebuild(&events),
             concerns: ConcernList::rebuild(&events),
+            rulings: Rulings::rebuild(&records),
         })
     }
 
-    /// The outbox claim's gate: the Debate's exchange 2, else the Challenge slot (V19, V21, V37).
+    /// The outbox claim's gate: a Ruling while its ruling stands (V74, V75); the Debate's
+    /// exchange 2, else the Challenge slot (V19, V21, V37).
     pub fn gate(&self, item: &Item) -> Gate {
-        self.debate.gate(item).unwrap_or_else(|| self.challenges.gate(item))
+        match item.kind {
+            ItemKind::Ruling => self.rulings.gate(item),
+            ItemKind::Challenge => self.debate.gate(item).unwrap_or_else(|| self.challenges.gate(item)),
+        }
     }
 
     /// The item waiting for delivery: the slot's Challenge, else the Debate's exchange 2 (V34).
@@ -132,6 +140,8 @@ pub fn claim(mailbox: &Mailbox, view: &View, route: Route, now: u64) -> io::Resu
     let mut fresh = None;
     let claim =
         mailbox.outbox().claim(route.name(), now, |item| match fresh.get_or_insert_with(|| View::read(mailbox)) {
+            // A Ruling goes by the idle-only routes only (V74).
+            Ok(_) if item.kind == ItemKind::Ruling && !route.idle() => Gate::Skip,
             Ok(view) => view.gate(item),
             Err(_) => Gate::Skip,
         })?;
