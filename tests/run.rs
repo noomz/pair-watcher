@@ -12,9 +12,12 @@ use common::{executable, fake_codex, write};
 use pair_watcher::event::{Event, Kind};
 use pair_watcher::home::Home;
 use pair_watcher::hook::{GUARD_ENV, SESSION_ENV};
+use pair_watcher::human::Act;
 use pair_watcher::jsonl::Record;
 use pair_watcher::launch::CODEX_BYPASS_FLAG;
 use pair_watcher::mailbox::Mailbox;
+use pair_watcher::ruling::{Keep, Side};
+use pair_watcher::standing;
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -298,4 +301,51 @@ fn repo_focus_without_tty_waits_for_focus_approve() {
     let (out, _) = w.pw(&["focus", "approve", "nope"]);
     assert!(!out.status.success());
     assert!(stderr(&out).contains("no repo Focus `nope` awaiting approval"));
+}
+
+/// V78, V84: session start logs the rulings count and hash; a hand edit since the last start is
+/// one `human rulings-edited` fact; `rulings list|rm` work on the repo at the current directory.
+#[test]
+fn session_start_logs_rulings_and_cli_lists_and_removes() {
+    let w = World::new();
+    let store = standing::path(&w.home, &standing::key(&w.repo));
+    let (out, _) = w.pw(&["rulings", "list"]);
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("no Standing rulings for this repo"));
+    assert!(store.to_string_lossy().contains(".pair-watcher/repos/"), "keyed by root commit: {}", store.display());
+
+    let keep = |h: &str| Keep {
+        concern: "c1".into(),
+        focus: "security".into(),
+        headline: h.into(),
+        side: Side::Worker,
+        reason: None,
+    };
+    for h in ["keys in fixtures are fake", "no CSRF on the health check"] {
+        standing::remember(&store, &keep(h), "2026-10-08", true).unwrap().unwrap();
+    }
+    let (out, _) = w.pw(&["rulings", "list"]);
+    let list = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(list.contains("r1  2026-10-08  security  sided with the Worker  keys in fixtures are fake"), "{list}");
+    assert!(list.contains("# 2 of 30 held"), "{list}");
+
+    let (out, _) = w.run(&[&w.harness("claude")]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let log = w.wait_for_end(&w.session("claude"));
+    let s = start(&log);
+    assert_eq!(s.fields["rulings"], 2);
+    assert_eq!(s.fields["rulings_hash"], standing::hash(&standing::load(&store).unwrap()));
+    assert!(!log.iter().any(|r| r.body.k == Kind::Human), "first sight is the baseline");
+
+    // No live session: the removal waits for the next start, as an edit.
+    let (out, _) = w.pw(&["rulings", "rm", "r1"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("removed Standing ruling r1"), "{}", stderr(&out));
+    let (out, _) = w.pw(&["rulings", "rm", "r1"]);
+    assert!(!out.status.success() && stderr(&out).contains("no Standing ruling r1 (held: r2)"));
+
+    let (out, _) = w.run(&[&w.harness("claude")]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let log = w.wait_for_end(&w.session("claude"));
+    assert_eq!(start(&log).fields["rulings"], 1);
+    let edited: Vec<Act> = log.iter().filter_map(|r| r.body.parse::<Act>()).collect();
+    assert_eq!(edited, [Act::RulingsEdited { added: vec![], removed: vec!["r1".into()], changed: vec![] }]);
 }

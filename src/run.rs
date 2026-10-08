@@ -25,7 +25,7 @@ use crate::mailbox::Mailbox;
 use crate::placement::{Placement, pane_command};
 use crate::problem::{Problem, Unreadable, ticker_line, tilde};
 use crate::repo::{self, Repo};
-use crate::supervisor;
+use crate::{standing, supervisor};
 
 const CODEX_LIST_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -163,13 +163,22 @@ fn wire(l: &Launch) -> io::Result<(Plan, Vec<String>)> {
     let observe_only = ours.is_empty();
     let plan = Plan::new(worker, ours);
 
-    mailbox.log().append(session_start(l, observe_only, &notes))?;
+    // Never blocks the Worker: a store that cannot be read loads no rulings (V78).
+    let rulings = standing::start(&standing::path(l.home, &standing::key(l.cwd))).unwrap_or_else(|e| standing::Start {
+        notes: vec![format!("rulings unavailable: {e}")],
+        ..standing::Start::default()
+    });
+    notes.extend(rulings.notes.iter().cloned());
+    mailbox.log().append(session_start(l, observe_only, &notes, &rulings))?;
+    if let Some(edited) = &rulings.edited {
+        mailbox.log().append(edited.event())?;
+    }
     supervisor::spawn(&exe, mailbox, l.session, std::process::id())?;
     Ok((plan, notes))
 }
 
-/// `session` start (V94); Worker model is read later from the transcript, rulings hash is T14.
-fn session_start(l: &Launch, observe_only: bool, notes: &[String]) -> Event {
+/// `session` start (V94); Worker model is read later from the transcript.
+fn session_start(l: &Launch, observe_only: bool, notes: &[String], rulings: &standing::Start) -> Event {
     let loaded = l.loaded;
     let mode = loaded.resolved.get("mode").and_then(toml::Value::as_str).unwrap_or("companion");
     let focuses: Vec<&str> = loaded.focuses.enabled.iter().map(|f| f.name.as_str()).collect();
@@ -184,6 +193,8 @@ fn session_start(l: &Launch, observe_only: bool, notes: &[String]) -> Event {
         .with("ceiling_usd", loaded.resolved.get("ceiling_usd").and_then(toml::Value::as_float).unwrap_or(5.0))
         .with("focuses", json!(focuses))
         .with("config_hash", config::config_hash(&loaded.resolved, &loaded.focuses.enabled))
+        .with("rulings", rulings.held.len())
+        .with("rulings_hash", rulings.hash.clone().map_or(Value::Null, Value::from))
         .with("layer_files", json!(layers))
         .with("version", env!("CARGO_PKG_VERSION"))
         .with("observe_only", observe_only)

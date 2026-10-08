@@ -249,7 +249,9 @@ pub enum FocusAction {
 
 #[derive(Subcommand, Debug)]
 pub enum RulingsAction {
+    /// List this repo's Standing rulings
     List,
+    /// Remove a Standing ruling
     Rm { id: String },
 }
 
@@ -289,8 +291,8 @@ fn dispatch(command: Command, via: Via) -> ExitCode {
         Command::Pause(session) => session_fact(&session, pause),
         Command::Rule { id, side, session } => session_fact(&session, |m| rule(m, &id, side, via)),
         Command::Undo(session) => session_fact(&session, |m| undo(m, via)),
-        Command::Keep(session) => session_fact(&session, keep),
-        Command::Rulings { .. } => later("T14"),
+        Command::Keep(session) => session_fact(&session, |m| keep(m, via)),
+        Command::Rulings { action } => rulings(action),
         Command::Install { .. } | Command::Uninstall { .. } | Command::Auth | Command::Doctor => later("T16"),
         Command::Models { action } => models_cmd(action),
         Command::Prefilter { .. } => later("T17"),
@@ -497,16 +499,66 @@ fn undo(m: &Mailbox, via: Via) -> std::io::Result<String> {
 }
 
 /// `keep` (V77): the last ruling or dismissal as a Standing ruling for this repo.
-fn keep(m: &Mailbox) -> std::io::Result<String> {
+fn keep(m: &Mailbox, via: Via) -> std::io::Result<String> {
     let b = board(m)?;
     // Nothing to keep says so before a missing store does.
     b.rulings.keep(&b.concerns, None).map_err(std::io::Error::other)?;
     let store = standing::session_path(m).ok_or_else(|| std::io::Error::other("the session's repo is unknown"))?;
-    let event = pane::keep(&b, &store, None, now_ms()).map_err(std::io::Error::other)?;
+    let event = pane::keep(&b, &store, None, now_ms(), via).map_err(std::io::Error::other)?;
     let (id, ruling) =
         (event.str("id").unwrap_or_default().to_owned(), event.str("ruling").unwrap_or_default().to_owned());
     m.log().append(event)?;
     Ok(format!("{id} kept for this repo as Standing ruling {ruling}"))
+}
+
+/// `rulings list|rm` (V78): the Standing rulings of the repo at the current directory. A removal
+/// is logged in each live session on the repo; with none, the next session start sees it as an
+/// edit of the file.
+fn rulings(action: RulingsAction) -> ExitCode {
+    let result = (|| -> Result<String, String> {
+        let home = Home::from_env().map_err(|e| e.to_string())?;
+        let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+        let key = standing::key(&cwd);
+        let store = standing::path(&home, &key);
+        match action {
+            RulingsAction::List => {
+                let held = standing::load(&store).map_err(|e| e.to_string())?;
+                if held.is_empty() {
+                    return Ok(format!("no Standing rulings for this repo ({})", tilde(&store)));
+                }
+                let lines: Vec<String> = held
+                    .iter()
+                    .map(|r| {
+                        let reason = r.reason.as_ref().map(|x| format!(" — {x}")).unwrap_or_default();
+                        format!("{}  {}  {}  {}  {}{reason}", r.id, r.date, r.focus, r.words(), r.headline)
+                    })
+                    .collect();
+                Ok(format!("{}\n# {} of {} held · {}", lines.join("\n"), held.len(), standing::CAP, tilde(&store)))
+            }
+            RulingsAction::Rm { id } => {
+                let sessions: Vec<Mailbox> = mailbox::live(&home)
+                    .into_iter()
+                    .filter(|m| m.repo().is_some_and(|r| standing::key(&r) == key))
+                    .collect();
+                let gone = standing::remove(&store, &id, !sessions.is_empty())
+                    .map_err(|e| e.to_string())?
+                    .map_err(|why| why.to_string())?;
+                for m in &sessions {
+                    m.log()
+                        .append(Act::RulingRemoved { ruling: gone.id.clone(), via: Via::Cli }.event())
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok(format!("removed Standing ruling {}: {}", gone.id, gone.headline))
+            }
+        }
+    })();
+    match result {
+        Ok(msg) => {
+            println!("{msg}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&e),
+    }
 }
 
 /// `pause` pauses a running Watcher and resumes a paused one (V70).

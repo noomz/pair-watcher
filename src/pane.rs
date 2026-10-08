@@ -93,8 +93,10 @@ pub struct Board {
     pub focuses: Vec<String>,
     pub observe_only: bool,
     pub ended: bool,
-    /// Standing rulings held: loaded at start (V78; T14 logs the count) + kept since (V77).
+    /// Standing rulings held: the count at session start (V78) + kept − removed since (V77).
     pub rulings_held: usize,
+    /// The Standing rulings, read live from the store while the `r` overlay is open (V78).
+    pub held: Vec<standing::Standing>,
     pub budget: Budget,
     pub concerns: ConcernList,
     pub challenges: Challenges,
@@ -139,6 +141,7 @@ impl Board {
             observe_only: false,
             ended: false,
             rulings_held: 0,
+            held: Vec::new(),
             budget: Budget::new(budget::RAISE_USD),
             concerns: ConcernList::default(),
             challenges: Challenges::default(),
@@ -431,9 +434,23 @@ impl Board {
                 self.nochallenge = true;
                 self.tick(t, "no auto-Challenge (this session)".to_owned(), Tone::Plain);
             }
-            Some(Act::RulingRemembered { id, ruling }) => {
+            Some(Act::RulingRemembered { id, ruling, .. }) => {
                 self.rulings_held += 1;
                 self.tick(t, format!("{id} kept for this repo as Standing ruling {ruling}"), Tone::Plain);
+            }
+            Some(Act::RulingRemoved { ruling, .. }) => {
+                self.rulings_held = self.rulings_held.saturating_sub(1);
+                self.tick(t, format!("Standing ruling {ruling} removed"), Tone::Plain);
+            }
+            // Already in the session start count.
+            Some(Act::RulingsEdited { added, removed, changed }) => {
+                let mut parts = Vec::new();
+                for (sign, ids) in [("+", added), ("−", removed), ("~", changed)] {
+                    if !ids.is_empty() {
+                        parts.push(format!("{sign}{}", ids.join(" ")));
+                    }
+                }
+                self.tick(t, format!("rulings file edited by hand: {}", parts.join(" · ")), Tone::Plain);
             }
             None => {}
         }
@@ -724,6 +741,8 @@ pub enum Effect {
     Undo,
     /// `s`: keep a ruling or dismissal for this repo (V77): the selected row, else the last.
     Keep(Option<String>),
+    /// `x` in the `r` overlay: remove this Standing ruling (V78).
+    Remove(String),
 }
 
 /// One key on the Board (I17). Pure: `ui` changes, events are returned for the caller to log.
@@ -748,6 +767,13 @@ pub fn key(b: &Board, ui: &mut Ui, frame: &Frame, k: Key, now: u64) -> Effect {
         return Effect::None;
     }
     let selected = frame.selected.clone();
+    // Over the rulings the selection is a ruling id: only moving, `x` and closing apply.
+    let over_rulings =
+        matches!(k, Key::Char('j' | 'k' | 'r' | 'x' | 'l' | '?' | 'q') | Key::Up | Key::Down | Key::Esc | Key::CtrlC);
+    if ui.overlay == Overlay::Rulings && !over_rulings {
+        ui.note = Some("r closes the rulings first".to_owned());
+        return Effect::None;
+    }
     let concern = selected.as_deref().and_then(|id| b.concerns.get(id));
     let append = |act: Act| Effect::Append(vec![act.event()]);
     match k {
@@ -763,6 +789,12 @@ pub fn key(b: &Board, ui: &mut Ui, frame: &Frame, k: Key, now: u64) -> Effect {
         Key::Char('c') => ui.closed = !ui.closed,
         Key::Char('l') => ui.overlay = toggle(ui.overlay, Overlay::Stream),
         Key::Char('?') => ui.overlay = toggle(ui.overlay, Overlay::Help),
+        Key::Char('r') => ui.overlay = toggle(ui.overlay, Overlay::Rulings),
+        Key::Char('x') => match selected {
+            Some(id) if ui.overlay == Overlay::Rulings => return Effect::Remove(id),
+            _ if ui.overlay == Overlay::Rulings => ui.note = Some("no Standing ruling selected".to_owned()),
+            _ => ui.note = Some("x removes a Standing ruling: open them with r".to_owned()),
+        },
         Key::Char('f') => {
             let mut all = b.focuses.clone();
             for c in b.concerns.all() {
@@ -841,12 +873,22 @@ pub fn undo(b: &Board, outbox: &Outbox, via: Via, surface: Surface) -> Result<Ev
 
 /// `s` / `/pw keep` / `pair-watcher keep` (V77): writes the Standing ruling to `store` (V78),
 /// returns the `human ruling-remembered` fact; refused at the cap.
-pub fn keep(b: &Board, store: &Path, selected: Option<&str>, now: u64) -> Result<Event, String> {
+pub fn keep(b: &Board, store: &Path, selected: Option<&str>, now: u64, via: Via) -> Result<Event, String> {
     let keep = b.rulings.keep(&b.concerns, selected)?;
-    match standing::remember(store, &keep, &standing::date(now, b.tz)) {
-        Ok(Ok(ruling)) => Ok(Act::RulingRemembered { id: keep.concern, ruling }.event()),
+    match standing::remember(store, &keep, &standing::date(now, b.tz), true) {
+        Ok(Ok(ruling)) => Ok(Act::RulingRemembered { id: keep.concern, ruling, via: Some(via) }.event()),
         Ok(Err(why)) => Err(format!("keep refused: {why}")),
         Err(e) => Err(format!("keep failed: {e}")),
+    }
+}
+
+/// `x` / `/pw`-less `pair-watcher rulings rm` (V78): removes the Standing ruling from `store`,
+/// returns the `human ruling-removed` fact.
+pub fn remove(store: &Path, id: &str, via: Via) -> Result<Event, String> {
+    match standing::remove(store, id, true) {
+        Ok(Ok(gone)) => Ok(Act::RulingRemoved { ruling: gone.id, via }.event()),
+        Ok(Err(why)) => Err(why),
+        Err(e) => Err(format!("remove failed: {e}")),
     }
 }
 
@@ -920,6 +962,16 @@ pub fn run(mailbox: &Mailbox) -> io::Result<()> {
         tail(&mut board, &mut offset)?;
         board.pending =
             delivery::pending(&board.challenges, &board.debate, board.observe_only, mailbox).unwrap_or(None);
+        if ui.overlay == Overlay::Rulings {
+            board.held = match store.as_deref().map(standing::load) {
+                Some(Ok(held)) => held,
+                Some(Err(e)) => {
+                    ui.note = Some(format!("rulings unreadable: {e}"));
+                    Vec::new()
+                }
+                None => Vec::new(),
+            };
+        }
         if ui.note.is_some() && note_at.elapsed() > NOTE_FOR {
             ui.note = None;
         }
@@ -952,8 +1004,12 @@ pub fn run(mailbox: &Mailbox) -> io::Result<()> {
                 Effect::Append(events) => Ok(events),
                 Effect::Undo => undo(&board, &mailbox.outbox(), Via::Key, Surface::Pane).map(|e| vec![e]),
                 Effect::Keep(selected) => match &store {
-                    Some(store) => keep(&board, store, selected.as_deref(), now).map(|e| vec![e]),
+                    Some(store) => keep(&board, store, selected.as_deref(), now, Via::Key).map(|e| vec![e]),
                     None => Err("keep: the session's repo is unknown".to_owned()),
+                },
+                Effect::Remove(id) => match &store {
+                    Some(store) => remove(store, &id, Via::Key).map(|e| vec![e]),
+                    None => Err("remove: the session's repo is unknown".to_owned()),
                 },
                 Effect::None => Ok(vec![]),
             };

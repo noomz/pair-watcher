@@ -531,7 +531,7 @@ fn keep_writes_a_standing_ruling() {
     let fx = Fx::new();
     let store = standing::path(&fx.home, &standing::key(&fx.dir.path().join("repo")));
     fx.log(Act::Mute { focus: "approach".into() }.event());
-    assert!(pane::keep(&fx.board(), &store, None, now_ms()).unwrap_err().contains("no ruling or dismissal"));
+    assert!(pane::keep(&fx.board(), &store, None, now_ms(), Via::Key).unwrap_err().contains("no ruling or dismissal"));
 
     fx.log(Change::Add { watcher: "companion".into(), concern: concern("c3") }.event());
     fx.log(Act::Dismiss { id: "c3".into() }.event());
@@ -539,13 +539,13 @@ fn keep_writes_a_standing_ruling() {
     fx.rule("e1", Side::Worker).unwrap();
 
     // The latest: the ruling on c2, with the Worker's reason.
-    let e = pane::keep(&fx.board(), &store, None, now_ms()).unwrap();
+    let e = pane::keep(&fx.board(), &store, None, now_ms(), Via::Key).unwrap();
     assert_eq!((e.str("id"), e.str("ruling")), (Some("c2"), Some("r1")));
     fx.log(e);
     // The selected CLOSED row: the dismissal of c3.
-    let e = pane::keep(&fx.board(), &store, Some("c3"), now_ms()).unwrap();
+    let e = pane::keep(&fx.board(), &store, Some("c3"), now_ms(), Via::Key).unwrap();
     fx.log(e);
-    assert!(pane::keep(&fx.board(), &store, Some("c3"), now_ms()).unwrap_err().contains("already kept"));
+    assert!(pane::keep(&fx.board(), &store, Some("c3"), now_ms(), Via::Key).unwrap_err().contains("already kept"));
     assert_eq!(fx.board().rulings_held, 2);
 
     let held = standing::load(&store).unwrap();
@@ -565,9 +565,11 @@ fn keep_writes_a_standing_ruling() {
         reason: None,
     };
     for _ in 2..standing::CAP {
-        standing::remember(&store, &keep, "2026-10-08").unwrap().unwrap();
+        standing::remember(&store, &keep, "2026-10-08", true).unwrap().unwrap();
     }
-    assert!(standing::remember(&store, &keep, "2026-10-08").unwrap().unwrap_err().contains("30 Standing rulings"));
+    assert!(
+        standing::remember(&store, &keep, "2026-10-08", true).unwrap().unwrap_err().contains("30 Standing rulings")
+    );
     assert_eq!(standing::date(0, 0), "1970-01-01");
     assert_eq!(standing::date(1_791_417_600_000, 0), "2026-10-08");
 }

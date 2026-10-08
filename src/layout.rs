@@ -94,6 +94,8 @@ pub enum Overlay {
     None,
     Stream,
     Help,
+    /// `r`: the repo's Standing rulings (V78).
+    Rulings,
 }
 
 /// A remark being typed for `P` (V20).
@@ -175,6 +177,7 @@ pub fn layout(b: &Board, ui: &Ui, width: usize, rows: usize) -> Frame {
         Overlay::None => board(b, ui, selected.as_deref(), width, false),
         Overlay::Stream => stream(b, ui, width, rows.saturating_sub(top.len() + bottom.len())),
         Overlay::Help => help(width),
+        Overlay::Rulings => rulings(b, selected.as_deref(), width),
     };
     // What may never be trimmed (V65) outranks the ticker, then the wake strip.
     let keep = body.iter().filter(|r| r.prio == 0).count();
@@ -199,6 +202,9 @@ pub fn layout(b: &Board, ui: &Ui, width: usize, rows: usize) -> Frame {
 
 /// Ids `j`/`k` move over: NEEDS YOU, IN DEBATE, OPEN, then CLOSED when expanded.
 fn selectable(b: &Board, ui: &Ui) -> Vec<String> {
+    if ui.overlay == Overlay::Rulings {
+        return b.held.iter().map(|r| r.id.clone()).collect();
+    }
     let mut out: Vec<String> = b.needs_you().map(|e| e.id.clone()).collect();
     out.extend(debating(b, ui).map(|c| c.id.clone()));
     out.extend(open(b, ui).into_iter().map(|c| c.id.clone()));
@@ -625,7 +631,7 @@ fn stream(b: &Board, ui: &Ui, width: usize, rows: usize) -> Vec<Row> {
         .collect()
 }
 
-const KEYS: [(&str, &str); 18] = [
+const KEYS: [(&str, &str); 20] = [
     ("j k ↑ ↓", "select"),
     ("⏎", "expand / collapse the Debate log"),
     ("y", "NEEDS YOU / IN DEBATE: side with the Watcher (it tells the Worker)"),
@@ -633,6 +639,8 @@ const KEYS: [(&str, &str); 18] = [
     ("d", "dismiss: the Concern (final), or a NEEDS YOU / IN DEBATE item"),
     ("u", "undo the last ruling"),
     ("s", "keep the last ruling or dismissal (or the selected CLOSED row) for this repo"),
+    ("r", "Standing rulings for this repo"),
+    ("x", "in r: remove the selected Standing ruling"),
     ("P", "promote to a Challenge, with a remark"),
     ("+", "mark helpful"),
     ("f", "Focus filter"),
@@ -652,6 +660,28 @@ fn help(width: usize) -> Vec<Row> {
             wrap(&format!("  {k:<8} {what}"), width, 11).into_iter().map(|l| row(Line::one(Style::Plain, l), 0))
         }))
         .collect()
+}
+
+/// The `r` overlay (V78): each Standing ruling's id, date, Focus, verdict, headline and reason.
+fn rulings(b: &Board, selected: Option<&str>, width: usize) -> Vec<Row> {
+    let mut out = vec![row(section("RULINGS", b.held.len(), "x remove · r close", width), 0)];
+    if b.held.is_empty() {
+        let none = "  none held; s keeps a ruling or dismissal for this repo";
+        out.extend(wrap(none, width, 2).into_iter().map(|l| row(Line::one(Style::Dim, l), 0)));
+    }
+    for r in &b.held {
+        let mark = if selected == Some(r.id.as_str()) { "›" } else { " " };
+        let head = format!("{mark}{} {} {} · {}", r.id, r.date, r.focus, r.words());
+        out.push(row(Line::one(Style::Bold, cut(&head, width)), 0));
+        out.extend(
+            wrap(&format!("    {}", r.headline), width, 4).into_iter().map(|l| row(Line::one(Style::Plain, l), 0)),
+        );
+        if let Some(reason) = &r.reason {
+            let reason = format!("    — {reason}");
+            out.extend(wrap(&reason, width, 6).into_iter().map(|l| row(Line::one(Style::Dim, l), 0)));
+        }
+    }
+    out
 }
 
 fn ordinal(n: usize) -> String {

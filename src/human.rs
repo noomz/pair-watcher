@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::event::{Event, Kind};
+use crate::ruling::Via;
 
 /// `human` event payload (V94).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -25,7 +26,23 @@ pub enum Act {
     /// `a`: no auto-Challenges for the session (V23).
     Nochallenge,
     /// `s` (V77): the ruling or dismissal on Concern `id` kept as Standing ruling `ruling` (V78).
-    RulingRemembered { id: String, ruling: String },
+    RulingRemembered {
+        id: String,
+        ruling: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        via: Option<Via>,
+    },
+    /// `x` / `rulings rm` (V78): Standing ruling `ruling` removed.
+    RulingRemoved { ruling: String, via: Via },
+    /// Session start: the rulings file was edited by hand since pair-watcher last knew it (V78).
+    RulingsEdited {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        added: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        removed: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        changed: Vec<String>,
+    },
 }
 
 impl Act {
