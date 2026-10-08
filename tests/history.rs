@@ -3,7 +3,7 @@ use pair_watcher::history::History;
 use pair_watcher::tailer::{Entry, Item};
 
 fn entry(items: Vec<Item>) -> Entry {
-    Entry { id: "e".into(), t: 0, items }
+    Entry { id: "e".into(), t: 0, items, ..Default::default() }
 }
 
 fn bash(id: &str, cmd: &str, output: &str, error: bool) -> Vec<Item> {

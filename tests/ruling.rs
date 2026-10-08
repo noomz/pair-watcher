@@ -203,7 +203,7 @@ impl Fx {
 }
 
 fn prompt(id: &str, t: u64, text: &str) -> Entry {
-    Entry { id: id.into(), t, items: vec![TItem::Prompt(text.into()), TItem::TurnEnd] }
+    Entry { id: id.into(), t, items: vec![TItem::Prompt(text.into()), TItem::TurnEnd], ..Default::default() }
 }
 
 #[test]
@@ -979,6 +979,7 @@ fn a_worker_concession_never_overrides_a_standing_ruling() {
         id: "t9".into(),
         t: now_ms(),
         items: vec![TItem::Text("Fine.\nChallenge c2: concede — you are right".into()), TItem::TurnEnd],
+        ..Default::default()
     };
     let mut d = fx.debate();
     d.observe(&fx.mb.log(), &fx.mb.outbox(), &[turn], now_ms()).unwrap();

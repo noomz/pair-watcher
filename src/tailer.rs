@@ -33,12 +33,14 @@ pub struct Cursor {
     pub turn_msg: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Entry {
     pub id: String,
     /// Arrival time (unix ms): when this read saw the entry.
     pub t: u64,
     pub items: Vec<Item>,
+    /// Where a read resumes after this entry: a slice ending here commits it (V10, V92).
+    pub next: Cursor,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -122,7 +124,9 @@ pub fn read(format: Format, path: &Path, cursor: &Cursor) -> io::Result<Tail> {
                     Format::Pi => pi(&v),
                 };
                 if !items.is_empty() {
-                    tail.entries.push(Entry { id: line.id, t, items });
+                    let next =
+                        Cursor { id: Some(line.id.clone()), at: line.at, turn_msg: tail.cursor.turn_msg.clone() };
+                    tail.entries.push(Entry { id: line.id, t, items, next });
                 }
             }
         }

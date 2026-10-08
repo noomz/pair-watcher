@@ -49,7 +49,7 @@ fn ctx<'a>(
 }
 
 fn entry(items: Vec<Item>) -> Entry {
-    Entry { id: "e".into(), t: 0, items }
+    Entry { id: "e".into(), t: 0, items, ..Default::default() }
 }
 
 fn call(id: &str, tool: &str, input: &str, output: &str, error: bool) -> Vec<Item> {

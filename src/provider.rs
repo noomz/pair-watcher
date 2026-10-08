@@ -4,7 +4,7 @@
 //! failure classes belong to the supervisor (V86, V87).
 
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -26,6 +26,8 @@ pub struct Call<'a> {
     pub input: &'a str,
     /// `None` = no tools (blocked wake).
     pub tools: Option<Snapshot<'a>>,
+    /// The wake clock (V87): no request runs past it.
+    pub deadline: Option<Instant>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -110,7 +112,7 @@ impl Api {
             let forced = call.tools.is_none() || allowance.spent();
             let body = convo.request(call.model, call.tools.is_some(), forced);
             requests += 1;
-            let resp = self.post(call.vendor, key, &body).map_err(|e| fail(e, usage))?;
+            let resp = self.post(call.vendor, key, &body, call.deadline).map_err(|e| fail(e, usage))?;
             let turn = convo.absorb(resp).map_err(|e| fail(e, usage))?;
             usage += turn.usage;
             let snap = match call.tools {
@@ -122,7 +124,13 @@ impl Api {
         }
     }
 
-    fn post(&self, vendor: Vendor, key: &str, body: &Value) -> Result<Value, ProviderError> {
+    fn post(&self, vendor: Vendor, key: &str, body: &Value, deadline: Option<Instant>) -> Result<Value, ProviderError> {
+        let left = match deadline {
+            Some(d) => {
+                Some(d.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()).ok_or(ProviderError::Timeout)?)
+            }
+            None => None,
+        };
         let req = match vendor {
             Vendor::Anthropic => self
                 .agent
@@ -133,6 +141,10 @@ impl Api {
                 .agent
                 .post(format!("{}/responses", self.openai_url))
                 .header("authorization", format!("Bearer {key}")),
+        };
+        let req = match left {
+            Some(left) => req.config().timeout_global(Some(left)).build(),
+            None => req,
         };
         let mut resp = req.send_json(body).map_err(transport)?;
         let status = resp.status().as_u16();

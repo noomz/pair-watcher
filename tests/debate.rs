@@ -85,7 +85,7 @@ fn turn(prompt: Option<&str>, text: &str) -> Vec<Entry> {
     items.push(T::Text(text.into()));
     items.push(T::TurnEnd);
     static N: AtomicUsize = AtomicUsize::new(0);
-    vec![Entry { id: format!("e{}", N.fetch_add(1, Ordering::Relaxed)), t: 0, items }]
+    vec![Entry { id: format!("e{}", N.fetch_add(1, Ordering::Relaxed)), t: 0, items, ..Default::default() }]
 }
 
 impl Fx {
@@ -339,9 +339,19 @@ fn pending_rebuttal_waits_and_is_stale_checked() {
     f.observe(&turn(None, "Challenge c1: defend — fine"));
     f.decide(&[("approach", line(Decision::Rebut, "new ground"))]);
     // The human prompts first; the human prompt may land in a checkpoint wake before its turn end.
-    f.observe(&[Entry { id: "h".into(), t: 0, items: vec![T::Prompt("rewrite it as a stream".into())] }]);
+    f.observe(&[Entry {
+        id: "h".into(),
+        t: 0,
+        items: vec![T::Prompt("rewrite it as a stream".into())],
+        ..Default::default()
+    }]);
     assert!(f.d.open().unwrap().human);
-    f.observe(&[Entry { id: "h2".into(), t: 0, items: vec![T::Text("Rewritten.".into()), T::TurnEnd] }]);
+    f.observe(&[Entry {
+        id: "h2".into(),
+        t: 0,
+        items: vec![T::Text("Rewritten.".into()), T::TurnEnd],
+        ..Default::default()
+    }]);
     assert_eq!(f.ops("human-turn").len(), 1);
     assert_eq!(f.d.waiting(), Some("c1/2"), "still waits for the next idle");
     assert_eq!(f.decide(&[]).ended, None);
@@ -415,7 +425,12 @@ fn escalate_unresolved_gate() {
 fn blocked_worker_debate_waits() {
     let mut f = fx();
     let tool = T::ToolCall { id: "t1".into(), name: "Bash".into(), input: "{}".into() };
-    f.observe(&[Entry { id: "b".into(), t: 0, items: vec![T::Text("Running it.".into()), tool] }]);
+    f.observe(&[Entry {
+        id: "b".into(),
+        t: 0,
+        items: vec![T::Text("Running it.".into()), tool],
+        ..Default::default()
+    }]);
     assert!(f.ops("exchange").is_empty());
     assert_eq!(f.d.open().unwrap().phase, Phase::Awaiting);
     f.assert_consistent();
@@ -692,7 +707,12 @@ fn owner_that_did_not_run_still_owes() {
 #[test]
 fn stale_human_flag_cleared_by_our_prompt() {
     let mut f = fx();
-    f.observe(&[Entry { id: "h".into(), t: 0, items: vec![T::Prompt("[Request interrupted by user]".into())] }]);
+    f.observe(&[Entry {
+        id: "h".into(),
+        t: 0,
+        items: vec![T::Prompt("[Request interrupted by user]".into())],
+        ..Default::default()
+    }]);
     assert!(f.d.open().unwrap().human);
     f.observe(&turn(Some(OWN), "carrying on"));
     assert_eq!(f.ops("exchange")[0].str("verdict"), Some("none"));
@@ -779,7 +799,7 @@ fn quoted_header_stays_human() {
 }
 
 fn entry(id: &str, items: Vec<T>) -> Entry {
-    Entry { id: id.into(), t: 0, items }
+    Entry { id: id.into(), t: 0, items, ..Default::default() }
 }
 
 /// Codex review: a checkpoint wake cutting between the final text and the turn end keeps the

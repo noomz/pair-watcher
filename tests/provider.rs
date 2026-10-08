@@ -179,6 +179,7 @@ fn anthropic_loop_caps_calls_then_forces_output() {
             vendor: Vendor::Anthropic,
             input: "WAKE INPUT",
             tools: Some(w.snap()),
+            deadline: None,
         })
         .unwrap();
     let seen = server.finish();
@@ -209,7 +210,7 @@ fn read_allowance_clips_and_forces() {
         Server::start(vec![(200, "", read_call("t0", json!({"path": "big.txt"}))), (200, "", final_text("done"))]);
     let reply = w
         .api(&server)
-        .call(&Call { model: "m", vendor: Vendor::Anthropic, input: "in", tools: Some(w.snap()) })
+        .call(&Call { model: "m", vendor: Vendor::Anthropic, input: "in", tools: Some(w.snap()), deadline: None })
         .unwrap();
     let seen = server.finish();
     assert_eq!((reply.requests, reply.tools.read), (2, MAX_READ));
@@ -224,8 +225,10 @@ fn read_allowance_clips_and_forces() {
 fn blocked_call_offers_no_tools() {
     let w = World::new();
     let server = Server::start(vec![(200, "", final_text("consideration"))]);
-    let reply =
-        w.api(&server).call(&Call { model: "m", vendor: Vendor::Anthropic, input: "blocked", tools: None }).unwrap();
+    let reply = w
+        .api(&server)
+        .call(&Call { model: "m", vendor: Vendor::Anthropic, input: "blocked", tools: None, deadline: None })
+        .unwrap();
     let seen = server.finish();
     assert_eq!((reply.text.as_str(), reply.requests), ("consideration", 1));
     assert!(seen[0].body.get("tools").is_none() && seen[0].body.get("tool_choice").is_none());
@@ -257,7 +260,13 @@ fn openai_loop_round_trips_items_and_normalizes_usage() {
     ]);
     let reply = w
         .api(&server)
-        .call(&Call { model: "gpt-6.1-sol", vendor: Vendor::Openai, input: "WAKE", tools: Some(w.snap()) })
+        .call(&Call {
+            model: "gpt-6.1-sol",
+            vendor: Vendor::Openai,
+            input: "WAKE",
+            tools: Some(w.snap()),
+            deadline: None,
+        })
         .unwrap();
     let seen = server.finish();
 
@@ -283,7 +292,7 @@ fn http_error_keeps_status_retry_after_and_partial_usage() {
     ]);
     let err = w
         .api(&server)
-        .call(&Call { model: "m", vendor: Vendor::Anthropic, input: "in", tools: Some(w.snap()) })
+        .call(&Call { model: "m", vendor: Vendor::Anthropic, input: "in", tools: Some(w.snap()), deadline: None })
         .unwrap_err();
     server.finish();
     let Failure { error, usage } = err;
@@ -299,7 +308,8 @@ fn http_error_keeps_status_retry_after_and_partial_usage() {
 fn missing_key_fails_before_any_request() {
     let w = World::new();
     let api = Api::new(Keys::load(&w.home, &|_| None), &|_| None, Duration::from_secs(1));
-    let err = api.call(&Call { model: "m", vendor: Vendor::Openai, input: "in", tools: None }).unwrap_err();
+    let err =
+        api.call(&Call { model: "m", vendor: Vendor::Openai, input: "in", tools: None, deadline: None }).unwrap_err();
     assert_eq!(err.error, ProviderError::NoKey(Vendor::Openai));
 }
 

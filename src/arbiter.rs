@@ -35,13 +35,24 @@ pub fn roster(enabled: &[Focus], swarm: bool) -> Vec<Watcher> {
     vec![Watcher { name: "companion".into(), focuses: enabled.iter().map(|f| f.name.clone()).collect(), model: None }]
 }
 
-/// One call per Watcher, all in parallel; results in roster order (V43).
-pub fn run<T: Send>(watchers: &[Watcher], call: impl Fn(&Watcher) -> T + Sync) -> Vec<T> {
+/// One call per Watcher, all in parallel; results in roster order (V43). A panic is caught at the
+/// task edge: that Watcher's result is `Err(message)`, its siblings run on (V90).
+pub fn run<T: Send>(watchers: &[Watcher], call: impl Fn(&Watcher) -> T + Sync) -> Vec<Result<T, String>> {
     let call = &call;
     std::thread::scope(|s| {
-        let tasks: Vec<_> = watchers.iter().map(|w| s.spawn(move || call(w))).collect();
-        tasks.into_iter().map(|t| t.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))).collect()
+        let tasks: Vec<_> = watchers
+            .iter()
+            .map(|w| s.spawn(move || std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call(w)))))
+            .collect();
+        tasks.into_iter().map(|t| t.join().and_then(|r| r).map_err(|p| panic_message(&*p))).collect()
     })
+}
+
+fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| p.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "panic".to_owned())
 }
 
 /// One Watcher's valid output for this wake (`output::parse`).

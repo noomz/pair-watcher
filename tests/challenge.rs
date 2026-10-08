@@ -54,7 +54,7 @@ fn fx() -> Fx {
     let store = Store::open(&mailbox, &Repo { root: root.clone(), root_commit: None }).unwrap();
     let tree = store.take().unwrap();
     let transcript = vec![
-        Entry { id: "e0".into(), t: 0, items: vec![Item::Prompt(OWN.into())] },
+        Entry { id: "e0".into(), t: 0, items: vec![Item::Prompt(OWN.into())], ..Default::default() },
         Entry {
             id: "e1".into(),
             t: 1,
@@ -85,6 +85,7 @@ fn fx() -> Fx {
                 Item::ToolCall { id: "t4".into(), name: "Bash".into(), input: r#"{"command":"rg TODO src"}"#.into() },
                 Item::ToolResult { id: "t4".into(), output: "\n".into(), error: false },
             ],
+            ..Default::default()
         },
     ];
     let log = EventLog::new(mailbox.join("events.jsonl"));
@@ -113,7 +114,7 @@ fn older() -> Vec<Entry> {
     [first, turn("a5"), turn("a6")]
         .into_iter()
         .enumerate()
-        .map(|(i, items)| Entry { id: format!("o{i}"), t: 0, items })
+        .map(|(i, items)| Entry { id: format!("o{i}"), t: 0, items, ..Default::default() })
         .collect()
 }
 

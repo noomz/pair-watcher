@@ -374,5 +374,18 @@ fn run_calls_watchers_in_parallel() {
         }
         w.name.clone()
     });
-    assert_eq!(results, ["approach", "correctness", "security"]);
+    assert_eq!(results, [Ok("approach".to_owned()), Ok("correctness".to_owned()), Ok("security".to_owned())]);
+}
+
+/// V90: a Focus task's panic is caught at its edge; the other Watchers' results stand.
+#[test]
+fn run_catches_a_task_panic() {
+    let roster = arbiter::roster(&[focus("approach", None), focus("correctness", None)], true);
+    let results = arbiter::run(&roster, |w| {
+        if w.name == "approach" {
+            panic!("boom in {}", w.name);
+        }
+        w.name.clone()
+    });
+    assert_eq!(results, [Err("boom in approach".to_owned()), Ok("correctness".to_owned())]);
 }

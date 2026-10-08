@@ -45,13 +45,15 @@ pub struct Due {
     pub trigger: Trigger,
     /// Blocked: the hook payload carrying the question.
     pub payload: Option<Value>,
+    /// Arrival of the hook that made it due (latest of a coalesced burst); checkpoint: `now`.
+    pub at: u64,
 }
 
 /// Signals seen since the last `due`; a burst coalesces to one wake per kind.
 #[derive(Clone, Debug, Default)]
 pub struct Triggers {
-    turn_end: bool,
-    blocked: Option<Value>,
+    turn_end: Option<u64>,
+    blocked: Option<(u64, Value)>,
     /// Codex `PermissionRequest` arrival time + payload, until activity cancels it.
     maybe_blocked: Option<(u64, Value)>,
 }
@@ -62,8 +64,8 @@ impl Triggers {
             self.maybe_blocked = None;
         }
         match signal {
-            Signal::TurnEnd => self.turn_end = true,
-            Signal::Blocked => self.blocked = Some(payload.clone()),
+            Signal::TurnEnd => self.turn_end = Some(at),
+            Signal::Blocked => self.blocked = Some((at, payload.clone())),
             Signal::MaybeBlocked => self.maybe_blocked = Some((at, payload.clone())),
             Signal::Activity => {}
         }
@@ -83,16 +85,16 @@ impl Triggers {
         if let Some((at, _)) = &self.maybe_blocked
             && now.saturating_sub(*at) >= CODEX_BLOCKED_MS
         {
-            self.blocked = self.maybe_blocked.take().map(|(_, p)| p);
+            self.blocked = self.maybe_blocked.take();
         }
         let mut due = Vec::new();
-        if let Some(payload) = self.blocked.take() {
-            due.push(Due { trigger: Trigger::Blocked, payload: Some(payload) });
+        if let Some((at, payload)) = self.blocked.take() {
+            due.push(Due { trigger: Trigger::Blocked, payload: Some(payload), at });
         }
-        if std::mem::take(&mut self.turn_end) {
-            due.push(Due { trigger: Trigger::TurnEnd, payload: None });
+        if let Some(at) = self.turn_end.take() {
+            due.push(Due { trigger: Trigger::TurnEnd, payload: None, at });
         } else if checkpoints && now.saturating_sub(last_wake) >= CHECKPOINT_FLOOR_MS && repo_changed() {
-            due.push(Due { trigger: Trigger::Checkpoint, payload: None });
+            due.push(Due { trigger: Trigger::Checkpoint, payload: None, at: now });
         }
         due
     }

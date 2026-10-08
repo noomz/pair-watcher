@@ -13,6 +13,7 @@ pub mod debate;
 pub mod delivery;
 pub mod escalation;
 pub mod event;
+pub mod fail;
 pub mod focus;
 pub mod harness;
 pub mod history;

@@ -414,7 +414,13 @@ fn rebuttal_is_delivered_like_the_challenge() {
     let (log, outbox) = (w.mb.log(), w.mb.outbox());
     let mut d = Debate::rebuild(&w.events());
     let reply = T::Text("Challenge c1: defend — it is idempotent".into());
-    d.observe(&log, &outbox, &[Entry { id: "e".into(), t: 0, items: vec![reply, T::TurnEnd] }], now).unwrap();
+    d.observe(
+        &log,
+        &outbox,
+        &[Entry { id: "e".into(), t: 0, items: vec![reply, T::TurnEnd], ..Default::default() }],
+        now,
+    )
+    .unwrap();
     let lines = [("approach".to_owned(), Line::Debate { decision: Decision::Rebut, text: "429s".into() })];
     let roster =
         [pair_watcher::arbiter::Watcher { name: "approach".into(), focuses: vec!["approach".into()], model: None }];
@@ -444,7 +450,13 @@ fn claim_rereads_the_log_under_the_lock() {
     let (log, outbox) = (w.mb.log(), w.mb.outbox());
     let mut d = Debate::rebuild(&w.events());
     let reply = T::Text("Challenge c1: defend — it is idempotent".into());
-    d.observe(&log, &outbox, &[Entry { id: "e".into(), t: 0, items: vec![reply, T::TurnEnd] }], now).unwrap();
+    d.observe(
+        &log,
+        &outbox,
+        &[Entry { id: "e".into(), t: 0, items: vec![reply, T::TurnEnd], ..Default::default() }],
+        now,
+    )
+    .unwrap();
     let lines = [("approach".to_owned(), Line::Debate { decision: Decision::Rebut, text: "429s".into() })];
     let roster =
         [pair_watcher::arbiter::Watcher { name: "approach".into(), focuses: vec!["approach".into()], model: None }];
