@@ -122,6 +122,9 @@ pub struct Committed {
     pub turns: (u64, u64),
     /// Wakes so far.
     pub n: u64,
+    /// `primary` requests answered (V51).
+    #[serde(default)]
+    pub primary: usize,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -238,6 +241,8 @@ pub struct Watch {
     api: Api,
     table: Table,
     keys: Keys,
+    /// Reloads keys for `primary`: the home and the launch env's key vars.
+    key_source: (Home, HashMap<String, String>),
     pub notifier: Notifier,
     pub placement: Placement,
     pub exe: PathBuf,
@@ -310,6 +315,7 @@ impl Watch {
             api: Api::new(keys.clone(), env, fail::WAKE_CLOCK),
             table,
             keys,
+            key_source: (home.clone(), key_env(env)),
             notifier: Notifier::detect(env),
             placement: Placement::detect(env),
             exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pair-watcher")),
@@ -438,6 +444,7 @@ impl Watch {
         self.refresh()?;
         self.hooks(now)?;
         self.guardian()?;
+        self.primary_asked(now)?;
         self.answer(now)?;
         let mut due = self.due(now);
         // A turn end waits for its transcript turn before it wakes (V89); a later one joins it.
@@ -465,6 +472,28 @@ impl Watch {
             self.mailbox.settle(self.state.inbox)?;
         }
         self.save()
+    }
+
+    /// `primary` (V51), each request once: keys reload (after `auth`), a Key fallback ends, and a
+    /// Watcher BLIND on its key wakes at once; its first accepted wake ends the BLIND (V89).
+    fn primary_asked(&mut self, now: u64) -> io::Result<()> {
+        if self.board.primary_asked <= self.state.primary {
+            return Ok(());
+        }
+        self.state.primary = self.board.primary_asked;
+        let (home, vars) = &self.key_source;
+        self.keys = Keys::load(home, &|k| vars.get(k).cloned());
+        self.api.set_keys(self.keys.clone());
+        if self.state.fallback.active == Some(Class::Key) {
+            self.state.fallback.recovered();
+            self.append(Op::Primary.event())?;
+        }
+        for h in self.state.health.values_mut() {
+            if h.blind.as_ref().is_some_and(|(_, r)| r.starts_with(fail::KEY_BLIND)) {
+                h.rewake_at = Some(now);
+            }
+        }
+        Ok(())
     }
 
     /// Final drain (V90): one last wake on what arrived, open escalations unruled, exit.
@@ -1459,4 +1488,13 @@ pub fn watch(home: &Home, session: &str) -> io::Result<()> {
             Ok(())
         }
     }
+}
+
+/// The launch env's API key vars, for reloading keys later.
+fn key_env(env: &dyn Fn(&str) -> Option<String>) -> HashMap<String, String> {
+    [Vendor::Anthropic, Vendor::Openai]
+        .into_iter()
+        .map(crate::credentials::env_name)
+        .filter_map(|k| Some((k.to_owned(), env(k)?)))
+        .collect()
 }

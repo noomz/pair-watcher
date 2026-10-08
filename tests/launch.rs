@@ -32,7 +32,7 @@ fn claude_settings_route_wake_hooks_through_the_shim() {
     events.sort();
     assert_eq!(
         events,
-        ["PermissionRequest", "SessionStart", "Stop"],
+        ["PermissionRequest", "SessionEnd", "SessionStart", "Stop"],
         "V56: blocked = PermissionRequest, not Notification"
     );
     for (event, groups) in hooks {

@@ -703,3 +703,23 @@ fn cli_mute_and_pause_append_facts() {
     assert_eq!(b.muted, vec!["approach"]);
     assert!(!b.user_paused && b.nochallenge);
 }
+
+/// V51: `F` asks for the primary model back only while a fallback runs or a key is BLIND.
+#[test]
+fn f_requests_the_primary_model() {
+    let mut b = Board::new(0);
+    let mut ui = Ui::default();
+    let f = layout(&b, &ui, 64, 30);
+    assert_eq!(pane::key(&b, &mut ui, &f, Key::Char('F'), 0), Effect::None);
+    assert_eq!(ui.note.as_deref(), Some("already on the primary model"));
+    b.fallback = Some("claude-haiku-4-5".into());
+    let f = layout(&b, &ui, 64, 30);
+    assert_eq!(pane::key(&b, &mut ui, &f, Key::Char('F'), 0), Effect::Append(vec![Act::Primary.event()]));
+    b.fallback = None;
+    b.blind.insert(None, (0, "model key: 401".into()));
+    assert!(b.key_blind());
+    let f = layout(&b, &ui, 64, 30);
+    assert_eq!(pane::key(&b, &mut ui, &f, Key::Char('F'), 0), Effect::Append(vec![Act::Primary.event()]));
+    b.apply(&Record::now(Act::Primary.event()));
+    assert_eq!(b.primary_asked, 1);
+}

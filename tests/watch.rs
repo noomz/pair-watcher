@@ -16,6 +16,7 @@ use std::time::Duration;
 use pair_watcher::escalation::Notifier;
 use pair_watcher::event::{Event, Kind};
 use pair_watcher::home::Home;
+use pair_watcher::human::Act;
 use pair_watcher::mailbox::{Hook, Mailbox};
 use pair_watcher::placement::Placement;
 use pair_watcher::status::{Coverage, Op, Outcome, Wake};
@@ -652,4 +653,61 @@ fn turn_read_before_its_hook_is_not_lost() {
     assert_eq!(server.requests().len(), 2, "the turn end woke at once");
     w.step(t0 + 11_000).unwrap();
     assert!(!fx.status().iter().any(|s| matches!(s, Op::Blind { .. })));
+}
+
+/// V51: a Key failure with `fallback_model` set switches for the session; `primary` (after
+/// `auth`) brings the primary back from the next wake.
+#[test]
+fn primary_ends_a_key_fallback() {
+    let revoked = Arc::new(AtomicBool::new(true));
+    let r = revoked.clone();
+    let server = Server::start(move |b| {
+        if b["model"] == "claude-sonnet-5-5" && r.load(Ordering::SeqCst) { (401, json!({})) } else { reply("") }
+    });
+    let fx = Fx::new("companion", &server);
+    let launch = Launch { flags: vec!["fallback_model=claude-haiku-4-5".into()], only: vec![] };
+    watch::write_json(&fx.mb.dir().join(watch::LAUNCH_FILE), &launch).unwrap();
+    let mut w = fx.open();
+    fx.start();
+    fx.turn(1, "Done.");
+    fx.stop();
+    let t0 = now();
+    w.step(t0).unwrap();
+    let key = pair_watcher::status::Class::Key;
+    assert!(fx.status().contains(&Op::Fallback { model: "claude-haiku-4-5".into(), class: key }));
+    w.step(t0 + 1).unwrap();
+    revoked.store(false, Ordering::SeqCst);
+    fx.mb.log().append(Act::Primary.event()).unwrap();
+    w.step(t0 + 2).unwrap();
+    assert!(fx.status().contains(&Op::Primary), "V51: switched back");
+    fx.turn(2, "Done again.");
+    fx.stop();
+    w.step(t0 + 3).unwrap();
+    let models: Vec<String> = server.requests().iter().map(|b| b["model"].as_str().unwrap().to_owned()).collect();
+    assert_eq!(models, ["claude-sonnet-5-5", "claude-haiku-4-5", "claude-sonnet-5-5"]);
+    w.step(t0 + 4).unwrap();
+    assert_eq!(server.requests().len(), 3, "each request answered once");
+}
+
+/// V51, V89: with no fallback a Key failure is BLIND; `primary` retries at once and the accepted
+/// wake ends the BLIND.
+#[test]
+fn primary_retries_a_key_blind_watcher() {
+    let revoked = Arc::new(AtomicBool::new(true));
+    let r = revoked.clone();
+    let server = Server::start(move |_| if r.load(Ordering::SeqCst) { (401, json!({})) } else { reply("") });
+    let fx = Fx::new("companion", &server);
+    let mut w = fx.open();
+    fx.start();
+    fx.turn(1, "Done.");
+    fx.stop();
+    let t0 = now();
+    w.step(t0).unwrap();
+    assert!(w.board().key_blind());
+    revoked.store(false, Ordering::SeqCst);
+    fx.mb.log().append(Act::Primary.event()).unwrap();
+    w.step(t0 + 1).unwrap();
+    assert_eq!(server.requests().len(), 2);
+    assert!(fx.status().contains(&Op::BlindEnd { focus: None }));
+    assert!(!w.board().key_blind());
 }

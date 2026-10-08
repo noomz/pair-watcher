@@ -115,7 +115,10 @@ pub fn supervise(home: &Home, session: &str, worker_pid: i32) -> io::Result<()> 
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("session {session} is not registered")))?;
     let dir = mailbox.dir().to_path_buf();
     write_atomic(&dir.join(PID_FILE), std::process::id().to_string().as_bytes())?;
-    write_atomic(&dir.join(WORKER_PID_FILE), worker_pid.to_string().as_bytes())?;
+    // 0 = attached, pid unknown: the next hook writes it (`hook::learn_worker`).
+    if worker_pid > 0 {
+        write_atomic(&dir.join(WORKER_PID_FILE), worker_pid.to_string().as_bytes())?;
+    }
     beat(dir.join(HEARTBEAT_FILE_SUPERVISOR));
     let log = mailbox.log();
     let env = |k: &str| std::env::var(k).ok();
@@ -128,7 +131,11 @@ pub fn supervise(home: &Home, session: &str, worker_pid: i32) -> io::Result<()> 
     let mut child = Some(start(&exe, &mailbox)?);
     let mut started = now_ms();
     let (mut board, mut offset) = (Board::new(0), 0);
-    while alive(worker_pid) && mailbox.is_live() {
+    let mut worker = worker_pid;
+    while (worker <= 0 || alive(worker)) && mailbox.is_live() {
+        if worker <= 0 {
+            worker = read_pid(&dir.join(WORKER_PID_FILE)).unwrap_or(0);
+        }
         let batch = log.read_from(offset)?;
         offset = batch.next;
         batch.records.iter().for_each(|r| board.apply(r));
@@ -257,9 +264,10 @@ pub fn running(mailbox: &Mailbox, now: u64) -> bool {
 /// crash-loop BLIND. Returns what it did.
 pub fn attach(home: &Home, session: &str, exe: &Path) -> Result<String, String> {
     let Some(mailbox) = Mailbox::open_registered(home, session) else {
-        return Err(format!(
-            "session {session} is not live; attaching to a Worker not started by `run` needs `install` (T16)"
-        ));
+        if Mailbox::open(home, session).is_some() {
+            return Err(format!("session {session} has ended"));
+        }
+        return crate::run::attach_installed(home, session, exe);
     };
     let lifted = fs::remove_file(mailbox.dir().join(watch::CRASHES_FILE)).is_ok();
     if lifted {
@@ -268,8 +276,11 @@ pub fn attach(home: &Home, session: &str, exe: &Path) -> Result<String, String> 
     if running(&mailbox, now_ms()) {
         return Ok(if lifted { "crash-looped Watchers resume".into() } else { "already watched".into() });
     }
-    let worker = read_pid(&mailbox.dir().join(WORKER_PID_FILE)).filter(|p| alive(*p));
-    let Some(worker) = worker else { return Err(format!("session {session}: its Worker is gone")) };
-    spawn(exe, &mailbox, session, worker as u32).map_err(|e| e.to_string())?;
+    // An attached session may not know its Worker's pid yet.
+    let worker = read_pid(&mailbox.dir().join(WORKER_PID_FILE)).unwrap_or(0);
+    if worker > 0 && !alive(worker) {
+        return Err(format!("session {session}: its Worker is gone"));
+    }
+    spawn(exe, &mailbox, session, worker.max(0) as u32).map_err(|e| e.to_string())?;
     Ok("supervisor restarted".into())
 }

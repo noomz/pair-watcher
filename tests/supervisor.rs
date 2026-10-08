@@ -168,5 +168,5 @@ fn attach_lifts_crash_loop() {
     assert_eq!(msg, "crash-looped Watchers resume");
     assert!(!fx.mb.dir().join(watch::CRASHES_FILE).exists());
     assert_eq!(supervisor::attach(&fx.home, "s1", exe).unwrap(), "already watched");
-    assert!(supervisor::attach(&fx.home, "nope", exe).unwrap_err().contains("is not live"));
+    assert!(supervisor::attach(&fx.home, "nope", exe).unwrap_err().contains("no live session"));
 }

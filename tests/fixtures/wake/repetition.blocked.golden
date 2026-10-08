@@ -4,7 +4,7 @@ WATCHER PROMPT (T7 owns the text)
 blocked: the Worker waits on the human
 
 ## Blocked question
-{"tool_input":{"questions":[{"options":["yes","no"],"question":"Keep requesting reviews until reviewbot approves?"}]},"tool_name":"AskUserQuestion"}
+{"tool_input":{"questions":[{"question":"Keep requesting reviews until reviewbot approves?","options":["yes","no"]}]},"tool_name":"AskUserQuestion"}
 
 ## Task
 [prompt 1] address the review comments on PR #412 and get it approved

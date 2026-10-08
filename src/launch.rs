@@ -16,8 +16,9 @@ use crate::harness::Harness;
 use crate::hook::shell_line;
 
 /// Hooks reported through the shim (I5, V56). `SessionStart` carries the transcript path and the
-/// Worker session id, including the new ones after Claude `/clear` or a resume.
-pub const CLAUDE_EVENTS: [&str; 3] = ["SessionStart", "Stop", "PermissionRequest"];
+/// Worker session id, including the new ones after Claude `/clear` or a resume. `SessionEnd` never
+/// wakes: it lets an attached session learn its Worker's pid even when no other hook fires.
+pub const CLAUDE_EVENTS: [&str; 4] = ["SessionStart", "Stop", "PermissionRequest", "SessionEnd"];
 /// Codex `UserPromptSubmit`: a turn started, even one that calls no tool (delivery waits, V21).
 pub const CODEX_EVENTS: [&str; 6] =
     ["SessionStart", "Stop", "PermissionRequest", "PreToolUse", "PostToolUse", "UserPromptSubmit"];
@@ -64,17 +65,22 @@ fn hook_group(shim: &Path, event: &str) -> Toml {
     Toml::Array(vec![group.into()])
 }
 
-/// Contents of the `--settings` file.
-pub fn claude_settings(shim: &Path) -> Value {
-    let hooks: serde_json::Map<String, Value> = CLAUDE_EVENTS
+/// `{<event>: [group]}`, one group running the shim per event: the shape of Claude settings
+/// `hooks` and Codex `hooks.json`.
+pub fn hook_groups(shim: &Path, events: &[&str]) -> serde_json::Map<String, Value> {
+    events
         .iter()
         .map(|ev| {
             let entry =
                 json!([{"hooks": [{"type": "command", "command": hook_command(shim, ev), "timeout": HOOK_TIMEOUT_S}]}]);
             ((*ev).to_owned(), entry)
         })
-        .collect();
-    json!({ "hooks": hooks })
+        .collect()
+}
+
+/// Contents of the `--settings` file.
+pub fn claude_settings(shim: &Path) -> Value {
+    json!({ "hooks": hook_groups(shim, &CLAUDE_EVENTS) })
 }
 
 pub fn claude_args(settings_file: &Path, mod_dir: &Path) -> Vec<String> {

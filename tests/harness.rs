@@ -23,7 +23,11 @@ fn version_is_read_from_each_harness_output() {
 #[test]
 fn compat_table_marks_newer_versions_untested() {
     assert_eq!(Support::of(Harness::Claude, Some(Version(2, 1, 289))), Support::Tested);
-    assert_eq!(Support::of(Harness::Claude, Some(Version(2, 1, 100))), Support::Tested, "no minimum until T16");
+    assert_eq!(Support::of(Harness::Claude, Some(Version(2, 1, 287))), Support::Tested, "minimum itself runs");
+    assert_eq!(Support::of(Harness::Claude, Some(Version(2, 1, 286))), Support::BelowMinimum(Version(2, 1, 286)));
+    assert_eq!(Support::of(Harness::Codex, Some(Version(0, 148, 9))), Support::BelowMinimum(Version(0, 148, 9)));
+    assert_eq!(Support::of(Harness::Pi, Some(Version(0, 80, 3))), Support::BelowMinimum(Version(0, 80, 3)));
+    assert_eq!(Support::of(Harness::Pi, Some(Version(0, 80, 4))), Support::Tested);
     let newer = Support::of(Harness::Codex, Some(Version(0, 160, 1)));
     assert_eq!(newer, Support::Untested(Some(Version(0, 160, 1))));
     assert!(newer.hooks(), "V60: newer → run with hooks");

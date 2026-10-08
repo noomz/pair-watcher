@@ -25,6 +25,8 @@ pub enum Act {
     Mute { focus: String },
     /// `a`: no auto-Challenges for the session (V23).
     Nochallenge,
+    /// `F` / `/pw primary` / `primary` (V51): back to the primary model, after `pair-watcher auth`.
+    Primary,
     /// `s` (V77): the ruling or dismissal on Concern `id` kept as Standing ruling `ruling` (V78).
     RulingRemembered {
         id: String,

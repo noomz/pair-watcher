@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use toml::Table;
 
-use crate::home::Home;
+use crate::home::{Home, write_atomic};
 use crate::models::Vendor;
 use crate::problem::tilde;
 
@@ -97,4 +97,23 @@ fn read_file(home: &Home) -> Result<Option<Table>, CredError> {
     let text = fs::read_to_string(&path).map_err(|e| CredError::Unreadable(path.clone(), e.to_string()))?;
     // The parse error would quote the line, i.e. a key: report the file only.
     text.parse::<Table>().map(Some).map_err(|_| CredError::Unreadable(path, "unparseable".into()))
+}
+
+/// `auth`: sets each given key in `credentials`, keeping the rest of the file; written 0600, which
+/// also fixes a file that was group/world-readable (C8).
+pub fn store(home: &Home, keys: &[(Vendor, String)]) -> io::Result<()> {
+    let path = home.credentials_file();
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    // The parse error would quote the line, i.e. a key: report the file only.
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("{}: unparseable", tilde(&path))))?;
+    for (vendor, key) in keys {
+        doc.insert(env_name(*vendor), toml_edit::value(key.trim()));
+    }
+    write_atomic(&path, doc.to_string().as_bytes())
 }

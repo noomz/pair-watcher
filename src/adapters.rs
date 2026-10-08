@@ -10,12 +10,14 @@ use crate::home::{Home, write_atomic};
 
 /// (path under the version dir, contents). Tests and generated mod types stay out.
 const FILES: [(&str, &str); 4] = [
-    (PI_EXTENSION, include_str!("../adapters/pi/pair-watcher.ts")),
+    (PI_EXTENSION, PI_SOURCE),
     ("claude/.claude-plugin/plugin.json", include_str!("../adapters/claude/.claude-plugin/plugin.json")),
     ("claude/hooks/hooks.json", include_str!("../adapters/claude/hooks/hooks.json")),
     ("claude/hooks/register.ts", include_str!("../adapters/claude/hooks/register.ts")),
 ];
 
+/// The pi extension, also what `install pi` writes (V59).
+pub const PI_SOURCE: &str = include_str!("../adapters/pi/pair-watcher.ts");
 /// pi `-e` target, relative to the version dir.
 pub const PI_EXTENSION: &str = "pi/pair-watcher.ts";
 /// Claude `--plugin-dir` target (the mod, I8), relative to the version dir.

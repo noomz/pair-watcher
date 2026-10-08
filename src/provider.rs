@@ -81,6 +81,11 @@ pub struct Api {
 }
 
 impl Api {
+    /// After `pair-watcher auth` (V51): calls use the reloaded keys.
+    pub fn set_keys(&mut self, keys: Keys) {
+        self.keys = keys;
+    }
+
     /// Base URLs from the standard `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`; `timeout` bounds each
     /// request.
     pub fn new(keys: Keys, env: &dyn Fn(&str) -> Option<String>, timeout: Duration) -> Api {

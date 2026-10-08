@@ -27,9 +27,14 @@ pub fn run(event: &str) {
     if std::env::var_os(GUARD_ENV).is_some() {
         return;
     }
-    let Ok(Some((mailbox, payload))) = registered(io::stdin().lock(), std::env::var(SESSION_ENV).ok()) else {
+    let launched = std::env::var(SESSION_ENV).ok();
+    let attached = launched.is_none();
+    let Ok(Some((mailbox, payload))) = registered(io::stdin().lock(), launched) else {
         return;
     };
+    if attached {
+        learn_worker(&mailbox);
+    }
     if event == "Stop" {
         // A panic must not cost the record below.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -55,6 +60,47 @@ fn registered(mut input: impl Read, launched: Option<String>) -> io::Result<Opti
     };
     let Some(mailbox) = Mailbox::open_registered(&home, id) else { return Ok(None) };
     Ok(Some((mailbox, payload)))
+}
+
+/// Names between a hook and its Worker: shells, `env`, the shim.
+const SHELLS: [&str; 8] = ["sh", "bash", "zsh", "dash", "fish", "ksh", "env", "pw-hook"];
+
+/// The Worker among a hook's ancestors (nearest first, `(pid, command name)`): the first that is
+/// not a shell.
+pub fn pick_worker(chain: impl IntoIterator<Item = (i32, String)>) -> Option<i32> {
+    chain
+        .into_iter()
+        .find(|(_, name)| {
+            let base = name.rsplit('/').next().unwrap_or(name).trim_start_matches('-');
+            !SHELLS.contains(&base)
+        })
+        .map(|(pid, _)| pid)
+        .filter(|pid| *pid > 1)
+}
+
+/// An attached session learns its Worker's pid from its first hook, so the supervisor can end the
+/// session when the Worker exits (V90). Once written, later hooks skip the walk.
+fn learn_worker(mailbox: &Mailbox) {
+    let path = mailbox.dir().join(crate::supervisor::WORKER_PID_FILE);
+    if path.exists() {
+        return;
+    }
+    // SAFETY: getppid has no preconditions.
+    let parent = unsafe { libc::getppid() };
+    let chain = std::iter::successors(Some(parent), |pid| parent_of(*pid).map(|(ppid, _)| ppid))
+        .take(8)
+        .filter_map(|pid| Some((pid, parent_of(pid)?.1)));
+    if let Some(pid) = pick_worker(chain) {
+        let _ = crate::home::write_atomic(&path, pid.to_string().as_bytes());
+    }
+}
+
+/// `(ppid, command name)` of `pid`.
+fn parent_of(pid: i32) -> Option<(i32, String)> {
+    let out = std::process::Command::new("ps").args(["-o", "ppid=,comm=", "-p", &pid.to_string()]).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (ppid, name) = text.trim().split_once(char::is_whitespace)?;
+    Some((ppid.trim().parse().ok()?, name.trim().to_owned()))
 }
 
 /// Writes `bin/pw-hook`: execs `exe` while it exists, else exits 0, so a removed binary stays

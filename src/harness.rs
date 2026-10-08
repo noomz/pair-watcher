@@ -31,12 +31,15 @@ impl Harness {
         }
     }
 
-    /// Minimum (`None` until T16 sets it) and last-tested version (C5).
-    fn compat(self) -> (Option<Version>, Version) {
+    pub const ALL: [Harness; 3] = [Harness::Claude, Harness::Codex, Harness::Pi];
+
+    /// Minimum and last-tested version (C5). Minimum = first release with every surface the
+    /// adapters use: Claude mods (2.1.287), `codex queue` (0.149.0), pi `agent_settled` (0.80.4).
+    pub fn compat(self) -> (Version, Version) {
         match self {
-            Harness::Claude => (None, Version(2, 1, 289)),
-            Harness::Codex => (None, Version(0, 160, 0)),
-            Harness::Pi => (None, Version(1, 0, 2)),
+            Harness::Claude => (Version(2, 1, 287), Version(2, 1, 289)),
+            Harness::Codex => (Version(0, 149, 0), Version(0, 160, 0)),
+            Harness::Pi => (Version(0, 80, 4), Version(1, 0, 2)),
         }
     }
 }
@@ -88,7 +91,7 @@ impl Support {
         let (minimum, tested) = harness.compat();
         match version {
             None => Support::Untested(None),
-            Some(v) if minimum.is_some_and(|m| v < m) => Support::BelowMinimum(v),
+            Some(v) if v < minimum => Support::BelowMinimum(v),
             Some(v) if v > tested => Support::Untested(Some(v)),
             Some(_) => Support::Tested,
         }

@@ -59,6 +59,38 @@ impl Drop for Raw {
     }
 }
 
+/// Typed input is not echoed until dropped (`auth` reads keys).
+pub struct NoEcho {
+    orig: libc::termios,
+}
+
+impl NoEcho {
+    pub fn enter() -> io::Result<NoEcho> {
+        let fd = io::stdin().as_raw_fd();
+        let mut t = MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: tcgetattr fills `t` on success; checked before use.
+        if unsafe { libc::tcgetattr(fd, t.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: initialised by the successful tcgetattr above.
+        let orig = unsafe { t.assume_init() };
+        let mut quiet = orig;
+        quiet.c_lflag &= !libc::ECHO;
+        // SAFETY: `quiet` is a valid termios copied from the terminal's own.
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(NoEcho { orig })
+    }
+}
+
+impl Drop for NoEcho {
+    fn drop(&mut self) {
+        // SAFETY: restores the attributes read in `enter`.
+        unsafe { libc::tcsetattr(io::stdin().as_raw_fd(), libc::TCSANOW, &self.orig) };
+    }
+}
+
 static STOP: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn stop(_: libc::c_int) {

@@ -65,6 +65,9 @@ pub fn jitter() -> f64 {
     f64::from(nanos % 1000) / 1000.0
 }
 
+/// BLIND reason prefix of a Key failure (V86).
+pub const KEY_BLIND: &str = "model key";
+
 /// What a [`Health`] change asks the loop to log or do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
@@ -136,7 +139,7 @@ impl Health {
                     self.rewake_at = Some(now + MIN_MS);
                 }
             }
-            Class::Key => out.extend(self.go_blind(now, &format!("model key: {error}"))),
+            Class::Key => out.extend(self.go_blind(now, &format!("{KEY_BLIND}: {error}"))),
         }
         out
     }

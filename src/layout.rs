@@ -631,7 +631,7 @@ fn stream(b: &Board, ui: &Ui, width: usize, rows: usize) -> Vec<Row> {
         .collect()
 }
 
-const KEYS: [(&str, &str); 20] = [
+const KEYS: [(&str, &str); 21] = [
     ("j k ↑ ↓", "select"),
     ("⏎", "expand / collapse the Debate log"),
     ("y", "NEEDS YOU / IN DEBATE: side with the Watcher (it tells the Worker)"),
@@ -649,6 +649,7 @@ const KEYS: [(&str, &str); 20] = [
     ("m", "mute the Concern's Focus (session)"),
     ("a", "no auto-Challenge (session)"),
     ("Z", "pause / resume the Watcher (you)"),
+    ("F", "back to the primary model (after `pair-watcher auth`)"),
     ("$", "add $5 and resume"),
     ("?", "this help"),
     ("q", "quit the pane"),

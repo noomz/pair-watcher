@@ -93,7 +93,7 @@ export const register: Register = on => {
     await $.command.register({ name: 'commentary', description: 'Open the pair-watcher Commentary pane', immediate: true })
     await $.command.register({
       name: 'pw',
-      description: 'pair-watcher: rule <id> watcher|worker|dismiss, undo, keep, mute <focus>, nochallenge, pause',
+      description: 'pair-watcher: rule <id> watcher|worker|dismiss, undo, keep, mute <focus>, nochallenge, pause, primary',
       immediate: true,
     })
     $.clock.every(POLL_MS, () => tick($))

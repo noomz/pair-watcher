@@ -87,14 +87,14 @@ fn hook_is_silent_and_later_commands_name_their_task() {
     let out = pw(t.path(), t.path(), &["hook", "Stop", "--anything"]);
     assert!(out.status.success() && out.stdout.is_empty() && out.stderr.is_empty());
 
-    let out = pw(t.path(), t.path(), &["doctor"]);
+    let out = pw(t.path(), t.path(), &["report"]);
     assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("(T16)"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("(T18)"));
 
-    // V90: `attach` re-adopts a live session only.
+    // `attach` needs a live session or a Worker transcript.
     let out = pw(t.path(), t.path(), &["attach", "s1"]);
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("is not live"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no live session"));
 }
 
 #[test]
@@ -147,4 +147,58 @@ fn run_flag_layer_orders_shortcuts_last() {
     let Command::Run(run) = cli.command else { panic!() };
     assert_eq!(run.flag_layer(), ["mode=companion", "mode=swarm", "ceiling_usd=2.5"]);
     assert_eq!(run.worker, ["claude"]);
+}
+
+fn pw_stdin(home: &Path, args: &[&str], stdin: &str) -> Output {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pair-watcher"))
+        .args(args)
+        .env("HOME", home)
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("OPENAI_API_KEY")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+/// I18, C8: `auth` writes keys 0600, keeps the rest, and an empty answer keeps a key.
+#[test]
+fn auth_stores_keys_0600() {
+    let t = TempDir::new().unwrap();
+    let creds = t.path().join(".pair-watcher/credentials");
+    let out = pw_stdin(t.path(), &["auth"], "sk-ant\n\n");
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(fs::metadata(&creds).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(fs::read_to_string(&creds).unwrap(), "ANTHROPIC_API_KEY = \"sk-ant\"\n");
+
+    fs::set_permissions(&creds, fs::Permissions::from_mode(0o644)).unwrap();
+    let out = pw_stdin(t.path(), &["auth"], "\nsk-oai\n");
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(fs::metadata(&creds).unwrap().permissions().mode() & 0o777, 0o600, "exposed file fixed");
+    assert_eq!(fs::read_to_string(&creds).unwrap(), "ANTHROPIC_API_KEY = \"sk-ant\"\nOPENAI_API_KEY = \"sk-oai\"\n");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("sk-"), "keys never printed");
+
+    let out = pw_stdin(t.path(), &["auth"], "\n\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "no keys changed");
+}
+
+/// V51: `primary` appends the human fact for the session.
+#[test]
+fn primary_is_a_session_fact() {
+    let t = TempDir::new().unwrap();
+    let home = pair_watcher::home::Home::new(t.path().join(".pair-watcher"));
+    home.ensure_layout().unwrap();
+    let mb = pair_watcher::mailbox::Mailbox::register(&home, "s1").unwrap();
+    let out = pw(t.path(), t.path(), &["primary", "--session", "s1"]);
+    assert!(out.status.success(), "{out:?}");
+    let records = mb.log().read_from(0).unwrap().records;
+    assert_eq!(
+        records.last().unwrap().body.parse::<pair_watcher::human::Act>(),
+        Some(pair_watcher::human::Act::Primary)
+    );
 }

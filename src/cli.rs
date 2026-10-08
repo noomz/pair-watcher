@@ -1,20 +1,26 @@
 //! CLI surface (I1). Commands owned by later §T tasks parse fully and report which task builds them.
 
+use std::ffi::OsStr;
+use std::path::Path;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+use crate::credentials::{self, Keys};
 use crate::delivery::{self, Route, Worker};
 use crate::focus::FocusSource;
+use crate::harness::{self, Harness};
 use crate::home::Home;
 use crate::human::Act;
 use crate::jsonl::now_ms;
 use crate::mailbox::Mailbox;
+use crate::models::Vendor;
 use crate::outbox::Claim;
 use crate::problem::{Problem, tilde};
 use crate::ruling::{self, Rulings, Surface, Via};
 use crate::status::Op as StatusOp;
-use crate::{config, hook, mailbox, models, pane, repo, run, standing, supervisor};
+use crate::{config, doctor, hook, install, launch, mailbox, models, pane, repo, run, standing, supervisor};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -77,6 +83,8 @@ pub enum Command {
     Nochallenge(SessionArg),
     /// Pause the Watcher for this session
     Pause(SessionArg),
+    /// Back to the primary model after `pair-watcher auth` (V51)
+    Primary(SessionArg),
     /// Rule on an Escalation
     Rule {
         id: String,
@@ -293,11 +301,17 @@ fn dispatch(command: Command, via: Via) -> ExitCode {
             m.log().append(Act::Nochallenge.event()).map(|()| "no auto-Challenge".to_owned())
         }),
         Command::Pause(session) => session_fact(&session, pause),
+        Command::Primary(session) => session_fact(&session, |m| {
+            m.log().append(Act::Primary.event()).map(|()| "primary model requested".to_owned())
+        }),
         Command::Rule { id, side, session } => session_fact(&session, |m| rule(m, &id, side, via)),
         Command::Undo(session) => session_fact(&session, |m| undo(m, via)),
         Command::Keep(session) => session_fact(&session, |m| keep(m, via)),
         Command::Rulings { action } => rulings(action),
-        Command::Install { .. } | Command::Uninstall { .. } | Command::Auth | Command::Doctor => later("T16"),
+        Command::Install { target } => install_cmd(target, true),
+        Command::Uninstall { target } => install_cmd(target, false),
+        Command::Auth => auth(),
+        Command::Doctor => doctor_cmd(),
         Command::Models { action } => models_cmd(action),
         Command::Prefilter { .. } => later("T17"),
         Command::Report { .. }
@@ -366,7 +380,7 @@ enum AdapterWorker {
 }
 
 /// Session commands `/pw` may run (I8).
-const PW_COMMANDS: [&str; 6] = ["rule", "undo", "keep", "mute", "nochallenge", "pause"];
+const PW_COMMANDS: [&str; 7] = ["rule", "undo", "keep", "mute", "nochallenge", "pause", "primary"];
 
 /// Fail-silent like a hook: a no-op under the Watcher guard or for an unregistered session.
 fn adapter(args: &[String]) -> ExitCode {
@@ -572,6 +586,123 @@ fn pause(m: &Mailbox) -> std::io::Result<String> {
         if board.user_paused { (StatusOp::UserResume, "resumed") } else { (StatusOp::UserPause, "paused (you)") };
     m.log().append(op.event())?;
     Ok(done.to_owned())
+}
+
+impl Target {
+    fn harnesses(self) -> Vec<Harness> {
+        match self {
+            Target::Claude => vec![Harness::Claude],
+            Target::Codex => vec![Harness::Codex],
+            Target::Pi => vec![Harness::Pi],
+            Target::All => Harness::ALL.to_vec(),
+        }
+    }
+}
+
+/// `install|uninstall <harness|all>` (V59); `install all` skips harnesses not on PATH.
+fn install_cmd(target: Target, add: bool) -> ExitCode {
+    let home = match Home::from_env().and_then(|h| h.ensure_layout().map(|()| h)) {
+        Ok(h) => h,
+        Err(e) => return fail(&e.to_string()),
+    };
+    let env = |k: &str| std::env::var(k).ok();
+    let (paths, exe) = match install::Paths::from_env(&env).and_then(|p| Ok((p, std::env::current_exe()?))) {
+        Ok(x) => x,
+        Err(e) => return fail(&e.to_string()),
+    };
+    let cwd = home.root().parent().map_or_else(|| home.root().to_path_buf(), Path::to_path_buf);
+    let codex_list = || launch::codex_hooks_list(OsStr::new("codex"), &[], &cwd, Duration::from_secs(10));
+    let cx = install::Ctx { home: &home, paths: &paths, exe: &exe, codex_list: &codex_list };
+    let mut failed = false;
+    for h in target.harnesses() {
+        if add && matches!(target, Target::All) && harness::probe(OsStr::new(h.name())).is_none() {
+            println!("{}: not found on PATH, skipped", h.name());
+            continue;
+        }
+        let result = if add { install::install(&cx, h) } else { install::uninstall(&home, &paths, h) };
+        match result {
+            Ok(lines) if lines.is_empty() => println!("{}: nothing of ours to remove", h.name()),
+            Ok(lines) => lines.iter().for_each(|l| println!("{l}")),
+            Err(e) => {
+                eprintln!("pair-watcher: {} {}: {e}", if add { "install" } else { "uninstall" }, h.name());
+                failed = true;
+            }
+        }
+    }
+    if add && !failed {
+        println!("hooks stay silent until a session is watched: `pair-watcher attach <session id>`");
+    }
+    if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+}
+
+/// `auth` (I18): one key per vendor, read without echo on a terminal (a line each otherwise);
+/// empty keeps the current one.
+fn auth() -> ExitCode {
+    use std::io::{BufRead, IsTerminal, Write};
+    let home = match Home::from_env().and_then(|h| h.ensure_layout().map(|()| h)) {
+        Ok(h) => h,
+        Err(e) => return fail(&e.to_string()),
+    };
+    let env = |k: &str| std::env::var(k).ok();
+    let current = Keys::load(&home, &env);
+    let tty = std::io::stdin().is_terminal();
+    let mut input = std::io::stdin().lock();
+    let mut updates = Vec::new();
+    for vendor in [Vendor::Anthropic, Vendor::Openai] {
+        let name = credentials::env_name(vendor);
+        let have = if current.get(vendor).is_some() { "set; enter keeps it" } else { "enter skips" };
+        eprint!("{name} ({have}): ");
+        let _ = std::io::stderr().flush();
+        let quiet = if tty { crate::term::NoEcho::enter().ok() } else { None };
+        let mut line = String::new();
+        let read = input.read_line(&mut line);
+        drop(quiet);
+        if tty {
+            eprintln!();
+        }
+        if let Err(e) = read {
+            return fail(&e.to_string());
+        }
+        if !line.trim().is_empty() {
+            updates.push((vendor, line.trim().to_owned()));
+        }
+    }
+    if updates.is_empty() {
+        println!("no keys changed");
+        return ExitCode::SUCCESS;
+    }
+    if let Err(e) = credentials::store(&home, &updates) {
+        return fail(&e.to_string());
+    }
+    println!("saved to {} (0600)", tilde(&home.credentials_file()));
+    if !mailbox::live(&home).is_empty() {
+        println!("a running session takes the new key with `pair-watcher primary` (pane F, /pw primary)");
+    }
+    ExitCode::SUCCESS
+}
+
+/// `doctor` (V85): non-zero only when the Watcher would be BLIND or cannot start.
+fn doctor_cmd() -> ExitCode {
+    let (home, cwd) = match Home::from_env().and_then(|h| Ok((h, std::env::current_dir()?))) {
+        Ok(x) => x,
+        Err(e) => return fail(&e.to_string()),
+    };
+    let env = |k: &str| std::env::var(k).ok();
+    let user = home.root().parent().map_or_else(|| home.root().to_path_buf(), Path::to_path_buf);
+    let probes = doctor::Probes {
+        env: &env,
+        version: &|h: Harness| harness::probe(OsStr::new(h.name())),
+        codex_list: &|| launch::codex_hooks_list(OsStr::new("codex"), &[], &user, Duration::from_secs(10)),
+        ollama: &doctor::ollama_models,
+        now: std::time::SystemTime::now(),
+    };
+    let lines = doctor::check(&home, &cwd, &probes);
+    lines.iter().for_each(|l| println!("{l}"));
+    if doctor::failed(&lines) {
+        println!("the Watcher would be BLIND or cannot start");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
 }
 
 fn later(task: &str) -> ExitCode {

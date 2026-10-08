@@ -114,6 +114,8 @@ pub struct Board {
     pub lagging: BTreeMap<Option<String>, u64>,
     pub blind: BTreeMap<Option<String>, (u64, String)>,
     pub fallback: Option<String>,
+    /// `primary` requests so far (V51); the Watcher answers each once.
+    pub primary_asked: usize,
     /// The session's one BLIND notification went out (V41).
     pub blind_notified: bool,
     pub nochallenge: bool,
@@ -157,6 +159,7 @@ impl Board {
             lagging: BTreeMap::new(),
             blind: BTreeMap::new(),
             fallback: None,
+            primary_asked: 0,
             blind_notified: false,
             nochallenge: false,
             muted: Vec::new(),
@@ -185,6 +188,11 @@ impl Board {
     }
 
     /// The Escalations still waiting on the human (NEEDS YOU), oldest first.
+    /// A Watcher is BLIND on a model key failure (V86): `F` may bring it back after `auth`.
+    pub fn key_blind(&self) -> bool {
+        self.blind.values().any(|(_, reason)| reason.starts_with(crate::fail::KEY_BLIND))
+    }
+
     pub fn needs_you(&self) -> impl Iterator<Item = &escalation::Escalation> {
         self.escalations.all().iter().filter(|e| self.rulings.is_open(e))
     }
@@ -432,6 +440,10 @@ impl Board {
                     self.muted.push(focus.clone());
                 }
                 self.tick(t, format!("muted: {focus} (this session)"), Tone::Plain);
+            }
+            Some(Act::Primary) => {
+                self.primary_asked += 1;
+                self.tick(t, "primary model requested".to_owned(), Tone::Plain);
             }
             Some(Act::Nochallenge) => {
                 self.nochallenge = true;
@@ -840,6 +852,8 @@ pub fn key(b: &Board, ui: &mut Ui, frame: &Frame, k: Key, now: u64) -> Effect {
             None => ui.note = Some("select a Concern (or filter a Focus) to mute".to_owned()),
         },
         Key::Char('a') if !b.nochallenge => return append(Act::Nochallenge),
+        Key::Char('F') if b.fallback.is_some() || b.key_blind() => return append(Act::Primary),
+        Key::Char('F') => ui.note = Some("already on the primary model".to_owned()),
         Key::Char('Z') => {
             let op = if b.user_paused { StatusOp::UserResume } else { StatusOp::UserPause };
             return Effect::Append(vec![op.event()]);

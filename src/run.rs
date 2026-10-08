@@ -131,8 +131,10 @@ fn wire(l: &Launch) -> io::Result<(Plan, Vec<String>)> {
     let shim = hook::write_shim(home, &exe)?;
     let adapters = adapters::write(home)?;
     let mut notes: Vec<String> = support.note(harness).into_iter().collect();
+    // Installed hooks already route by the session env var; per-session ones would fire twice.
+    let installed = crate::install::installed(home, harness).is_some();
 
-    let ours = if !support.hooks() {
+    let ours = if !support.hooks() || installed {
         Vec::new()
     } else {
         match harness {
@@ -166,7 +168,7 @@ fn wire(l: &Launch) -> io::Result<(Plan, Vec<String>)> {
             Harness::Pi => launch::pi_args(&adapters.join(adapters::PI_EXTENSION)),
         }
     };
-    let observe_only = ours.is_empty();
+    let observe_only = ours.is_empty() && !(installed && support.hooks());
     let plan = Plan::new(worker, ours);
 
     // Never blocks the Worker: a store that cannot be read loads no rulings (V78).
@@ -175,7 +177,8 @@ fn wire(l: &Launch) -> io::Result<(Plan, Vec<String>)> {
         ..standing::Start::default()
     });
     notes.extend(rulings.notes.iter().cloned());
-    mailbox.log().append(session_start(l, observe_only, &notes, &rulings))?;
+    let start = Start { cwd: l.cwd, harness, version: l.version, observe_only, notes: &notes, rulings: &rulings };
+    mailbox.log().append(session_start(l.loaded, &start))?;
     if let Some(edited) = &rulings.edited {
         mailbox.log().append(edited.event())?;
     }
@@ -183,9 +186,18 @@ fn wire(l: &Launch) -> io::Result<(Plan, Vec<String>)> {
     Ok((plan, notes))
 }
 
+struct Start<'a> {
+    cwd: &'a Path,
+    harness: Harness,
+    version: Option<Version>,
+    observe_only: bool,
+    notes: &'a [String],
+    rulings: &'a standing::Start,
+}
+
 /// `session` start (V94); Worker model is read later from the transcript.
-fn session_start(l: &Launch, observe_only: bool, notes: &[String], rulings: &standing::Start) -> Event {
-    let loaded = l.loaded;
+fn session_start(loaded: &Loaded, l: &Start) -> Event {
+    let (observe_only, notes, rulings) = (l.observe_only, l.notes, l.rulings);
     let mode = loaded.resolved.get("mode").and_then(toml::Value::as_str).unwrap_or("companion");
     let focuses: Vec<&str> = loaded.focuses.enabled.iter().map(|f| f.name.as_str()).collect();
     let layers: Vec<String> = loaded.resolved.layer_files.iter().map(|p| p.to_string_lossy().into_owned()).collect();
@@ -279,3 +291,115 @@ fn exec(plan: &Plan, session: Option<&str>) -> ExitCode {
     eprintln!("pair-watcher: cannot start {}: {err}", plan.program.to_string_lossy());
     ExitCode::from(127)
 }
+
+/// A Worker session found by its id in its harness's transcript store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Found {
+    pub harness: Harness,
+    pub transcript: PathBuf,
+    pub cwd: PathBuf,
+}
+
+/// The transcript of Worker session `id`: Claude `projects/*/<id>.jsonl`, Codex
+/// `sessions/**/rollout-*-<id>.jsonl`, pi `sessions/*/*_<id>.jsonl`; harness dirs follow the
+/// same env vars as `install`.
+pub fn find_transcript(env: &dyn Fn(&str) -> Option<String>, id: &str) -> Option<Found> {
+    if !crate::mailbox::valid_session_id(id) {
+        return None;
+    }
+    let home = PathBuf::from(env("HOME").filter(|h| !h.is_empty())?);
+    let dir =
+        |var: &str, default: &str| env(var).filter(|v| !v.is_empty()).map_or_else(|| home.join(default), PathBuf::from);
+    let found = |harness, transcript: PathBuf, pointer: &str| {
+        let cwd = first_cwd(&transcript, pointer)?;
+        Some(Found { harness, transcript, cwd })
+    };
+    let claude = dir("CLAUDE_CONFIG_DIR", ".claude").join("projects");
+    let name = format!("{id}.jsonl");
+    if let Some(f) = files(&claude, 1).into_iter().find(|f| f.file_name().is_some_and(|n| n == name.as_str())) {
+        return found(Harness::Claude, f, "/cwd");
+    }
+    let suffix = format!("-{id}.jsonl");
+    let codex = dir("CODEX_HOME", ".codex").join("sessions");
+    let is_rollout = |n: &str| n.starts_with("rollout-") && n.ends_with(&suffix);
+    if let Some(f) =
+        files(&codex, 3).into_iter().find(|f| f.file_name().and_then(|n| n.to_str()).is_some_and(is_rollout))
+    {
+        return found(Harness::Codex, f, "/payload/cwd");
+    }
+    let pi = env("PI_CODING_AGENT_SESSION_DIR")
+        .filter(|v| !v.is_empty())
+        .map_or_else(|| dir("PI_CODING_AGENT_DIR", ".pi/agent").join("sessions"), PathBuf::from);
+    let suffix = format!("_{id}.jsonl");
+    let f = files(&pi, 1)
+        .into_iter()
+        .find(|f| f.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(&suffix)))?;
+    found(Harness::Pi, f, "/cwd")
+}
+
+/// Files `depth` dirs below `root`.
+fn files(root: &Path, depth: usize) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(root) else { return Vec::new() };
+    let paths = entries.filter_map(|e| e.ok()).map(|e| e.path());
+    if depth == 0 {
+        return paths.filter(|p| p.is_file()).collect();
+    }
+    paths.filter(|p| p.is_dir()).flat_map(|p| files(&p, depth - 1)).collect()
+}
+
+/// The first `pointer` value among the transcript's first lines (Claude puts `cwd` on entries,
+/// Codex on `session_meta`, pi on its header).
+fn first_cwd(path: &Path, pointer: &str) -> Option<PathBuf> {
+    let file = std::fs::File::open(path).ok()?;
+    io::BufRead::lines(io::BufReader::new(file))
+        .take(200)
+        .map_while(Result::ok)
+        .find_map(|line| serde_json::from_str::<Value>(&line).ok()?.pointer(pointer)?.as_str().map(PathBuf::from))
+}
+
+/// `attach <id>` for a Worker started without `run` (V58, V61): its harness must be installed so
+/// its hooks route by payload session id. Registers the mailbox under the Worker session id, logs
+/// the session start, adopts the transcript from its end (earlier content predates the session)
+/// and starts the supervisor; the next hook tells it the Worker's pid.
+pub fn attach_installed(home: &Home, id: &str, exe: &Path) -> Result<String, String> {
+    let env = |k: &str| std::env::var(k).ok();
+    let found = find_transcript(&env, id)
+        .ok_or_else(|| format!("no live session {id} and no Claude, Codex or pi transcript for it"))?;
+    let harness = found.harness;
+    if crate::install::installed(home, harness).is_none() {
+        return Err(format!(
+            "session {id} is a {0} session not started by `run`: `pair-watcher install {0}` first, then restart it",
+            harness.name()
+        ));
+    }
+    home.ensure_layout().map_err(|e| e.to_string())?;
+    let loaded = load(home, &found.cwd, &[], &[]).map_err(|u| u.to_string())?;
+    let mailbox = Mailbox::register(home, id).map_err(|e| e.to_string())?;
+    let result = (|| -> io::Result<()> {
+        crate::watch::write_json(&mailbox.dir().join(crate::watch::LAUNCH_FILE), &crate::watch::Launch::default())?;
+        let version = harness::probe(std::ffi::OsStr::new(harness.name()));
+        let mut notes: Vec<String> = Support::of(harness, version).note(harness).into_iter().collect();
+        let rulings = standing::start(&standing::path(home, &standing::key(&found.cwd))).unwrap_or_else(|e| {
+            standing::Start { notes: vec![format!("rulings unavailable: {e}")], ..standing::Start::default() }
+        });
+        notes.extend(rulings.notes.iter().cloned());
+        let observe_only = !Support::of(harness, version).hooks();
+        let start = Start { cwd: &found.cwd, harness, version, observe_only, notes: &notes, rulings: &rulings };
+        mailbox.log().append(session_start(&loaded, &start))?;
+        if let Some(edited) = &rulings.edited {
+            mailbox.log().append(edited.event())?;
+        }
+        let payload =
+            json!({"session_id": id, "transcript_path": found.transcript, "cwd": found.cwd, "source": "resume"});
+        mailbox.append_hook(&crate::mailbox::Hook { event: ATTACH_EVENT.into(), payload })?;
+        supervisor::spawn(exe, &mailbox, id, 0)
+    })();
+    if let Err(e) = result {
+        let _ = mailbox.unregister();
+        return Err(e.to_string());
+    }
+    Ok(format!("watching {} session in {}", harness.name(), found.cwd.display()))
+}
+
+/// The hook record `attach` writes: the transcript to tail, from its end. It never wakes.
+pub const ATTACH_EVENT: &str = "attach";
