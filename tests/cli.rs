@@ -87,9 +87,15 @@ fn hook_is_silent_and_later_commands_name_their_task() {
     let out = pw(t.path(), t.path(), &["hook", "Stop", "--anything"]);
     assert!(out.status.success() && out.stdout.is_empty() && out.stderr.is_empty());
 
-    let out = pw(t.path(), t.path(), &["report"]);
+    let out = pw(t.path(), t.path(), &["mcp"]);
     assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("(T18)"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("(T20)"));
+
+    let out = pw(t.path(), t.path(), &["report"]);
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("pair-watcher report · all sessions · 0 sessions"));
+    let out = pw(t.path(), t.path(), &["report", "--since", "yesterday"]);
+    assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("expected YYYY-MM-DD"));
 
     // `attach` needs a live session or a Worker transcript.
     let out = pw(t.path(), t.path(), &["attach", "s1"]);

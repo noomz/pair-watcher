@@ -107,6 +107,12 @@ pub enum Command {
         export: bool,
         #[arg(long)]
         explicit_only: bool,
+        /// First session start date included, `YYYY-MM-DD` (UTC)
+        #[arg(long)]
+        since: Option<String>,
+        /// Last session start date included, `YYYY-MM-DD` (UTC)
+        #[arg(long)]
+        until: Option<String>,
     },
     /// Pre-filter tools
     Prefilter {
@@ -314,11 +320,8 @@ fn dispatch(command: Command, via: Via) -> ExitCode {
         Command::Doctor => doctor_cmd(),
         Command::Models { action } => models_cmd(action),
         Command::Prefilter { action: PrefilterAction::Fit { target } } => prefilter_fit(target),
-        Command::Report { .. }
-        | Command::Replay { .. }
-        | Command::Audit { .. }
-        | Command::Telemetry { .. }
-        | Command::Prune => later("T18"),
+        Command::Report { export, explicit_only, since, until } => report(export, explicit_only, since, until),
+        Command::Replay { .. } | Command::Audit { .. } | Command::Telemetry { .. } | Command::Prune => later("T18"),
         Command::Mcp => later("T20"),
     }
 }
@@ -334,6 +337,22 @@ fn prefilter_fit(target: Option<f64>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => fail(&format!("prefilter fit: {e}")),
+    }
+}
+
+fn report(export: bool, explicit_only: bool, since: Option<String>, until: Option<String>) -> ExitCode {
+    for (flag, d) in [("since", &since), ("until", &until)] {
+        if let Some(Err(e)) = d.as_deref().map(|d| crate::report::check_date(flag, d)) {
+            return fail(&format!("report: {e}"));
+        }
+    }
+    let filter = crate::report::Filter { since, until, explicit_only };
+    match Home::from_env().and_then(|home| crate::report::report_cmd(&home, &filter, export, now_ms())) {
+        Ok(lines) => {
+            lines.iter().for_each(|l| println!("{l}"));
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&format!("report: {e}")),
     }
 }
 
