@@ -3,6 +3,7 @@
 
 mod common;
 
+use std::cell::RefCell;
 use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
@@ -12,9 +13,11 @@ use std::time::{Duration, SystemTime};
 
 use pair_watcher::doctor::{self, Level, Line, Probes};
 use pair_watcher::harness::{Harness, Version};
+use pair_watcher::headless::Kind;
 use pair_watcher::home::Home;
 use pair_watcher::launch::{CODEX_EVENTS, ListedHook};
 use pair_watcher::prefilter::Tag;
+use pair_watcher::provider::ProviderError;
 use tempfile::TempDir;
 
 struct World {
@@ -25,6 +28,9 @@ struct World {
     versions: [Option<Version>; 3],
     listed: Vec<ListedHook>,
     ollama: Result<Vec<String>, String>,
+    /// What a subscription backend call returns, and the calls made.
+    backend: Result<(), ProviderError>,
+    probed: RefCell<Vec<(Kind, String)>>,
     now: SystemTime,
 }
 
@@ -54,6 +60,8 @@ impl World {
             versions: [tested(Harness::Claude), tested(Harness::Codex), tested(Harness::Pi)],
             listed: Vec::new(),
             ollama: Ok(vec!["nimble:latest".into()]),
+            backend: Ok(()),
+            probed: RefCell::new(Vec::new()),
             now: SystemTime::now(),
         }
     }
@@ -69,7 +77,18 @@ impl World {
         let ollama = move |_: &str| {
             ollama.clone().map(|names| names.into_iter().map(|name| Tag { name, digest: String::new() }).collect())
         };
-        let probes = Probes { env: &env, version: &version, codex_list: &codex_list, ollama: &ollama, now: self.now };
+        let backend = |kind: Kind, model: &str| {
+            self.probed.borrow_mut().push((kind, model.to_owned()));
+            self.backend.clone()
+        };
+        let probes = Probes {
+            env: &env,
+            version: &version,
+            codex_list: &codex_list,
+            ollama: &ollama,
+            backend: &backend,
+            now: self.now,
+        };
         doctor::check(&self.home, &self.repo, &probes)
     }
 
@@ -257,4 +276,40 @@ fn claude_session_backend_flags_codex_and_pi() {
         );
     }
     assert!(!has(&lines, Level::Warn, "for a claude Worker"));
+}
+
+/// V111: a subscription backend gets one real call with the Watcher's model; a lost login is
+/// BLIND (exit non-zero), a Service error only warns; the direct API is never probed this way.
+#[test]
+fn subscription_backend_is_probed_with_a_real_call() {
+    let mut w = World::new();
+    let _ = w.check();
+    assert!(w.probed.borrow().is_empty(), "api backend: no CLI probe");
+
+    w.global("backend = \"codex-exec\"");
+    let lines = w.check();
+    assert!(has(&lines, Level::Ok, "backend codex-exec gpt-6.1-sol answers"), "{lines:#?}");
+    assert_eq!(*w.probed.borrow(), [(Kind::CodexExec, "gpt-6.1-sol".to_owned())], "once per backend + model");
+
+    w.backend = Err(ProviderError::Cli("codex-exec login expired — re-login, then /pw primary".into()));
+    let lines = w.check();
+    assert!(
+        has(
+            &lines,
+            Level::Fail,
+            "backend codex-exec gpt-6.1-sol: codex-exec login expired — re-login, then /pw primary"
+        ),
+        "{lines:#?}"
+    );
+    assert!(doctor::failed(&lines));
+
+    w.backend = Err(ProviderError::Timeout(String::new()));
+    let lines = w.check();
+    assert!(has(&lines, Level::Warn, "backend codex-exec gpt-6.1-sol: timed out"), "{lines:#?}");
+
+    w.probed.borrow_mut().clear();
+    w.backend = Ok(());
+    w.global("backend = \"api\"\n[harness.claude]\nbackend = \"claude-p\"\n");
+    let _ = w.check();
+    assert_eq!(*w.probed.borrow(), [(Kind::ClaudeP, "claude-sonnet-5-5".to_owned())]);
 }

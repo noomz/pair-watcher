@@ -832,6 +832,37 @@ fn auth() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `doctor`'s subscription backend check (V111): the Watcher's own call, no tools.
+fn probe_backend(
+    home: &Home,
+    kind: crate::headless::Kind,
+    model: &str,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<(), crate::provider::ProviderError> {
+    use crate::headless::{Cli, Kind, Routing};
+    let cli = Cli {
+        kind,
+        program: PathBuf::from(kind.program()),
+        exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pair-watcher")),
+        mailbox: home.root().join("doctor"),
+        repo: None,
+        routing: Routing::for_kind(kind, env),
+    };
+    let vendor = match kind {
+        Kind::ClaudeP => Vendor::Anthropic,
+        Kind::CodexExec => Vendor::Openai,
+    };
+    let call = crate::provider::Call {
+        model,
+        vendor,
+        input: "This is a connectivity check. Reply with nothing.",
+        tools: None,
+        deadline: Some(std::time::Instant::now() + Duration::from_secs(60)),
+        fallback: false,
+    };
+    cli.call(&call).map(drop).map_err(|f| f.error)
+}
+
 /// `doctor` (V85): non-zero only when the Watcher would be BLIND or cannot start.
 fn doctor_cmd() -> ExitCode {
     let (home, cwd) = match Home::from_env().and_then(|h| Ok((h, std::env::current_dir()?))) {
@@ -845,6 +876,7 @@ fn doctor_cmd() -> ExitCode {
         version: &|h: Harness| harness::probe(OsStr::new(h.name())),
         codex_list: &|| launch::codex_hooks_list(OsStr::new("codex"), &[], &user, Duration::from_secs(10)),
         ollama: &crate::prefilter::ollama_tags,
+        backend: &|kind, model| probe_backend(&home, kind, model, &env),
         now: std::time::SystemTime::now(),
     };
     let lines = doctor::check(&home, &cwd, &probes);

@@ -8,13 +8,17 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use crate::credentials::Keys;
+use crate::fail;
 use crate::focus::FocusSource;
 use crate::harness::{Harness, Support, Version};
+use crate::headless::Kind;
 use crate::home::Home;
 use crate::launch::{CODEX_EVENTS, ListedHook};
 use crate::models::{self, Table};
 use crate::prefilter::{self, Tag};
 use crate::problem::tilde;
+use crate::provider::{Backend, ProviderError};
+use crate::status::Class;
 use crate::{install, run};
 
 /// A user `models.toml` older than this is likely missing new models or prices.
@@ -54,6 +58,8 @@ pub struct Probes<'a> {
     pub codex_list: &'a dyn Fn() -> io::Result<Vec<ListedHook>>,
     /// The models an Ollama server at `url` has pulled.
     pub ollama: &'a dyn Fn(&str) -> Result<Vec<Tag>, String>,
+    /// One minimal real call on a subscription backend, args and routing as the Watcher's (V111).
+    pub backend: &'a dyn Fn(Kind, &str) -> Result<(), ProviderError>,
     pub now: SystemTime,
 }
 
@@ -114,6 +120,35 @@ pub fn check(home: &Home, cwd: &Path, p: &Probes) -> Vec<Line> {
                         push(level, format!("harness.{}.{key} {m}: {e}", h.name()));
                     }
                 }
+            }
+            // Subscription backends: a real call, not `login status` (V111).
+            let mut probed = Vec::new();
+            for h in Harness::ALL {
+                let backend = Backend::from_config(&loaded.resolved.backend_for(h.name()).0);
+                let (Some(kind), Some(vendor)) = (backend.headless(), backend.vendor()) else { continue };
+                let get = |k: &str| loaded.resolved.get_for(k, h.name()).and_then(toml::Value::as_str);
+                let setting = get("model").unwrap_or("auto");
+                let Ok(choice) = models::choose(&table, setting, h.vendor(), &[vendor]) else {
+                    push(
+                        Level::Fail,
+                        format!("backend {} runs no model {setting} → the Watcher cannot start", kind.backend()),
+                    );
+                    continue;
+                };
+                if probed.contains(&(kind, choice.model.clone())) {
+                    continue;
+                }
+                match (p.backend)(kind, &choice.model) {
+                    Ok(()) => push(Level::Ok, format!("backend {} {} answers", kind.backend(), choice.model)),
+                    Err(e) if fail::classify(&e) == Class::Key => {
+                        push(
+                            Level::Fail,
+                            format!("backend {} {}: {e} → the Watcher is BLIND", kind.backend(), choice.model),
+                        );
+                    }
+                    Err(e) => push(Level::Warn, format!("backend {} {}: {e}", kind.backend(), choice.model)),
+                }
+                probed.push((kind, choice.model));
             }
             let swarm = text("mode").as_deref() == Some("swarm");
             for f in &loaded.focuses.enabled {

@@ -31,6 +31,15 @@ impl Harness {
         }
     }
 
+    /// The vendor whose models the Worker runs; pi runs any.
+    pub fn vendor(self) -> Option<crate::models::Vendor> {
+        match self {
+            Harness::Claude => Some(crate::models::Vendor::Anthropic),
+            Harness::Codex => Some(crate::models::Vendor::Openai),
+            Harness::Pi => None,
+        }
+    }
+
     pub const ALL: [Harness; 3] = [Harness::Claude, Harness::Codex, Harness::Pi];
 
     /// Minimum and last-tested version (C5). Minimum = first release with every surface the

@@ -404,6 +404,7 @@ impl Watch {
                 exe: exe.clone(),
                 mailbox: mailbox.dir().to_owned(),
                 repo: worker_repo.map(|r| r.root),
+                routing: crate::headless::Routing::for_kind(kind, env),
             }),
         };
         let mut w = Watch {
@@ -495,7 +496,7 @@ impl Watch {
     /// A subscription backend runs its own vendor's models only, on its login (I15).
     fn choose_on(&self, backend: Backend, setting: &str) -> Result<Choice, String> {
         let configured = backend.vendor().map_or_else(|| self.keys.configured(), |v| vec![v]);
-        models::choose(&self.table, setting, worker_vendor(self.harness), &configured).map_err(|e| match e {
+        models::choose(&self.table, setting, self.harness.vendor(), &configured).map_err(|e| match e {
             models::ChoiceError::NoKey(v) if backend.subscription() => {
                 format!("backend {} runs no {} models", backend.name(), v.name())
             }
@@ -1614,14 +1615,6 @@ fn format(h: Harness) -> Format {
 }
 
 /// The Worker's vendor for `model = auto` (V46); pi's is unknown here.
-fn worker_vendor(h: Harness) -> Option<Vendor> {
-    match h {
-        Harness::Claude => Some(Vendor::Anthropic),
-        Harness::Codex => Some(Vendor::Openai),
-        Harness::Pi => None,
-    }
-}
-
 fn trigger_name(t: Trigger, catch_up: bool) -> &'static str {
     match t {
         _ if catch_up => "catch-up",

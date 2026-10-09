@@ -1,7 +1,8 @@
 //! Opt-in subscription backends (I15, V52): `claude -p` and `codex exec`, run headless once per
 //! call. Read tools come from `pair-watcher mcp` over the wake's snapshot; the harness's own tools,
 //! hooks and user config stay off, and the Watcher env guard is set so the Worker's hooks no-op
-//! (V58). Codex launches never pass `--dangerously-bypass-hook-trust` (C10).
+//! (V58). Codex launches never pass `--dangerously-bypass-hook-trust` (C10). `codex exec` still
+//! routes like the user's Codex: their `model_provider` comes along, its secrets off argv (V110).
 
 use std::io::{Read, Write};
 use std::os::unix::fs::DirBuilderExt;
@@ -47,6 +48,83 @@ impl Kind {
             Kind::CodexExec => "codex",
         }
     }
+
+    /// The config `backend` value.
+    pub fn backend(self) -> &'static str {
+        match self {
+            Kind::ClaudeP => "claude-p",
+            Kind::CodexExec => "codex-exec",
+        }
+    }
+}
+
+/// The user's Codex `model_provider`, carried past `--ignore-user-config` (V110): `-c` overrides
+/// for argv, and the secret values they name by env var, for the child's env only.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Routing {
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
+/// Env var prefix for provider secrets moved off argv.
+pub const SECRET_ENV: &str = "PAIR_WATCHER_CODEX_SECRET";
+
+impl Routing {
+    pub fn for_kind(kind: Kind, env: &dyn Fn(&str) -> Option<String>) -> Routing {
+        match kind {
+            Kind::ClaudeP => Routing::default(),
+            Kind::CodexExec => Routing::codex(env),
+        }
+    }
+
+    /// `$CODEX_HOME/config.toml` (default `~/.codex`); unreadable → the built-in provider.
+    pub fn codex(env: &dyn Fn(&str) -> Option<String>) -> Routing {
+        let home = env("CODEX_HOME")
+            .filter(|h| !h.trim().is_empty())
+            .map(PathBuf::from)
+            .or_else(|| env("HOME").map(|h| Path::new(&h).join(".codex")));
+        home.and_then(|h| std::fs::read_to_string(h.join("config.toml")).ok())
+            .map_or_else(Routing::default, |text| Routing::from_config(&text))
+    }
+
+    /// Only the top-level `model_provider` and its `[model_providers.<name>]` table. Literal
+    /// `http_headers` become `env_http_headers`, `experimental_bearer_token` becomes `env_key`.
+    pub fn from_config(text: &str) -> Routing {
+        let Ok(config) = text.parse::<toml::Table>() else { return Routing::default() };
+        let Some(name) = config.get("model_provider").and_then(toml::Value::as_str) else {
+            return Routing::default();
+        };
+        let mut args = vec!["-c".to_owned(), format!("model_provider={}", toml::Value::from(name))];
+        let table = config.get("model_providers").and_then(|t| t.get(name)).and_then(toml::Value::as_table);
+        let mut env = Vec::new();
+        if let Some(table) = table {
+            // `-c` keys split on dots: a name that needs quoting cannot be addressed.
+            if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+                return Routing::default();
+            }
+            let mut table = table.clone();
+            let mut secret = |value: toml::Value| {
+                let var = format!("{SECRET_ENV}_{}", env.len());
+                env.push((var.clone(), value.as_str().map_or_else(|| value.to_string(), str::to_owned)));
+                toml::Value::from(var)
+            };
+            if let Some(toml::Value::Table(headers)) = table.remove("http_headers") {
+                let mut named = match table.remove("env_http_headers") {
+                    Some(toml::Value::Table(t)) => t,
+                    _ => toml::Table::new(),
+                };
+                for (header, value) in headers {
+                    named.insert(header, secret(value));
+                }
+                table.insert("env_http_headers".into(), toml::Value::Table(named));
+            }
+            if let Some(token) = table.remove("experimental_bearer_token") {
+                table.insert("env_key".into(), secret(token));
+            }
+            args.extend(["-c".into(), format!("model_providers.{name}={}", toml::Value::Table(table))]);
+        }
+        Routing { args, env }
+    }
 }
 
 /// A headless backend bound to one session.
@@ -61,6 +139,8 @@ pub struct Cli {
     pub mailbox: PathBuf,
     /// The Worker repo; `None` = no tools (no repo to snapshot).
     pub repo: Option<PathBuf>,
+    /// `codex exec` only: the user's provider (V110).
+    pub routing: Routing,
 }
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -102,7 +182,10 @@ impl Cli {
                 let result = wrote
                     .map_err(|e| (ProviderError::Cli(format!("schema file: {e}")), Usage::default()))
                     .and_then(|()| {
-                        cmd.args(codex_args(call.model, mcp.as_ref(), &schema, &last, &scratch));
+                        let mut args = codex_args(call.model, mcp.as_ref(), &schema, &last, &scratch);
+                        let stdin = args.pop();
+                        args.extend(self.routing.args.iter().cloned().chain(stdin));
+                        cmd.args(args).envs(self.routing.env.iter().map(|(k, v)| (k, v)));
                         let input = format!("{}{CODEX_FORMAT}", call.input);
                         run(cmd, &input, call.deadline)
                             .and_then(|out| parse_codex(&out, std::fs::read_to_string(&last).ok()))
@@ -276,6 +359,26 @@ impl Pipe {
     }
 }
 
+/// CLI auth failures that name their cause (V111). A failed call only: a reply may quote these.
+const AUTH_CAUSES: [&str; 6] = [
+    "refresh_token_expired",
+    "log in again",
+    "login again",
+    "sign in again",
+    "oauth session expired",
+    "oauth token has expired",
+];
+
+/// A failed call whose stderr or events name an auth cause: the Key reason says so, never the
+/// side error that came first (B7).
+fn login_expired(kind: Kind, out: &Output) -> Option<ProviderError> {
+    let all = format!("{}\n{}", out.stdout, out.stderr).to_ascii_lowercase();
+    AUTH_CAUSES
+        .iter()
+        .any(|c| all.contains(c))
+        .then(|| ProviderError::Cli(format!("{} login expired — re-login, then /pw primary", kind.backend())))
+}
+
 fn message(s: &str) -> String {
     crate::clip::head(s.trim(), MAX_MESSAGE)
 }
@@ -287,6 +390,9 @@ fn n(v: &Value, k: &str) -> u64 {
 /// `claude -p --output-format json`: one result object.
 pub fn parse_claude(out: &Output) -> Parsed {
     let Ok(v) = serde_json::from_str::<Value>(out.stdout.trim()) else {
+        if let Some(e) = login_expired(Kind::ClaudeP, out) {
+            return Err((e, Usage::default()));
+        }
         let why = if out.stderr.trim().is_empty() { &out.stdout } else { &out.stderr };
         return Err((
             ProviderError::Cli(format!("claude -p exited {}: {}", out.status, message(why))),
@@ -302,6 +408,9 @@ pub fn parse_claude(out: &Output) -> Parsed {
     };
     let text = v["result"].as_str().unwrap_or_default().to_owned();
     if v["is_error"].as_bool().unwrap_or(false) || !out.status.success() {
+        if let Some(e) = login_expired(Kind::ClaudeP, out) {
+            return Err((e, usage));
+        }
         let why = if text.is_empty() { v["subtype"].as_str().unwrap_or("error").to_owned() } else { text };
         return Err((ProviderError::Cli(format!("claude -p: {}", message(&why))), usage));
     }
@@ -333,6 +442,11 @@ pub fn parse_codex(out: &Output, last: Option<String>) -> Parsed {
             "error" => error = error.or_else(|| v["message"].as_str().map(str::to_owned)),
             _ => {}
         }
+    }
+    if (error.is_some() || !out.status.success())
+        && let Some(e) = login_expired(Kind::CodexExec, out)
+    {
+        return Err((e, usage));
     }
     if let Some(e) = error {
         return Err((ProviderError::Cli(format!("codex exec: {}", message(&e))), usage));

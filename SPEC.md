@@ -221,7 +221,7 @@ T25|x|T22 live fixes: Debate-closed Concern entries in wake input + no-reraise p
 T26|x|Slot admission after owner sees closed Debate (Swarm); test: sibling Debate ends unresolved → waiting Concern not queued same round, queued next round only if owner keeps flag|V19,V103,V105
 T27|x|Per-harness config table `[harness.claude|codex|pi]` (`backend`, `model`, `fallback_model`): parse, precedence within layer, repo filter, env names, `config show --origin`, hash; tests per precedence case|V79,V80,V83,V84,V109,I18
 T28|x|`claude-session` backend: mailbox request/result records (Rust + TS), mod runner on `$.model.complete`, code-owned tool loop, failure mapping, 15 s unclaimed → BLIND/fallback, refusal on Codex/pi, pane notes, pricing from usage; live check on a real Claude session|V8,V11,V46,V47,V51,V52,V86,V106,V107,V108,I8,I15
-T29|.|`codex-exec` provider carry-over (V110) + Key reason from CLI auth cause + `doctor` live probe (V111); tests: args carry provider only, no secret on argv, stderr `refresh_token_expired` → clear reason; live check through CCS cliproxy|V86,V110,V111,I15
+T29|x|`codex-exec` provider carry-over (V110) + Key reason from CLI auth cause + `doctor` live probe (V111); tests: args carry provider only, no secret on argv, stderr `refresh_token_expired` → clear reason; live check through CCS cliproxy|V86,V110,V111,I15
 T30|.|`/pw watch|stop` in Claude mod + pi extension: spawn `attach` for own session id, already-watched + not-installed answers, stop path (supervisor shutdown, end event, drop queued), re-watch reuses session dir; tests; live check in a plain `claude` session after `install claude`|V82,V112,I1,I8,I9
 
 ## §B

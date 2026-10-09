@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use pair_watcher::config::{self, Sources};
 use pair_watcher::fail;
-use pair_watcher::headless::{Cli, Kind};
+use pair_watcher::headless::{Cli, Kind, Routing, SECRET_ENV};
 use pair_watcher::home::Home;
 use pair_watcher::models::Vendor;
 use pair_watcher::problem::Problem;
@@ -79,7 +79,14 @@ impl World {
     }
 
     fn cli(&self, kind: Kind, program: PathBuf) -> Cli {
-        Cli { kind, program, exe: PathBuf::from(BIN), mailbox: self.mailbox.clone(), repo: Some(self.root.clone()) }
+        Cli {
+            kind,
+            program,
+            exe: PathBuf::from(BIN),
+            mailbox: self.mailbox.clone(),
+            repo: Some(self.root.clone()),
+            routing: Routing::default(),
+        }
     }
 
     fn out(&self, name: &str) -> String {
@@ -333,6 +340,127 @@ fn codex_exec_turn_failed_is_an_error() {
     let f = w.cli(Kind::CodexExec, fake).call(&call("x", None)).unwrap_err();
     assert!(matches!(&f.error, ProviderError::Cli(m) if m.contains("usage limit")));
     assert_eq!(fail::classify(&f.error), Class::Key);
+}
+
+const CODEX_CONFIG: &str = r#"
+model_provider = "cliproxy"
+model = "gpt-6.1-sol"
+notify = ["say", "done"]
+
+[profiles.fast]
+model_provider = "lms"
+
+[model_providers.lms]
+name = "LM Studio"
+base_url = "http://localhost:1234/v1"
+
+[model_providers.cliproxy]
+name = "CLIProxy Codex"
+base_url = "http://127.0.0.1:8317/api/provider/codex"
+http_headers = { Authorization = "Bearer s3cret-header" }
+experimental_bearer_token = "s3cret-token"
+wire_api = "responses"
+requires_openai_auth = false
+
+[mcp_servers.time]
+command = "docker"
+
+[hooks]
+Stop = "echo user-hook"
+"#;
+
+/// V110: `codex exec` keeps `--ignore-user-config` but carries the user's `model_provider` and
+/// only its table; literal secrets reach the child by env, never argv (B7: CCS cliproxy).
+#[test]
+fn codex_exec_carries_user_provider_only() {
+    let w = World::new();
+    let d = w.dir.path().display();
+    let script = format!(
+        "{rec}printf '%s|%s' \"${SECRET_ENV}_0\" \"${SECRET_ENV}_1\" > '{d}/secrets'\nprev=''\nfor a in \"$@\"; do\n  [ \"$prev\" = -o ] && last=\"$a\"\n  prev=\"$a\"\ndone\nprintf '%s' '{{\"lines\":[]}}' > \"$last\"\n",
+        rec = recorder(w.dir.path()),
+    );
+    let fake = w.fake("codex", &script);
+    let mut cli = w.cli(Kind::CodexExec, fake);
+    cli.routing = Routing::from_config(CODEX_CONFIG);
+    let mut c = call("x", None);
+    c.model = "gpt-6.1-sol";
+    c.vendor = Vendor::Openai;
+    cli.call(&c).unwrap();
+
+    let args: Vec<String> = w.out("args").lines().map(str::to_owned).collect();
+    assert!(args.iter().any(|a| a == "--ignore-user-config"));
+    assert_eq!(args.last().unwrap(), "-", "prompt on stdin");
+    assert!(!args.iter().any(|a| a.contains("s3cret")), "no secret on argv: {args:?}");
+    let configs: Vec<&String> = args.windows(2).filter(|p| p[0] == "-c").map(|p| &p[1]).collect();
+    assert_eq!(configs.len(), 2, "no mcp server without tools: {configs:?}");
+    assert_eq!(configs[0], r#"model_provider="cliproxy""#);
+    let provider = configs[1].strip_prefix("model_providers.cliproxy=").expect("provider table");
+    let table: toml::Table = format!("t = {provider}").parse::<toml::Table>().unwrap()["t"].as_table().unwrap().clone();
+    assert_eq!(table["base_url"].as_str(), Some("http://127.0.0.1:8317/api/provider/codex"));
+    assert_eq!(table["wire_api"].as_str(), Some("responses"));
+    assert_eq!(table["requires_openai_auth"].as_bool(), Some(false));
+    assert!(!table.contains_key("http_headers") && !table.contains_key("experimental_bearer_token"));
+    let header_var = table["env_http_headers"]["Authorization"].as_str().unwrap();
+    let key_var = table["env_key"].as_str().unwrap();
+    assert_eq!((header_var, key_var), (&*format!("{SECRET_ENV}_0"), &*format!("{SECRET_ENV}_1")));
+    assert_eq!(w.out("secrets"), "Bearer s3cret-header|s3cret-token", "secrets in the child env");
+    let joined = args.join(" ");
+    for other in ["lms", "LM Studio", "mcp_servers.time", "hooks", "profiles", "notify"] {
+        assert!(!joined.contains(other), "{other} carried: {joined}");
+    }
+}
+
+/// V110: unreadable config, no `model_provider`, or an unaddressable name → built-in provider.
+#[test]
+fn codex_routing_falls_back_to_built_in() {
+    let dir = TempDir::new().unwrap();
+    let home = dir.path().display().to_string();
+    assert_eq!(Routing::codex(&|k| (k == "CODEX_HOME").then(|| home.clone())), Routing::default());
+    assert_eq!(Routing::from_config("model_provider = [broken"), Routing::default());
+    assert_eq!(Routing::from_config("model = \"gpt-6.1-sol\"\n"), Routing::default());
+    let odd = "model_provider = \"a.b\"\n[model_providers.\"a.b\"]\nbase_url = \"http://x\"\n";
+    assert_eq!(Routing::from_config(odd), Routing::default());
+    // A built-in provider by name: no table to carry.
+    let builtin = Routing::from_config("model_provider = \"oss\"\n");
+    assert_eq!(builtin.args, ["-c", r#"model_provider="oss""#]);
+    assert!(builtin.env.is_empty());
+    // `CODEX_HOME` unset: `~/.codex`.
+    std::fs::create_dir_all(dir.path().join(".codex")).unwrap();
+    std::fs::write(dir.path().join(".codex/config.toml"), CODEX_CONFIG).unwrap();
+    let r = Routing::codex(&|k| (k == "HOME").then(|| home.clone()));
+    assert_eq!(r.env.len(), 2);
+}
+
+/// V111, B7: the auth cause on stderr names the Key reason, not the side error event before it.
+#[test]
+fn codex_exec_expired_login_names_the_cause() {
+    let w = World::new();
+    let side = json!({"type": "error", "message": "workspace routing discovery unauthorized"});
+    let failed = json!({"type": "turn.failed", "error": {"message": "unexpected status 401 Unauthorized"}});
+    let body = format!(
+        "cat > /dev/null\necho '{side}'\necho '{failed}'\necho 'ERROR: refresh token failed: {{\"error\":{{\"code\":\"refresh_token_expired\"}}}}' >&2\nexit 1\n"
+    );
+    let f = w.cli(Kind::CodexExec, w.fake("codex", &body)).call(&call("x", None)).unwrap_err();
+    assert_eq!(f.error, ProviderError::Cli("codex-exec login expired — re-login, then /pw primary".into()));
+    assert_eq!(fail::classify(&f.error), Class::Key);
+    let mut h = fail::Health::default();
+    let blind = h.failed(Class::Key, "s", &f.error.to_string(), 1);
+    assert_eq!(blind, [fail::Effect::Blind("model key: codex-exec login expired — re-login, then /pw primary".into())]);
+
+    let expired = json!({"type": "result", "is_error": true, "result": "OAuth token has expired. Please run /login", "usage": {}});
+    let f = w
+        .cli(Kind::ClaudeP, w.fake("claude", &format!("cat > /dev/null\necho '{expired}'\nexit 1\n")))
+        .call(&call("x", None))
+        .unwrap_err();
+    assert_eq!(f.error.to_string(), "claude-p login expired — re-login, then /pw primary");
+
+    // A reply that only quotes such text is an answer, not a failure.
+    let ok = json!({"type": "result", "is_error": false, "result": "user must log in again", "usage": {}});
+    let reply = w
+        .cli(Kind::ClaudeP, w.fake("claude2", &format!("cat > /dev/null\necho '{ok}'\n")))
+        .call(&call("x", None))
+        .unwrap();
+    assert_eq!(reply.text, "user must log in again");
 }
 
 /// C10: a pi backend is refused, saying why.
