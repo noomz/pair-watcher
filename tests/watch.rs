@@ -270,7 +270,8 @@ fn turn_end_wakes_and_commits() {
     assert!(wakes[0].latency_ms.is_some());
     let rec = record::read(fx.mb.dir(), wakes[0].record.as_deref().expect("record ref")).unwrap();
     assert_eq!((rec.n, rec.watcher.as_str(), rec.output.as_deref()), (1, "companion", Some(ADD)));
-    assert_eq!(rec.focuses, ["approach", "correctness", "security"]);
+    assert_eq!(rec.focuses().collect::<Vec<_>>(), ["approach", "correctness", "security"]);
+    assert_eq!(rec.render(&rec.prompt, &rec.briefs), input, "the record re-renders the input as sent");
     assert!(rec.tree.is_some(), "tools served from a snapshot");
     assert!(rec.input.section("Turn").unwrap().contains("Starting the 6th review round."));
     assert!(input.ends_with(&rec.input.render("", &[]).trim_start().to_owned()), "record = what was sent");

@@ -84,7 +84,7 @@ const SLICE_MAX: usize = TURN_MAX;
 /// How often a due checkpoint looks for repo changes (each look is a snapshot).
 const CHANGE_POLL_MS: u64 = 30_000;
 const CODEX_QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
-const PROMPT: &str = include_str!("watch_prompt.md");
+pub const PROMPT: &str = include_str!("watch_prompt.md");
 
 /// One Focus's committed place (V10): transcript cursor, the snapshot its last diff ended at,
 /// the digest state, and the arrival time of the last entry it reviewed.
@@ -1297,7 +1297,13 @@ impl Watch {
             n: self.state.n + 1,
             watcher: w.name.clone(),
             trigger: trigger.into(),
-            focuses: w.focuses.clone(),
+            prompt: PROMPT.to_owned(),
+            briefs: self
+                .focuses
+                .iter()
+                .filter(|f| w.focuses.contains(&f.name))
+                .map(|f| (f.name.clone(), f.brief.clone()))
+                .collect(),
             input: b.sections.clone(),
             tree: tree.map(str::to_owned),
             head: self.store.as_ref().and_then(Store::head),

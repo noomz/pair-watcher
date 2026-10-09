@@ -36,6 +36,7 @@ pub mod prefilter;
 pub mod problem;
 pub mod provider;
 pub mod record;
+pub mod replay;
 pub mod repo;
 pub mod report;
 pub mod retention;

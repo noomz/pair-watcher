@@ -21,9 +21,10 @@ pub struct WakeRecord {
     pub n: u64,
     pub watcher: String,
     pub trigger: String,
-    /// The Focuses whose briefs the input carried; the prompt + briefs are not stored, `replay`
-    /// renders them again (current or recorded, V98).
-    pub focuses: Vec<String>,
+    /// The prompt and (Focus name, brief) pairs the input was rendered with: `replay --variant`
+    /// swaps exactly one of prompt, briefs, model (V98).
+    pub prompt: String,
+    pub briefs: Vec<(String, String)>,
     pub input: Input,
     /// Snapshot tree the read tools were served from (V96); `None` = no tools (blocked wake).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -50,6 +51,18 @@ pub fn write(session: &Path, record: &WakeRecord) -> io::Result<String> {
     let json = serde_json::to_vec(record)?;
     write_atomic(&path, &zstd::encode_all(json.as_slice(), LEVEL)?)?;
     Ok(rel)
+}
+
+impl WakeRecord {
+    /// The input as sent, or with another prompt / briefs.
+    pub fn render(&self, prompt: &str, briefs: &[(String, String)]) -> String {
+        let named: Vec<(&str, &str)> = briefs.iter().map(|(n, b)| (n.as_str(), b.as_str())).collect();
+        self.input.render_named(prompt, &named)
+    }
+
+    pub fn focuses(&self) -> impl Iterator<Item = &str> {
+        self.briefs.iter().map(|(n, _)| n.as_str())
+    }
 }
 
 pub fn read(session: &Path, rel: &str) -> io::Result<WakeRecord> {

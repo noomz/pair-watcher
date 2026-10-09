@@ -84,9 +84,15 @@ pub struct Input {
 impl Input {
     /// One Watcher's input: prompt + its brief(s) (≤6 K), then the shared sections.
     pub fn render(&self, prompt: &str, briefs: &[&Focus]) -> String {
+        let named: Vec<(&str, &str)> = briefs.iter().map(|f| (f.name.as_str(), f.brief.as_str())).collect();
+        self.render_named(prompt, &named)
+    }
+
+    /// `render` from (Focus name, brief) pairs, as a wake record keeps them.
+    pub fn render_named(&self, prompt: &str, briefs: &[(&str, &str)]) -> String {
         let mut head = prompt.trim().to_owned();
-        for f in briefs {
-            head.push_str(&format!("\n\n## Focus: {}\n{}", f.name, f.brief.trim()));
+        for (name, brief) in briefs {
+            head.push_str(&format!("\n\n## Focus: {name}\n{}", brief.trim()));
         }
         let mut out = clip::head(&head, PROMPT_CAP);
         for s in &self.sections {

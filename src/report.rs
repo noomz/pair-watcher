@@ -648,7 +648,7 @@ pub fn render(stats: &Stats, prune: &[String], filter: &Filter) -> Vec<String> {
     out.push(headline_line("all", &stats.total(), false));
     for (title, dim) in DIMS {
         let groups = stats.by(dim);
-        if groups.len() < 2 && title != "Focus" {
+        if groups.is_empty() || groups.len() < 2 && title != "Focus" {
             continue;
         }
         out.push(format!("by {title}"));

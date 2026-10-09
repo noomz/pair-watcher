@@ -55,7 +55,8 @@ fn session(home: &Home, id: &str, live: bool, wakes: &[(u64, Outcome, u64)], sto
             n,
             watcher: "companion".into(),
             trigger: "turn-end".into(),
-            focuses: vec![],
+            prompt: String::new(),
+            briefs: vec![],
             input: Input { sections: vec![], diff_bytes: 0 },
             tree: None,
             head: None,
@@ -96,8 +97,6 @@ fn retention_keeps_pinned_and_live_stores() {
         focus: "approach".into(),
         headline: "h".into(),
         detail: vec![],
-        auditor: "a".into(),
-        spend: 0.0,
     };
     log.append(finding.event()).unwrap();
     log.append(AuditOp::Label { finding: "F1".into(), label: Label::Miss }.event()).unwrap();

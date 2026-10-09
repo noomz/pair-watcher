@@ -119,3 +119,88 @@ fi
     executable(&path, &script);
     path
 }
+
+/// Mock model server: answers every request with `handler(body)`, recording bodies.
+pub struct Server {
+    pub url: String,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Server {
+    pub fn start(handler: impl Fn(&serde_json::Value) -> (u16, serde_json::Value) + Send + Sync + 'static) -> Server {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (log, halt) = (Arc::clone(&seen), Arc::clone(&stop));
+        let handler = Arc::new(handler);
+        std::thread::spawn(move || {
+            while !halt.load(Ordering::Relaxed) {
+                let Ok((stream, _)) = listener.accept() else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                };
+                stream.set_nonblocking(false).unwrap();
+                let (log, handler) = (Arc::clone(&log), Arc::clone(&handler));
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut len = 0;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                            len = v.trim().parse().unwrap();
+                        }
+                    }
+                    let mut buf = vec![0; len];
+                    reader.read_exact(&mut buf).unwrap();
+                    let body: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+                    let (status, reply) = handler(&body);
+                    log.lock().unwrap().push(body);
+                    let text = reply.to_string();
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{text}",
+                        text.len()
+                    );
+                });
+            }
+        });
+        Server { url, seen, stop }
+    }
+
+    pub fn requests(&self) -> Vec<serde_json::Value> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// An Anthropic Messages reply with `text`, 1000 in / 100 out tokens.
+pub fn anthropic_reply(text: &str) -> (u16, serde_json::Value) {
+    (
+        200,
+        serde_json::json!({
+            "content": [{"type": "text", "text": text}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1000, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "output_tokens": 100}
+        }),
+    )
+}
+
+/// The first user message text of a recorded request.
+pub fn input_of(body: &serde_json::Value) -> String {
+    body["messages"][0]["content"][0]["text"].as_str().unwrap().to_owned()
+}

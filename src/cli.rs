@@ -323,7 +323,8 @@ fn dispatch(command: Command, via: Via) -> ExitCode {
         Command::Report { export, explicit_only, since, until } => report(export, explicit_only, since, until),
         Command::Telemetry { action } => telemetry(action),
         Command::Prune => prune(),
-        Command::Replay { .. } | Command::Audit { .. } => later("T18"),
+        Command::Replay { variant, wake_set } => replay(variant, &wake_set),
+        Command::Audit { yes, max_usd, sample, model, resume } => audit(yes, max_usd, sample, model.as_deref(), resume),
         Command::Mcp => later("T20"),
     }
 }
@@ -755,9 +756,9 @@ fn loaded() -> Result<(Home, run::Loaded), String> {
 }
 
 fn telemetry(action: TelemetryAction) -> ExitCode {
-    let home = match Home::from_env() {
+    let home = match Home::from_env().and_then(|h| h.ensure_layout().map(|()| h)) {
         Ok(h) => h,
-        Err(e) => return fail(&e.to_string()),
+        Err(e) => return fail(&format!("telemetry: {e}")),
     };
     let done = match action {
         TelemetryAction::On | TelemetryAction::Off => {
@@ -778,6 +779,124 @@ fn telemetry(action: TelemetryAction) -> ExitCode {
         }
         Err(e) => fail(&format!("telemetry: {e}")),
     }
+}
+
+fn replay(variant: Variant, set: &str) -> ExitCode {
+    use crate::replay::{self, Current};
+    let run = || -> Result<Vec<String>, String> {
+        let (home, loaded) = loaded()?;
+        let table = models::Table::load(&home)?;
+        let (all, items) = replay::select(&home, set)?;
+        let briefs = loaded.focuses.enabled.iter().map(|f| (f.name.clone(), f.brief.clone())).collect();
+        let model = loaded.resolved.get("model").and_then(toml::Value::as_str);
+        let cur = Current { prompt: crate::watch::PROMPT, briefs: &briefs, model };
+        let variant = match variant {
+            Variant::Prompt => replay::Variant::Prompt,
+            Variant::Focus => replay::Variant::Focus,
+            Variant::Model => replay::Variant::Model,
+        };
+        let jobs = replay::jobs(&items, variant, &cur)?;
+        let usd = replay::estimate(&jobs, &table)?;
+        if !confirm(&format!("replay {} wakes, estimated ${usd:.2} (outside any session ceiling)? [y/N] ", jobs.len()))
+        {
+            return Err("not confirmed (needs an interactive terminal)".into());
+        }
+        let env = |k: &str| std::env::var(k).ok();
+        let api = crate::provider::Api::new(credentials::Keys::load(&home, &env), &env, crate::fail::WAKE_CLOCK);
+        Ok(replay::run(&api, &table, &all, &items, &jobs).summary())
+    };
+    match run() {
+        Ok(lines) => {
+            lines.iter().for_each(|l| println!("{l}"));
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&format!("replay: {e}")),
+    }
+}
+
+fn audit(yes: bool, max_usd: f64, sample: usize, model: Option<&str>, resume: bool) -> ExitCode {
+    use crate::audit::{self, Queue, Why};
+    use crate::report::{Filter, sessions};
+    let run = || -> Result<(), String> {
+        let home = Home::from_env().map_err(|e| e.to_string())?;
+        let table = models::Table::load(&home)?;
+        let all = sessions(&home, &Filter::default()).map_err(|e| e.to_string())?;
+        let queue = if resume {
+            let q = audit::load_queue(&home);
+            if q.left.is_empty() {
+                println!("audit: nothing to resume");
+            }
+            q
+        } else {
+            Queue { left: audit::candidates(&all, sample, &table, model, now_ms())?, spent: 0.0 }
+        };
+        let lost = all.iter().filter(|s| !audit::lost(s).is_empty()).count();
+        if lost > 0 {
+            println!("silence not certifiable: {lost} sessions with lost spans (their lost activity is never audited)");
+        }
+        if !queue.left.is_empty() {
+            let corrections = queue.left.iter().filter(|c| c.why == Why::Correction).count();
+            let mut auditors: Vec<&str> = queue.left.iter().map(|c| c.auditor.as_str()).collect();
+            auditors.sort_unstable();
+            auditors.dedup();
+            let usd = audit::estimate(&all, &table, &queue.left);
+            println!(
+                "{} candidates ({corrections} before a human correction, {} sampled) · auditor {} · estimated ${usd:.2}, stops at ${max_usd:.2} (outside any session ceiling)",
+                queue.left.len(),
+                queue.left.len() - corrections,
+                auditors.join(", ")
+            );
+            if !yes && !confirm("audit now? [y/N] ") {
+                return Err("not confirmed (pass --yes without a terminal)".into());
+            }
+            let env = |k: &str| std::env::var(k).ok();
+            let api = crate::provider::Api::new(credentials::Keys::load(&home, &env), &env, crate::fail::WAKE_CLOCK);
+            let ran = audit::run(&home, &api, &table, &all, queue, max_usd).map_err(|e| e.to_string())?;
+            println!(
+                "audited {} wakes · {} findings · {} failed · spent ${:.2} (outside any session ceiling)",
+                ran.audited, ran.findings, ran.failed, ran.spent
+            );
+            if ran.stopped {
+                println!("stopped at --max-usd ${max_usd:.2}: `pair-watcher audit --resume` continues");
+            }
+        }
+        label_findings(&sessions(&home, &Filter::default()).map_err(|e| e.to_string())?)
+    };
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => fail(&format!("audit: {e}")),
+    }
+}
+
+/// The human labels each finding on a terminal (V97: only human labels count).
+fn label_findings(all: &[crate::report::Session]) -> Result<(), String> {
+    use crate::audit::{self, Label};
+    use std::io::{BufRead, IsTerminal, Write};
+    let todo = audit::unlabelled(all);
+    if todo.is_empty() {
+        return Ok(());
+    }
+    if !std::io::stdin().is_terminal() {
+        println!("{} findings await your label: run `pair-watcher audit` in a terminal", todo.len());
+        return Ok(());
+    }
+    for f in &todo {
+        println!("\n{} · {}:{} {} · [{}] {}", f.id, f.session, f.wake, f.watcher, f.focus, f.headline);
+        f.detail.iter().for_each(|d| println!("    {d}"));
+        print!("[m]iss · [n]ot a miss · [a]lready said · [s]kip · [q]uit: ");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line).map_err(|e| e.to_string())?;
+        let label = match line.trim() {
+            "m" => Label::Miss,
+            "n" => Label::NotAMiss,
+            "a" => Label::AlreadySaid,
+            "q" => break,
+            _ => continue,
+        };
+        audit::label(f, label).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 fn prune() -> ExitCode {

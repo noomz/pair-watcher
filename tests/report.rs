@@ -349,8 +349,6 @@ fn audit_labels_give_recall() {
                 focus: "approach".into(),
                 headline: "h".into(),
                 detail: vec![],
-                auditor: "gpt-6-astra".into(),
-                spend: 0.1,
             }
             .event(),
         );
