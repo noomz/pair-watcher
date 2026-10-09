@@ -58,6 +58,9 @@ let running = false
 let submitting = 0
 // A prompt was queued behind the running turn: it starts next, at a turn.start.
 let queued = false
+// `turn.start`s so far: a prompt whose own turn started while it entered is not queued, though
+// its `prompt.submit` chain resolves with that turn already running.
+let starts = 0
 let polling = false
 let commentary: string[] = []
 let status: string | undefined
@@ -191,9 +194,10 @@ export const register: Register = on => {
   on('prompt.submit', async ($, e, next) => {
     ruledSeen = board?.band?.ruled
     submitting++
+    const before = starts
     try {
       const r = await next(e)
-      if (running && !('drop' in r && r.drop)) queued = true
+      if (running && starts === before && !('drop' in r && r.drop)) queued = true
       return r
     } finally {
       submitting--
@@ -201,6 +205,7 @@ export const register: Register = on => {
   })
 
   on('turn.start', async ($, e, next) => {
+    starts++
     running = true
     queued = false
     return next(e)

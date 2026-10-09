@@ -25,10 +25,13 @@ function world(on: any, answer: object, box: string | string[] = '', stderr = ''
     return { value: { text, cursor: text.length } }
   })
   // What lies beneath the plugins: a prompt enters after `delay` ms (slow settings hooks).
+  // `startsTurn`: like the engine, `next` resolves once the prompt's own turn started.
   let delay = 0
+  let startTurn: ((text: string) => Promise<unknown>) | undefined
   on('prompt.submit', async (_$: any, e: { text: string }) => {
     if (delay) await clock.sleep(delay)
     submits.push(e.text)
+    if (startTurn) await startTurn(e.text)
     return { text: e.text }
   })
   on('ui.status', (_$: any, e: { text?: string }) => {
@@ -41,7 +44,15 @@ function world(on: any, answer: object, box: string | string[] = '', stderr = ''
   on('turn.complete', () => ({ text: '' }))
   // One poll interval: the mod's own timer polls the mailbox.
   const tick = () => clock.advance(1000)
-  return { runs, submits, statuses, tick, clock, slowSubmit: (ms: number) => (delay = ms) }
+  return {
+    runs,
+    submits,
+    statuses,
+    tick,
+    clock,
+    slowSubmit: (ms: number) => (delay = ms),
+    engineSubmit: (fire: (text: string) => Promise<unknown>) => (startTurn = fire),
+  }
 }
 
 const start = ($: any) => $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
@@ -94,6 +105,17 @@ describe('turn boundaries (V25, V21)', () => {
     await entering
     await w.tick()
     expect(polls(w.runs).at(-1)?.at(-1)).toBe('idle')
+  })
+
+  test('a prompt whose own turn started before submit resolved is not queued: idle after it completes', async ($, on) => {
+    const w = world(on, { status: null, commentary: [], item: null })
+    await start($)
+    w.engineSubmit(text => $.turn.start({ text, turnId: 't1' }))
+    await $.prompt.submit({ text: 'human prompt' })
+    await w.tick()
+    await $.turn.complete({ reason: 'answer', answer: 'done', durationMs: 1, isAborted: false, turnId: 't1' } as any)
+    await w.tick()
+    expect(polls(w.runs).map(p => p.at(-1))).toEqual(['busy', 'idle'])
   })
 
   test('a prompt queued behind the running turn keeps it busy past turn.complete', async ($, on) => {

@@ -724,6 +724,11 @@ fn stale_human_flag_cleared_by_our_prompt() {
 fn own_prompt_predicate() {
     assert!(history::is_own(OWN));
     assert!(history::is_own("Stop hook feedback:\n[pair-watcher · Challenge c1 · from the Watcher, not the human]"));
+    // The mod's idle route as Claude 2.1.295 records it (T22 live).
+    assert!(history::is_own(
+        "The pair-watcher plugin sent a message:\n[pair-watcher · Ruling c2 · from the human] The human sides…"
+    ));
+    assert!(!history::is_own("The pair-watcher plugin sent a message:\nplease rerun the tests"));
     assert!(!history::is_own("please look at the pair-watcher · Challenge c1 thing"));
 }
 

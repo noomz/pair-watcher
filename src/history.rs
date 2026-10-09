@@ -33,8 +33,9 @@ pub fn is_own(prompt: &str) -> bool {
     }
 }
 
-/// Lines a harness puts above a prompt it delivers for us (Claude's `Stop` block).
-const HARNESS_LABELS: &[&str] = &["Stop hook feedback:"];
+/// Lines a harness puts above a prompt it delivers for us (Claude's `Stop` block, and the mod's
+/// `$.prompt.submit` since Claude 2.1.295).
+const HARNESS_LABELS: &[&str] = &["Stop hook feedback:", "The pair-watcher plugin sent a message:"];
 /// Claude's blocked-question tool: its result is the human's answer.
 const ASK_TOOL: &str = "AskUserQuestion";
 

@@ -145,6 +145,10 @@ fn git(dir: &Path, args: &[&str]) {
 impl Fx {
     /// A Claude session in a git repo; `mode` = companion | swarm.
     fn new(mode: &str, server: &Server) -> Fx {
+        Fx::with_harness(mode, "claude", server)
+    }
+
+    fn with_harness(mode: &str, harness: &str, server: &Server) -> Fx {
         let dir = TempDir::new().unwrap();
         let home = Home::new(dir.path().join(".pair-watcher"));
         home.ensure_layout().unwrap();
@@ -159,7 +163,7 @@ impl Fx {
             .append(
                 Event::new(Kind::Session)
                     .with("phase", "start")
-                    .with("harness", "claude")
+                    .with("harness", harness)
                     .with("repo", repo.to_string_lossy().as_ref())
                     .with("mode", mode)
                     .with("ceiling_usd", 5.0)
@@ -691,6 +695,40 @@ fn verified_concern_becomes_challenge() {
     assert_eq!(queued.len(), 1);
     assert_eq!(fx.wakes()[0].outcome, Outcome::Challenge);
     assert_eq!(fx.mb.outbox().pending().unwrap().len(), 1);
+}
+
+/// V27, V21: on Codex the Challenge a turn-end wake queues goes by `codex queue` once that turn
+/// end settled, in the same step, to the Worker's thread (T22 live: it never went).
+#[test]
+fn codex_challenge_queued_after_settle() {
+    let add = r#"{"op":"add","severity":"warn","focus":"approach","headline":"6th review round, 0 new findings","challenge":true,"evidence":[{"kind":"transcript","excerpt":"Starting the 6th review round with zero new findings."}],"alternative":"stop requesting reviews; ask the human to merge"}"#;
+    let server = Server::start(move |_| reply(add));
+    let fx = Fx::with_harness("companion", "codex", &server);
+    let mut w = fx.open();
+    let dir = fx.repo.parent().unwrap().to_path_buf();
+    let argv = dir.join("codex.argv");
+    let codex = dir.join("codex");
+    fs::write(&codex, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n", argv.display())).unwrap();
+    fs::set_permissions(&codex, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    w.codex = codex;
+    let payload = json!({"transcript_path": fx.transcript, "session_id": "019a-thread"});
+    fx.hook("SessionStart", payload.clone());
+    for line in [
+        json!({"type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "UserMessage", "content": "get it approved"}}}),
+        json!({"type": "response_item", "payload": {"type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": "Starting the 6th review round with zero new findings."}]}}),
+        json!({"type": "event_msg", "payload": {"type": "task_complete"}}),
+    ] {
+        fx.line(line);
+    }
+    fx.hook("Stop", payload);
+    w.step(now()).unwrap();
+    assert_eq!(fx.wakes()[0].outcome, Outcome::Challenge);
+    let argv = fs::read_to_string(&argv).expect("codex queue ran");
+    let argv: Vec<&str> = argv.lines().collect();
+    assert_eq!(&argv[..4], ["queue", "--thread", "019a-thread", "--message"]);
+    assert!(argv[4].starts_with("[pair-watcher · Challenge c1"));
+    assert!(fx.events().iter().any(|e| e.k == Kind::Challenge && e.str("op") == Some("sent")));
 }
 
 trait BodyText {

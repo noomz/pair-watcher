@@ -288,6 +288,8 @@ pub struct Watch {
     /// Clock of normal wakes; tests shorten it.
     pub wake_clock: Duration,
     pub blocked_clock: Duration,
+    /// The Codex CLI `codex queue` runs (V27); tests point it at a fake.
+    pub codex: PathBuf,
     board: Board,
     offset: u64,
     triggers: Triggers,
@@ -405,6 +407,7 @@ impl Watch {
             exe,
             wake_clock: fail::WAKE_CLOCK,
             blocked_clock: fail::BLOCKED_CLOCK,
+            codex: PathBuf::from("codex"),
             board,
             offset: records.next,
             triggers: Triggers::default(),
@@ -577,6 +580,14 @@ impl Watch {
         // A turn end taken in beside a wake (V102) has not woken yet (V21).
         if self.turn_wait.is_none() && !self.triggers.turn_end_held() {
             self.mailbox.settle(self.state.inbox)?;
+        }
+        // After the settle (V21): the turn end's stale check ran, so a waiting item may go now, or
+        // again once a failed call's lease lapsed, while the Worker stays idle (V27).
+        if self.harness == Harness::Codex && !self.board.observe_only {
+            if let Err(e) = delivery::codex_queue(&self.mailbox, self.codex.as_os_str(), CODEX_QUEUE_TIMEOUT, now) {
+                eprintln!("pair-watcher: codex queue: {e}");
+            }
+            self.sync_sent()?;
         }
         self.save()
     }
@@ -1224,12 +1235,6 @@ impl Watch {
         }
         self.refresh()?;
         self.deliver()?;
-        if due.trigger == Trigger::TurnEnd && self.harness == Harness::Codex && !self.board.observe_only {
-            if let Err(e) = delivery::codex_queue(&self.mailbox, "codex".as_ref(), CODEX_QUEUE_TIMEOUT, now) {
-                eprintln!("pair-watcher: codex queue: {e}");
-            }
-            self.sync_sent()?;
-        }
         // A slice that did not reach the live tail is replayed next loop (V92).
         for (i, w) in roster.iter().enumerate() {
             let behind = !blocked && built[i].next.cursor != self.state.code && failed.iter().all(|(j, ..)| *j != i);
