@@ -458,6 +458,7 @@ impl Board {
                 self.tick(t, format!("Standing ruling {ruling} removed"), Tone::Plain);
             }
             // Already in the session start count.
+            Some(Act::Correction { .. }) => {}
             Some(Act::RulingsEdited { added, removed, changed }) => {
                 let mut parts = Vec::new();
                 for (sign, ids) in [("+", added), ("−", removed), ("~", changed)] {

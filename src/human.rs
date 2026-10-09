@@ -36,6 +36,9 @@ pub enum Act {
     },
     /// `x` / `rulings rm` (V78): Standing ruling `ruling` removed.
     RulingRemoved { ruling: String, via: Via },
+    /// The Watcher judged the human's prompt a correction of the Worker (V94): arbiter-written
+    /// from wake `wake`'s output, at most one per wake. Audit candidates follow from it (V97).
+    Correction { prompt_ref: String, watcher: String, wake: u64 },
     /// Session start: the rulings file was edited by hand since pair-watcher last knew it (V78).
     RulingsEdited {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]

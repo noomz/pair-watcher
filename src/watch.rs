@@ -35,6 +35,7 @@ use crate::focus::Focus;
 use crate::harness::Harness;
 use crate::history::History;
 use crate::home::{Home, write_atomic};
+use crate::human::Act;
 use crate::jsonl::now_ms;
 use crate::mailbox::Mailbox;
 use crate::models::{Choice, Table, Usage, Vendor};
@@ -1038,6 +1039,14 @@ impl Watch {
         arbiter::commit(&mut list, &self.log, &unverifiable)?;
         for d in &merged.dropped {
             eprintln!("pair-watcher: dropped {d}");
+        }
+        if due.trigger == Trigger::TurnEnd
+            && let Some((watcher, prompt_ref)) = merged.rest.iter().find_map(|(w, l)| match l {
+                Line::Correction { prompt_ref } => Some((w.clone(), prompt_ref.clone())),
+                _ => None,
+            })
+        {
+            self.append(Act::Correction { prompt_ref, watcher, wake: self.state.n + 1 }.event())?;
         }
         self.refresh()?;
         for (i, w) in roster.iter().enumerate() {

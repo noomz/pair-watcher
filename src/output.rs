@@ -62,6 +62,9 @@ pub enum Line {
     InferredRuling { escalation: String, side: Side, prompt_ref: String },
     /// A Concern withheld because a Standing ruling covers it (V78).
     HeldBack { ruling: String },
+    /// Turn-end wake: the human's latest prompt corrects the Worker (V94); its wake's
+    /// predecessor becomes an audit candidate (V97).
+    Correction { prompt_ref: String },
 }
 
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,6 +154,7 @@ fn check(line: &Line) -> Result<(), String> {
             text("prompt_ref", prompt_ref)
         }
         Line::HeldBack { ruling } => text("ruling", ruling),
+        Line::Correction { prompt_ref } => text("prompt_ref", prompt_ref),
     }
 }
 

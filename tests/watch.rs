@@ -836,3 +836,34 @@ fn prefilter_failure_fails_open() {
     let v = fx.wakes()[0].prefilter.clone().unwrap();
     assert!(v.error.is_some_and(|e| e.contains("500")) && v.score.is_none() && !v.skipped);
 }
+
+/// V94, V97: a turn-end answer flagging the human's prompt as a correction logs one `human
+/// correction` naming the wake; an invalid one (empty quote) voids the output as usual.
+#[test]
+fn correction_flag_logs_human_correction() {
+    let line = r#"{"op":"correction","prompt_ref":"no, put the old parser back"}"#;
+    let server = Server::start(move |_| reply(line));
+    let fx = Fx::new("companion", &server);
+    let mut w = fx.open();
+    fx.start();
+    fx.turn(1, "Rewrote the parser.");
+    fx.stop();
+    w.step(now()).unwrap();
+
+    let acts: Vec<Act> = fx
+        .mb
+        .log()
+        .read_from(0)
+        .unwrap()
+        .records
+        .iter()
+        .filter(|r| r.body.k == Kind::Human)
+        .filter_map(|r| r.body.parse::<Act>())
+        .collect();
+    assert_eq!(
+        acts,
+        [Act::Correction { prompt_ref: "no, put the old parser back".into(), watcher: "companion".into(), wake: 1 }]
+    );
+    assert_eq!(fx.wakes()[0].outcome, Outcome::Silent);
+    assert!(pair_watcher::output::parse(r#"{"op":"correction","prompt_ref":" "}"#).is_err());
+}
