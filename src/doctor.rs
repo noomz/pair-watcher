@@ -13,6 +13,7 @@ use crate::harness::{Harness, Support, Version};
 use crate::home::Home;
 use crate::launch::{CODEX_EVENTS, ListedHook};
 use crate::models::{self, Table};
+use crate::prefilter::{self, Tag};
 use crate::problem::tilde;
 use crate::{install, run};
 
@@ -51,8 +52,8 @@ pub struct Probes<'a> {
     pub version: &'a dyn Fn(Harness) -> Option<Version>,
     /// Codex `hooks/list` over the user config.
     pub codex_list: &'a dyn Fn() -> io::Result<Vec<ListedHook>>,
-    /// Model names an Ollama server at `url` has pulled.
-    pub ollama: &'a dyn Fn(&str) -> Result<Vec<String>, String>,
+    /// The models an Ollama server at `url` has pulled.
+    pub ollama: &'a dyn Fn(&str) -> Result<Vec<Tag>, String>,
     pub now: SystemTime,
 }
 
@@ -158,17 +159,17 @@ pub fn check(home: &Home, cwd: &Path, p: &Probes) -> Vec<Line> {
     if mode != "off" {
         let url = text("prefilter.url").unwrap_or_else(|| "http://localhost:11434".into());
         let model = text("prefilter.model").unwrap_or_else(|| "nimble".into());
-        if !local(&url) {
-            push(Level::Warn, format!("prefilter.url {url}: wake evidence leaves this machine"));
+        if !prefilter::local(&url) {
+            push(Level::Warn, format!("prefilter.url {url}: {}", prefilter::LEAVES));
         }
         match (p.ollama)(&url) {
-            Ok(names) if names.iter().any(|n| n == &model || n.starts_with(&format!("{model}:"))) => {
+            Ok(tags) if prefilter::pulled(&tags, &model).is_some() => {
                 push(Level::Ok, format!("pre-filter {model} at {url}"));
             }
             Ok(_) => push(Level::Warn, format!("pre-filter: {model} not pulled at {url}: ollama pull {model}")),
             Err(e) => push(Level::Warn, format!("pre-filter: Ollama not reachable at {url} ({e}); pre-filter off")),
         }
-        if mode == "skip" && !thresholds_present(home) {
+        if mode == "skip" && !prefilter::fitted_for(&prefilter::load_thresholds(home), &url) {
             push(
                 Level::Warn,
                 "prefilter.mode = skip refused: no fitted skip_below (pair-watcher prefilter fit); runs shadow".into(),
@@ -215,25 +216,9 @@ pub fn failed(lines: &[Line]) -> bool {
     lines.iter().any(|l| l.level == Level::Fail)
 }
 
-fn local(url: &str) -> bool {
-    let host = url.split("://").nth(1).unwrap_or(url).split(['/', ':']).next().unwrap_or_default();
-    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[")
-}
-
 fn age_days(path: &Path, now: SystemTime) -> Option<u64> {
     let modified = fs::metadata(path).ok()?.modified().ok()?;
     Some(now.duration_since(modified).unwrap_or(Duration::ZERO).as_secs() / 86_400)
-}
-
-/// `prefilter/thresholds.json` holds at least one fitted entry (written by `prefilter fit`, T17).
-fn thresholds_present(home: &Home) -> bool {
-    let path = home.root().join("prefilter").join("thresholds.json");
-    let Ok(bytes) = fs::read(path) else { return false };
-    match serde_json::from_slice::<serde_json::Value>(&bytes) {
-        Ok(serde_json::Value::Object(m)) => !m.is_empty(),
-        Ok(serde_json::Value::Array(a)) => !a.is_empty(),
-        _ => false,
-    }
 }
 
 fn dir_size(dir: &Path) -> u64 {
@@ -246,15 +231,4 @@ fn dir_size(dir: &Path) -> u64 {
             _ => 0,
         })
         .sum()
-}
-
-/// `GET <url>/api/tags`: the models an Ollama server has pulled.
-pub fn ollama_models(url: &str) -> Result<Vec<String>, String> {
-    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(2))).build().into();
-    let body: serde_json::Value = agent
-        .get(&format!("{}/api/tags", url.trim_end_matches('/')))
-        .call()
-        .and_then(|mut r| r.body_mut().read_json())
-        .map_err(|e| e.to_string())?;
-    Ok(body["models"].as_array().into_iter().flatten().filter_map(|m| m["name"].as_str().map(str::to_owned)).collect())
 }

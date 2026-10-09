@@ -84,6 +84,14 @@ impl Keys {
     }
 }
 
+/// A key by its env name, then the same name in `credentials` (the hosted pre-filter, I16).
+pub fn named(home: &Home, env: &dyn Fn(&str) -> Option<String>, name: &str) -> Option<String> {
+    env(name)
+        .or_else(|| read_file(home).ok().flatten()?.get(name)?.as_str().map(str::to_owned))
+        .map(|k| k.trim().to_owned())
+        .filter(|k| !k.is_empty())
+}
+
 fn read_file(home: &Home) -> Result<Option<Table>, CredError> {
     let path = home.credentials_file();
     let meta = match fs::metadata(&path) {

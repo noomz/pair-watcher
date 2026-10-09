@@ -578,6 +578,7 @@ impl Board {
             Outcome::Concern | Outcome::Challenge => ('■', "concern"),
             Outcome::Silent if w.replayed => ('↻', "replayed"),
             Outcome::Silent => ('·', "silent"),
+            Outcome::Skipped => ('·', "skipped"),
         };
         if matches!(w.outcome, Outcome::Concern | Outcome::Challenge | Outcome::Escalation) {
             self.last_spoke = Some(t);
@@ -724,7 +725,7 @@ fn rank(glyph: char) -> usize {
 }
 
 fn rank_word(word: &str) -> usize {
-    ["escalation", "failed", "concern", "replayed", "silent"].iter().position(|w| *w == word).unwrap_or(9)
+    ["escalation", "failed", "concern", "replayed", "silent", "skipped"].iter().position(|w| *w == word).unwrap_or(9)
 }
 
 fn strings(v: Option<&serde_json::Value>) -> Vec<String> {

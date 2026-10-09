@@ -181,7 +181,8 @@ impl Fx {
             "ANTHROPIC_BASE_URL" => Some(url.clone()),
             _ => None,
         };
-        let mut w = Watch::open(&self.home, self.mb.clone(), &env).unwrap_or_else(|e| panic!("open: {}", e.0));
+        let mut w = Watch::open_with(&self.home, self.mb.clone(), &env, &|_| Err("no Ollama in tests".into()))
+            .unwrap_or_else(|e| panic!("open: {}", e.0));
         w.notifier = Notifier::None;
         w.placement = Placement::Print;
         w.wake_clock = Duration::from_secs(5);
@@ -442,6 +443,8 @@ fn budget_hold_then_merged_catch_up() {
         spend: 5.0,
         replayed: false,
         rulings: vec![],
+        prefilter: None,
+        input: None,
     };
     fx.mb.log().append(spent.event()).unwrap();
     fx.turn(1, "First turn text.");
@@ -710,4 +713,113 @@ fn primary_retries_a_key_blind_watcher() {
     assert_eq!(server.requests().len(), 2);
     assert!(fx.status().contains(&Op::BlindEnd { focus: None }));
     assert!(!w.board().key_blind());
+}
+
+// ---- §T17 pre-filter (V53–V55) ----
+
+/// Model requests only; pre-filter requests carry `questions`.
+fn model_calls(server: &Server) -> Vec<Value> {
+    server.requests().into_iter().filter(|b| b.get("questions").is_none()).collect()
+}
+
+fn noul(p: f64) -> (u16, Value) {
+    (200, json!({"model": "nimble", "answers": {"worth_review": {"type": "noul", "noul": p}}}))
+}
+
+impl Fx {
+    /// The pre-filter pointed at the mock server.
+    fn prefilter(&self, mode: &str) {
+        let flags =
+            vec!["mode=companion".into(), format!("prefilter.mode={mode}"), format!("prefilter.url={}", self.url)];
+        watch::write_json(&self.mb.dir().join(watch::LAUNCH_FILE), &Launch { flags, only: vec![] }).unwrap();
+    }
+
+    fn fit(&self, skip_below: f64) {
+        let key = pair_watcher::prefilter::key(&self.url, "nimble");
+        let t = json!({key: {"skip_below": skip_below, "target": 0.98, "n": 100, "positives": 60}});
+        fs::write(pair_watcher::prefilter::thresholds_path(&self.home), t.to_string()).unwrap();
+    }
+}
+
+/// V53, V54: shadow scores a turn-end wake, logs score + key, never skips; a blocked wake is not
+/// scored.
+#[test]
+fn shadow_scores_and_never_skips() {
+    let server = Server::start(|b| if b.get("questions").is_some() { noul(0.01) } else { reply("") });
+    let fx = Fx::new("companion", &server);
+    fx.prefilter("shadow");
+    fx.fit(0.5);
+    let mut w = fx.open();
+    fx.start();
+    fx.turn(1, "Renamed a variable.");
+    fx.stop();
+    w.step(now()).unwrap();
+
+    assert_eq!(model_calls(&server).len(), 1, "shadow never skips");
+    let wake = &fx.wakes()[0];
+    assert_eq!(wake.outcome, Outcome::Silent);
+    let v = wake.prefilter.clone().expect("scored");
+    assert_eq!(v.score, Some(0.01));
+    assert_eq!(v.key.as_deref(), Some(format!("{}|nimble|worth_review@1", fx.url).as_str()));
+    assert_eq!((v.would_skip, v.skipped), (Some(true), false));
+
+    let scored = server.requests().len() - 1;
+    fx.hook("PermissionRequest", json!({"tool_name": "Bash", "tool_input": {"command": "ls"}}));
+    w.step(now()).unwrap();
+    assert_eq!(server.requests().len() - model_calls(&server).len(), scored, "blocked wake not scored");
+    assert!(fx.wakes().last().unwrap().prefilter.is_none());
+}
+
+/// V55: below the fitted threshold the wake is skipped: no model call, input kept, cursor held so
+/// the next wake reviews the skipped turn.
+#[test]
+fn skip_holds_the_cursor_and_keeps_the_input() {
+    let score = Arc::new(Mutex::new(0.1));
+    let s = Arc::clone(&score);
+    let server =
+        Server::start(move |b| if b.get("questions").is_some() { noul(*s.lock().unwrap()) } else { reply("") });
+    let fx = Fx::new("companion", &server);
+    fx.prefilter("skip");
+    fx.fit(0.5);
+    let mut w = fx.open();
+    fx.start();
+    fx.turn(1, "Bumped a comment.");
+    fx.stop();
+    w.step(now()).unwrap();
+
+    assert!(model_calls(&server).is_empty(), "skipped: no model call");
+    let wake = fx.wakes()[0].clone();
+    assert_eq!(wake.outcome, Outcome::Skipped);
+    assert!(wake.prefilter.as_ref().is_some_and(|v| v.skipped && v.score == Some(0.1)));
+    let kept = fs::read_to_string(fx.mb.dir().join(wake.input.unwrap())).unwrap();
+    assert!(kept.contains("Bumped a comment."));
+    assert!(w.state().focus.get("approach").is_none_or(|p| p.cursor != w.state().code), "cursor held");
+
+    *score.lock().unwrap() = 0.9;
+    fx.turn(2, "Rewrote the parser.");
+    fx.stop();
+    w.step(now()).unwrap();
+    let calls = model_calls(&server);
+    assert_eq!(calls.len(), 1);
+    let input = input_of(&calls[0]);
+    assert!(input.contains("Bumped a comment.") && input.contains("Rewrote the parser."), "skipped turn reviewed");
+    assert_eq!(fx.wakes().last().unwrap().outcome, Outcome::Silent);
+    assert_eq!(w.state().focus["approach"].cursor, w.state().code);
+}
+
+/// V55, V86: a pre-filter failure wakes, with the error logged.
+#[test]
+fn prefilter_failure_fails_open() {
+    let server = Server::start(|b| if b.get("questions").is_some() { (500, json!({})) } else { reply("") });
+    let fx = Fx::new("companion", &server);
+    fx.prefilter("skip");
+    fx.fit(0.5);
+    let mut w = fx.open();
+    fx.start();
+    fx.turn(1, "Done.");
+    fx.stop();
+    w.step(now()).unwrap();
+    assert_eq!(model_calls(&server).len(), 1);
+    let v = fx.wakes()[0].prefilter.clone().unwrap();
+    assert!(v.error.is_some_and(|e| e.contains("500")) && v.score.is_none() && !v.skipped);
 }

@@ -14,6 +14,7 @@ use pair_watcher::doctor::{self, Level, Line, Probes};
 use pair_watcher::harness::{Harness, Version};
 use pair_watcher::home::Home;
 use pair_watcher::launch::{CODEX_EVENTS, ListedHook};
+use pair_watcher::prefilter::Tag;
 use tempfile::TempDir;
 
 struct World {
@@ -65,7 +66,9 @@ impl World {
         let listed = self.listed.clone();
         let codex_list = move || -> io::Result<Vec<ListedHook>> { Ok(listed.clone()) };
         let ollama = self.ollama.clone();
-        let ollama = move |_: &str| ollama.clone();
+        let ollama = move |_: &str| {
+            ollama.clone().map(|names| names.into_iter().map(|name| Tag { name, digest: String::new() }).collect())
+        };
         let probes = Probes { env: &env, version: &version, codex_list: &codex_list, ollama: &ollama, now: self.now };
         doctor::check(&self.home, &self.repo, &probes)
     }
@@ -198,7 +201,17 @@ fn prefilter_checks_follow_the_mode() {
     let lines = w.check();
     assert!(has(&lines, Level::Warn, "prefilter.mode = skip refused"), "V55: {lines:#?}");
     assert!(has(&lines, Level::Warn, "wake evidence leaves this machine"), "V55");
-    common::write(&w.home.root().join("prefilter/thresholds.json"), r#"{"k": {"skip_below": 0.1}}"#);
+    // Another backend's or question's key does not lift the refusal (V55).
+    let fitted = |key: &str| format!(r#"{{"{key}": {{"skip_below": 0.1}}}}"#);
+    common::write(
+        &w.home.root().join("prefilter/thresholds.json"),
+        &fitted("http://localhost:11434|nimble|worth_review@1"),
+    );
+    assert!(has(&w.check(), Level::Warn, "skip refused"));
+    common::write(
+        &w.home.root().join("prefilter/thresholds.json"),
+        &fitted("https://prefilter.example|jev-1.13.0|worth_review@1"),
+    );
     assert!(!has(&w.check(), Level::Warn, "skip refused"));
     w.global("[prefilter]\nmode = \"off\"\n");
     assert!(!w.check().iter().any(|l| l.text.contains("pre-filter")), "off: no probe");

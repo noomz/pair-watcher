@@ -17,6 +17,8 @@ use crate::outbox::Outbox;
 const REGISTERED: &str = "registered";
 /// Hook inbox offset the arbiter has stale-checked through (V21); idle deliverers wait on it.
 const SETTLED: &str = "settled";
+/// The session event log (I4).
+pub const LOG_FILE: &str = "log.jsonl";
 
 /// One hook invocation as appended to `events.jsonl` (I5).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -110,7 +112,7 @@ impl Mailbox {
     }
 
     pub fn log(&self) -> EventLog {
-        EventLog::new(self.dir.join("log.jsonl"))
+        EventLog::new(self.dir.join(LOG_FILE))
     }
 }
 

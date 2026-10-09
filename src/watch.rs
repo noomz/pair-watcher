@@ -25,7 +25,7 @@ use crate::budget::Need;
 use crate::challenge::{self, Auto, Origin, Sources};
 use crate::concern::{Change, Concern};
 use crate::config::Resolved;
-use crate::credentials::Keys;
+use crate::credentials::{self, Keys};
 use crate::debate::EscalateAt;
 use crate::delivery;
 use crate::escalation::{self, Notifier, Surfaces};
@@ -42,6 +42,7 @@ use crate::outbox::Outbox;
 use crate::output::{self, Line};
 use crate::pane::{self, Board};
 use crate::placement::{Placement, pane_command};
+use crate::prefilter::{self, Gate, Tag, Verdict, Wakeup};
 use crate::provider::{Api, Call, ProviderError};
 use crate::repo;
 use crate::snapshot::Store;
@@ -264,6 +265,10 @@ pub struct Watch {
     /// Owner Watcher's last wake cost (V24).
     cost: HashMap<String, f64>,
     pane_opened: bool,
+    /// The wake pre-filter; `None` = off (V53).
+    prefilter: Option<Gate>,
+    /// The final drain's wake: never skipped (V54).
+    draining: bool,
 }
 
 /// Why the Watcher cannot run at all: logged as BLIND (V89).
@@ -272,6 +277,16 @@ pub struct Unrunnable(pub String);
 impl Watch {
     /// Rebuilds the Watcher from the session's files (V91). `env` = the launch environment.
     pub fn open(home: &Home, mailbox: Mailbox, env: &dyn Fn(&str) -> Option<String>) -> Result<Watch, Unrunnable> {
+        Self::open_with(home, mailbox, env, &prefilter::ollama_tags)
+    }
+
+    /// `open` with the pre-filter's Ollama probe given (tests).
+    pub fn open_with(
+        home: &Home,
+        mailbox: Mailbox,
+        env: &dyn Fn(&str) -> Option<String>,
+        probe: &dyn Fn(&str) -> Result<Vec<Tag>, String>,
+    ) -> Result<Watch, Unrunnable> {
         let log = mailbox.log();
         let records = log.read_from(0).map_err(|e| Unrunnable(format!("event log: {e}")))?;
         let board = Board::rebuild(0, &records.records);
@@ -304,6 +319,20 @@ impl Watch {
                 .unwrap_or_default(),
             None => Vec::new(),
         };
+        let text = |k: &str| loaded.resolved.get(k).and_then(toml::Value::as_str).map(str::to_owned);
+        let url = text("prefilter.url").unwrap_or_else(|| prefilter::DEFAULT_URL.into());
+        let key = (!prefilter::local(&url)).then(|| credentials::named(home, env, prefilter::KEY_ENV)).flatten();
+        let gate = Gate::open(
+            home,
+            &text("prefilter.mode").unwrap_or_else(|| "auto".into()),
+            &url,
+            &text("prefilter.model").unwrap_or_else(|| prefilter::DEFAULT_MODEL.into()),
+            key,
+            probe,
+        );
+        for note in gate.iter().flat_map(|g| &g.notes) {
+            eprintln!("pair-watcher: {note}");
+        }
         let mut w = Watch {
             log,
             outbox: mailbox.outbox(),
@@ -334,6 +363,8 @@ impl Watch {
             turn_wait: None,
             cost: HashMap::new(),
             pane_opened: mailbox.dir().join(PANE_OPENED).exists(),
+            prefilter: gate,
+            draining: false,
             mailbox,
         };
         w.choose_models()?;
@@ -396,6 +427,8 @@ impl Watch {
                     spend: 0.0,
                     replayed: false,
                     rulings: vec![],
+                    prefilter: None,
+                    input: None,
                 }
                 .event(),
             )?;
@@ -511,7 +544,9 @@ impl Watch {
             self.turn_wait = None;
             let clock = self.wake_clock;
             self.wake_clock = DRAIN_CLOCK.min(clock);
+            self.draining = true;
             self.round(&Due { trigger, payload: None, at: now }, None, now)?;
+            self.draining = false;
             self.wake_clock = clock;
         }
         let mut rulings = self.board.rulings.clone();
@@ -851,8 +886,33 @@ impl Watch {
         rulings.drop_on_prompt(&self.log, &self.outbox, &fresh, now)?;
         self.refresh()?;
 
-        let built: Vec<Built> =
+        let mut built: Vec<Built> =
             roster.iter().map(|w| self.build(w, due, tree.as_deref())).collect::<io::Result<_>>()?;
+        let wakeup =
+            Wakeup { blocked, owes_reply: self.board.debate.owes(), catch_up: only.is_some() || self.draining };
+        let mut verdicts = self.prefilter(&built, wakeup);
+        // Skipped Watchers: logged with their input, cursor held, no model call (V55).
+        let mut skipped = Vec::new();
+        for i in (0..roster.len()).rev() {
+            if verdicts[i].as_ref().is_some_and(|v| v.skipped) {
+                let (w, b, v) = (roster.remove(i), built.remove(i), verdicts.remove(i));
+                let input = prefilter::keep_input(self.mailbox.dir(), self.state.n + 1, &w.name, &b.input)?;
+                skipped.push(Wake {
+                    n: self.state.n + 1,
+                    watcher: w.name,
+                    trigger: trigger_name(due.trigger, false).into(),
+                    outcome: Outcome::Skipped,
+                    class: None,
+                    error: None,
+                    model: String::new(),
+                    spend: 0.0,
+                    replayed: false,
+                    rulings: vec![],
+                    prefilter: v,
+                    input: Some(input),
+                });
+            }
+        }
         let slices = roster.iter().zip(&built).map(|(w, b)| (w.name.clone(), slice_key(b))).collect();
         let skip = roster.iter().zip(&built).map(|(w, b)| (w.name.clone(), skip_of(b, now))).collect();
         let inflight = self.mailbox.dir().join(INFLIGHT_FILE);
@@ -901,6 +961,8 @@ impl Watch {
                 spend: 0.0,
                 replayed: built[i].replayed,
                 rulings: vec![],
+                prefilter: verdicts[i].clone(),
+                input: None,
             };
             match r {
                 Err(panic) => {
@@ -1044,7 +1106,7 @@ impl Watch {
                 wakes[i].outcome = Outcome::Escalation;
             }
         }
-        for wake in wakes {
+        for wake in skipped.into_iter().chain(wakes) {
             self.append(wake.event())?;
         }
         self.state.n += 1;
@@ -1071,6 +1133,32 @@ impl Watch {
             }
         }
         Ok(())
+    }
+
+    /// Scores each eligible Watcher's input in parallel (V53–V55); `None` = not scored. A failure
+    /// fails open and reaches the ticker once until an answer comes back (V86).
+    fn prefilter(&mut self, built: &[Built], wakeup: Wakeup) -> Vec<Option<Verdict>> {
+        let Some(gate) = self.prefilter.as_mut().filter(|_| wakeup.eligible()) else {
+            return vec![None; built.len()];
+        };
+        let verdicts: Vec<Option<Verdict>> = thread::scope(|s| {
+            let gate = &*gate;
+            let tasks: Vec<_> = built
+                .iter()
+                // A replayed or merged slice is catch-up, never skipped (V54).
+                .map(|b| (!b.replayed && b.merged.is_none()).then(|| s.spawn(|| gate.score(&b.input))))
+                .collect();
+            tasks.into_iter().map(|t| t.and_then(|t| t.join().ok())).collect()
+        });
+        match verdicts.iter().flatten().find_map(|v| v.error.as_deref()) {
+            Some(e) if !gate.down => {
+                gate.down = true;
+                eprintln!("pair-watcher: pre-filter down ({e}): waking");
+            }
+            None if verdicts.iter().flatten().any(|v| v.score.is_some()) => gate.down = false,
+            _ => {}
+        }
+        verdicts
     }
 
     /// Wakes the budget or the user held back (V50, V70, V92): the cursor stays; the next wake

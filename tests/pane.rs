@@ -59,6 +59,8 @@ fn wake(n: u64, outcome: Outcome) -> Event {
         spend: 0.23,
         replayed: false,
         rulings: vec![],
+        prefilter: None,
+        input: None,
     }
     .event()
 }

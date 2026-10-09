@@ -19,6 +19,8 @@ pub enum Outcome {
     Invalid,
     Failed,
     Interrupted,
+    /// The pre-filter skipped it: no model call, cursor held (V55).
+    Skipped,
 }
 
 /// Failure class (V86).
@@ -53,6 +55,12 @@ pub struct Wake {
     /// Standing rulings the Watcher held a Concern back for (`held_back`, V78, V94).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rulings: Vec<String>,
+    /// Pre-filter score, threshold key, would-skip (V53, V94).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefilter: Option<crate::prefilter::Verdict>,
+    /// A skipped wake's kept input, session-relative (V55).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
 }
 
 impl Wake {

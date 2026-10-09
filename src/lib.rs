@@ -31,6 +31,7 @@ pub mod outbox;
 pub mod output;
 pub mod pane;
 pub mod placement;
+pub mod prefilter;
 pub mod problem;
 pub mod provider;
 pub mod repo;

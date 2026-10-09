@@ -313,13 +313,27 @@ fn dispatch(command: Command, via: Via) -> ExitCode {
         Command::Auth => auth(),
         Command::Doctor => doctor_cmd(),
         Command::Models { action } => models_cmd(action),
-        Command::Prefilter { .. } => later("T17"),
+        Command::Prefilter { action: PrefilterAction::Fit { target } } => prefilter_fit(target),
         Command::Report { .. }
         | Command::Replay { .. }
         | Command::Audit { .. }
         | Command::Telemetry { .. }
         | Command::Prune => later("T18"),
         Command::Mcp => later("T20"),
+    }
+}
+
+/// `prefilter fit` (V55, V98): the only fitted value, `skip_below`, per threshold key.
+fn prefilter_fit(target: Option<f64>) -> ExitCode {
+    let target = target.unwrap_or(crate::prefilter::DEFAULT_TARGET);
+    match Home::from_env().and_then(|home| crate::prefilter::fit_cmd(&home, target)) {
+        Ok(lines) => {
+            for line in lines {
+                println!("{line}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&format!("prefilter fit: {e}")),
     }
 }
 
@@ -693,7 +707,7 @@ fn doctor_cmd() -> ExitCode {
         env: &env,
         version: &|h: Harness| harness::probe(OsStr::new(h.name())),
         codex_list: &|| launch::codex_hooks_list(OsStr::new("codex"), &[], &user, Duration::from_secs(10)),
-        ollama: &doctor::ollama_models,
+        ollama: &crate::prefilter::ollama_tags,
         now: std::time::SystemTime::now(),
     };
     let lines = doctor::check(&home, &cwd, &probes);
