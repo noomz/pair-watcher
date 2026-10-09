@@ -184,6 +184,8 @@ struct Cfg {
     band_digits: bool,
     model: String,
     fallback: Option<String>,
+    telemetry: bool,
+    retention: crate::retention::Policy,
 }
 
 impl Cfg {
@@ -198,6 +200,8 @@ impl Cfg {
             band_digits: flag("band_digits", true),
             model: text("model").unwrap_or_else(|| "auto".into()),
             fallback: text("fallback_model").filter(|m| !m.trim().is_empty()),
+            telemetry: flag("telemetry", false),
+            retention: crate::retention::Policy::from(r),
         }
     }
 }
@@ -1622,7 +1626,10 @@ pub fn watch(home: &Home, session: &str) -> io::Result<()> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("session {session} is not registered")))?;
     let env = |k: &str| std::env::var(k).ok();
     match Watch::open(home, mailbox.clone(), &env) {
-        Ok(mut w) => w.run(),
+        Ok(mut w) => {
+            upkeep(home.clone(), w.cfg.retention, w.cfg.telemetry);
+            w.run()
+        }
         Err(Unrunnable(reason)) => {
             heartbeat(mailbox.dir().join(HEARTBEAT_FILE));
             let log = mailbox.log();
@@ -1636,6 +1643,24 @@ pub fn watch(home: &Home, session: &str) -> io::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Store housekeeping off the wake path (V96, V99): retention + cap, then a due weekly telemetry
+/// send. Failures only print; nothing here may stop the Watcher.
+fn upkeep(home: Home, policy: crate::retention::Policy, telemetry: bool) {
+    thread::spawn(move || {
+        let now = now_ms();
+        if let Err(e) = crate::retention::prune(&home, policy, now) {
+            eprintln!("pair-watcher: prune: {e}");
+        }
+        if telemetry {
+            match crate::telemetry::weekly(&home, now, &crate::telemetry::post) {
+                Ok(crate::telemetry::Sent::Dropped(why)) => eprintln!("pair-watcher: telemetry dropped: {why}"),
+                Err(e) => eprintln!("pair-watcher: telemetry: {e}"),
+                _ => {}
+            }
+        }
+    });
 }
 
 /// The launch env's API key vars, for reloading keys later.

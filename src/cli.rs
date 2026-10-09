@@ -321,7 +321,9 @@ fn dispatch(command: Command, via: Via) -> ExitCode {
         Command::Models { action } => models_cmd(action),
         Command::Prefilter { action: PrefilterAction::Fit { target } } => prefilter_fit(target),
         Command::Report { export, explicit_only, since, until } => report(export, explicit_only, since, until),
-        Command::Replay { .. } | Command::Audit { .. } | Command::Telemetry { .. } | Command::Prune => later("T18"),
+        Command::Telemetry { action } => telemetry(action),
+        Command::Prune => prune(),
+        Command::Replay { .. } | Command::Audit { .. } => later("T18"),
         Command::Mcp => later("T20"),
     }
 }
@@ -741,6 +743,61 @@ fn doctor_cmd() -> ExitCode {
 fn later(task: &str) -> ExitCode {
     eprintln!("pair-watcher: not implemented yet ({task})");
     ExitCode::from(2)
+}
+
+/// Home and the config resolved for the current directory.
+fn loaded() -> Result<(Home, run::Loaded), String> {
+    let home = Home::from_env().map_err(|e| e.to_string())?;
+    home.ensure_layout().map_err(|e| format!("{}: {e}", tilde(home.root())))?;
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let loaded = run::load(&home, &cwd, &[], &[]).map_err(|u| u.to_string())?;
+    Ok((home, loaded))
+}
+
+fn telemetry(action: TelemetryAction) -> ExitCode {
+    let home = match Home::from_env() {
+        Ok(h) => h,
+        Err(e) => return fail(&e.to_string()),
+    };
+    let done = match action {
+        TelemetryAction::On | TelemetryAction::Off => {
+            let on = matches!(action, TelemetryAction::On);
+            crate::telemetry::set(&home, on, now_ms()).map(|()| {
+                let state = if on { "on: a weekly aggregate (counts and ratios only)" } else { "off" };
+                vec![format!("telemetry {state}")]
+            })
+        }
+        TelemetryAction::Preview => crate::telemetry::payload(&home, now_ms())
+            .and_then(|v| serde_json::to_string_pretty(&v).map_err(Into::into))
+            .map(|s| vec![s]),
+    };
+    match done {
+        Ok(lines) => {
+            lines.iter().for_each(|l| println!("{l}"));
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&format!("telemetry: {e}")),
+    }
+}
+
+fn prune() -> ExitCode {
+    let (home, loaded) = match loaded() {
+        Ok(l) => l,
+        Err(e) => return fail(&e),
+    };
+    let policy = crate::retention::Policy::from(&loaded.resolved);
+    match crate::retention::prune(&home, policy, now_ms()) {
+        Ok(p) => {
+            println!(
+                "pruned {} wake records, {} snapshot stores ({:.1} MB); event logs and Standing rulings kept",
+                p.records,
+                p.stores,
+                p.bytes as f64 / 1_048_576.0
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&format!("prune: {e}")),
+    }
 }
 
 fn config_show(origin: bool) -> ExitCode {
