@@ -52,6 +52,8 @@ pub enum ProviderError {
     Network(String),
     /// Response not in the vendor's shape.
     Protocol(String),
+    /// A headless backend failed (`claude -p`, `codex exec`): its message.
+    Cli(String),
 }
 
 impl fmt::Display for ProviderError {
@@ -62,6 +64,7 @@ impl fmt::Display for ProviderError {
             ProviderError::Timeout => f.write_str("timed out"),
             ProviderError::Network(e) => write!(f, "network: {e}"),
             ProviderError::Protocol(e) => write!(f, "unexpected response: {e}"),
+            ProviderError::Cli(e) => f.write_str(e),
         }
     }
 }
@@ -71,6 +74,76 @@ impl fmt::Display for ProviderError {
 pub struct Failure {
     pub error: ProviderError,
     pub usage: Usage,
+}
+
+/// Config `backend` (I15): the direct API (default) or an opt-in subscription CLI (V52).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    Api,
+    ClaudeP,
+    CodexExec,
+}
+
+impl Backend {
+    pub fn from_config(s: &str) -> Backend {
+        match s {
+            "claude-p" => Backend::ClaudeP,
+            "codex-exec" => Backend::CodexExec,
+            _ => Backend::Api,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Backend::Api => "api",
+            Backend::ClaudeP => "claude-p",
+            Backend::CodexExec => "codex-exec",
+        }
+    }
+
+    /// Runs on the harness's login, not an API key: shares the Worker's quota (V52).
+    pub fn subscription(self) -> bool {
+        self != Backend::Api
+    }
+
+    /// The one vendor a subscription backend runs; `None` = whichever vendors have keys.
+    pub fn vendor(self) -> Option<Vendor> {
+        match self {
+            Backend::Api => None,
+            Backend::ClaudeP => Some(Vendor::Anthropic),
+            Backend::CodexExec => Some(Vendor::Openai),
+        }
+    }
+
+    pub fn headless(self) -> Option<crate::headless::Kind> {
+        match self {
+            Backend::Api => None,
+            Backend::ClaudeP => Some(crate::headless::Kind::ClaudeP),
+            Backend::CodexExec => Some(crate::headless::Kind::CodexExec),
+        }
+    }
+}
+
+/// One interface over every backend (I15).
+pub enum Provider {
+    Api(Api),
+    Cli(crate::headless::Cli),
+}
+
+impl Provider {
+    pub fn call(&self, call: &Call) -> Result<Reply, Failure> {
+        match self {
+            Provider::Api(api) => api.call(call),
+            Provider::Cli(cli) => cli.call(call),
+        }
+    }
+
+    /// After `pair-watcher auth` (V51); a subscription backend has no keys.
+    pub fn set_keys(&mut self, keys: Keys) {
+        if let Provider::Api(api) = self {
+            api.set_keys(keys);
+        }
+    }
 }
 
 pub struct Api {

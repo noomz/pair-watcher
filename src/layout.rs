@@ -306,7 +306,7 @@ fn header(b: &Board, ui: &Ui, width: usize) -> Vec<Line> {
         rest.push("same vendor as Worker".to_owned());
     }
     if b.models.values().any(|(.., quota)| *quota) {
-        rest.push("shares Worker quota".to_owned());
+        rest.push("shares Worker quota, budgets approximate".to_owned());
     }
     if let Some(m) = &b.fallback {
         rest.push(format!("fallback {m} (primary failing)"));

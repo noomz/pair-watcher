@@ -44,7 +44,7 @@ use crate::output::{self, Line};
 use crate::pane::{self, Board};
 use crate::placement::{Placement, pane_command};
 use crate::prefilter::{self, Gate, Tag, Verdict, Wakeup};
-use crate::provider::{Api, Call, ProviderError};
+use crate::provider::{Api, Backend, Call, Provider, ProviderError};
 use crate::record::{self, WakeRecord};
 use crate::repo;
 use crate::snapshot::Store;
@@ -202,6 +202,7 @@ struct Cfg {
     band_digits: bool,
     model: String,
     fallback: Option<String>,
+    backend: Backend,
     telemetry: bool,
     retention: crate::retention::Policy,
 }
@@ -218,6 +219,7 @@ impl Cfg {
             band_digits: flag("band_digits", true),
             model: text("model").unwrap_or_else(|| "auto".into()),
             fallback: text("fallback_model").filter(|m| !m.trim().is_empty()),
+            backend: Backend::from_config(&text("backend").unwrap_or_default()),
             telemetry: flag("telemetry", false),
             retention: crate::retention::Policy::from(r),
         }
@@ -270,7 +272,8 @@ pub struct Watch {
     focuses: Vec<Focus>,
     cfg: Cfg,
     instructions: Vec<String>,
-    api: Api,
+    /// From config `backend` (I15); tests point a subscription CLI at a fake.
+    pub provider: Provider,
     table: Table,
     keys: Keys,
     /// Reloads keys for `primary`: the home and the launch env's key vars.
@@ -337,7 +340,8 @@ impl Watch {
             .map_err(|u| Unrunnable(format!("config unreadable: {u}")))?;
         let table = Table::load(home).map_err(|e| Unrunnable(format!("price table: {e}")))?;
         let keys = Keys::load(home, env);
-        let store = repo::discover(&repo).and_then(|r| Store::open(mailbox.dir(), &r).ok());
+        let worker_repo = repo::discover(&repo);
+        let store = worker_repo.as_ref().and_then(|r| Store::open(mailbox.dir(), r).ok());
         let mut state: Committed = read_json(&mailbox.dir().join(STATE_FILE))
             .map_err(|e| Unrunnable(format!("{STATE_FILE}: {e}")))?
             .unwrap_or_default();
@@ -364,6 +368,18 @@ impl Watch {
         for note in gate.iter().flat_map(|g| &g.notes) {
             eprintln!("pair-watcher: {note}");
         }
+        let cfg = Cfg::from(&loaded.resolved);
+        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pair-watcher"));
+        let provider = match cfg.backend.headless() {
+            None => Provider::Api(Api::new(keys.clone(), env, fail::WAKE_CLOCK)),
+            Some(kind) => Provider::Cli(crate::headless::Cli {
+                kind,
+                program: PathBuf::from(kind.program()),
+                exe: exe.clone(),
+                mailbox: mailbox.dir().to_owned(),
+                repo: worker_repo.map(|r| r.root),
+            }),
+        };
         let mut w = Watch {
             log,
             outbox: mailbox.outbox(),
@@ -371,14 +387,14 @@ impl Watch {
             instructions: wake::instruction_files(&repo),
             store,
             focuses: loaded.focuses.enabled,
-            cfg: Cfg::from(&loaded.resolved),
-            api: Api::new(keys.clone(), env, fail::WAKE_CLOCK),
+            cfg,
+            provider,
             table,
             keys,
             key_source: (home.clone(), key_env(env)),
             notifier: Notifier::detect(env),
             placement: Placement::detect(env),
-            exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pair-watcher")),
+            exe,
             wake_clock: fail::WAKE_CLOCK,
             blocked_clock: fail::BLOCKED_CLOCK,
             board,
@@ -419,7 +435,7 @@ impl Watch {
                 watcher: w.name.clone(),
                 model: choice.model,
                 same_vendor: choice.same_vendor,
-                shares_quota: false,
+                shares_quota: self.cfg.backend.subscription(),
             };
             if self.board.models.get(&w.name).map(|m| m.0.as_str()) != Some(op_model(&op)) {
                 self.append(op.event()).map_err(|e| Unrunnable(e.to_string()))?;
@@ -430,13 +446,23 @@ impl Watch {
 
     fn primary(&self, w: &Watcher) -> Result<Choice, String> {
         let setting = w.model.as_deref().unwrap_or(&self.cfg.model);
-        models::choose(&self.table, setting, worker_vendor(self.harness), &self.keys.configured())
-            .map_err(|e| format!("model {setting}: {e}"))
+        self.choose(setting).map_err(|e| format!("model {setting}: {e}"))
     }
 
     fn fallback_choice(&self) -> Option<Choice> {
-        let m = self.cfg.fallback.as_deref()?;
-        models::choose(&self.table, m, worker_vendor(self.harness), &self.keys.configured()).ok()
+        self.choose(self.cfg.fallback.as_deref()?).ok()
+    }
+
+    /// A subscription backend runs its own vendor's models only, on its login (I15).
+    fn choose(&self, setting: &str) -> Result<Choice, String> {
+        let backend = self.cfg.backend;
+        let configured = backend.vendor().map_or_else(|| self.keys.configured(), |v| vec![v]);
+        models::choose(&self.table, setting, worker_vendor(self.harness), &configured).map_err(|e| match e {
+            models::ChoiceError::NoKey(v) if backend.subscription() => {
+                format!("backend {} runs no {} models", backend.name(), v.name())
+            }
+            e => e.to_string(),
+        })
     }
 
     /// A wake cut off by a crash or kill counts once against its slices (V86, V88).
@@ -547,7 +573,7 @@ impl Watch {
         self.state.primary = self.board.primary_asked;
         let (home, vars) = &self.key_source;
         self.keys = Keys::load(home, &|k| vars.get(k).cloned());
-        self.api.set_keys(self.keys.clone());
+        self.provider.set_keys(self.keys.clone());
         if self.state.fallback.active == Some(Class::Key) {
             self.state.fallback.recovered();
             self.append(Op::Primary.event())?;
@@ -966,7 +992,7 @@ impl Watch {
             .collect::<Result<_, String>>()
             .map_err(io::Error::other)?;
         let head = self.store.as_ref().and_then(Store::head);
-        let (api, table, store) = (&self.api, &self.table, self.store.as_ref());
+        let (provider, table, store) = (&self.provider, &self.table, self.store.as_ref());
         let results = arbiter::run(&roster, |w| {
             let i = roster.iter().position(|r| r.name == w.name).expect("in roster");
             let tools = match (store, &tree) {
@@ -974,7 +1000,7 @@ impl Watch {
                 _ => None,
             };
             let (choice, probe) = &plans[i];
-            ask(api, table, choice, &built[i].input, tools, deadline, !probe, *probe)
+            ask(provider, table, choice, &built[i].input, tools, deadline, !probe, *probe)
         });
 
         // The arbiter takes accepted outputs only (V10, V43).
@@ -1571,7 +1597,7 @@ fn item_len(i: &Item) -> usize {
 /// asked again once, then failed with its class. `retries = false` for a primary probe (V51).
 #[allow(clippy::too_many_arguments)]
 fn ask(
-    api: &Api,
+    provider: &Provider,
     table: &Table,
     choice: &Choice,
     input: &str,
@@ -1588,7 +1614,7 @@ fn ask(
     let mut invalid = None;
     let result = loop {
         let call = Call { model: &choice.model, vendor: choice.vendor, input, tools, deadline: Some(deadline) };
-        match api.call(&call) {
+        match provider.call(&call) {
             Ok(reply) => {
                 spend += cost(&reply.usage);
                 usage += reply.usage;

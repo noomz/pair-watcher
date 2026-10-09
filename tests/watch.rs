@@ -19,6 +19,7 @@ use pair_watcher::home::Home;
 use pair_watcher::human::Act;
 use pair_watcher::mailbox::{Hook, Mailbox};
 use pair_watcher::placement::Placement;
+use pair_watcher::provider::Provider;
 use pair_watcher::record;
 use pair_watcher::status::{Coverage, Op, Outcome, Wake};
 use pair_watcher::watch::{self, Inflight, Launch, Watch};
@@ -867,4 +868,103 @@ fn correction_flag_logs_human_correction() {
     );
     assert_eq!(fx.wakes()[0].outcome, Outcome::Silent);
     assert!(pair_watcher::output::parse(r#"{"op":"correction","prompt_ref":" "}"#).is_err());
+}
+
+/// I15, V52: `backend = claude-p` wakes through `claude -p` on the login (no API key); the fake
+/// `claude` drives the real `pair-watcher mcp` from `--mcp-config`, reading the wake's snapshot;
+/// the read is counted and the pane notes the shared quota.
+#[test]
+fn claude_p_backend_wakes_through_mcp() {
+    let server = Server::start(|_| (500, json!({})));
+    let fx = Fx::new("companion", &server);
+    watch::write_json(
+        &fx.mb.dir().join(watch::LAUNCH_FILE),
+        &Launch { flags: vec!["mode=companion".into(), "backend=claude-p".into()], only: vec![] },
+    )
+    .unwrap();
+    let log = fx.repo.parent().unwrap().join("claude.log");
+    let result = json!({"type": "result", "subtype": "success", "is_error": false, "result": ADD, "num_turns": 2,
+        "usage": {"input_tokens": 900, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "output_tokens": 90}});
+    let fake = fx.repo.parent().unwrap().join("claude");
+    fs::write(
+        &fake,
+        format!(
+            r#"#!/usr/bin/env python3
+import json, os, subprocess, sys
+a = sys.argv[1:]
+stdin = sys.stdin.read()
+cfg = json.loads(a[a.index("--mcp-config") + 1])["mcpServers"]["pair-watcher"]
+p = subprocess.Popen([cfg["command"]] + cfg["args"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+def rpc(i, method, params):
+    p.stdin.write(json.dumps({{"jsonrpc": "2.0", "id": i, "method": method, "params": params}}) + "\n")
+    p.stdin.flush()
+    return json.loads(p.stdout.readline())
+rpc(1, "initialize", {{"protocolVersion": "2025-06-18"}})
+tools = [t["name"] for t in rpc(2, "tools/list", {{}})["result"]["tools"]]
+read = rpc(3, "tools/call", {{"name": "read_file", "arguments": {{"path": "a.txt"}}}})["result"]["content"][0]["text"]
+p.stdin.close()
+p.wait()
+json.dump({{"guard": os.environ.get("PAIR_WATCHER_GUARD"), "tools": tools, "read": read, "watcher": stdin.startswith("You are a Watcher")}}, open({log:?}, "w"))
+print({result})
+"#,
+            log = log.to_str().unwrap(),
+            result = serde_json::to_string(&result.to_string()).unwrap(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+    let mut w = Watch::open_with(&fx.home, fx.mb.clone(), &|_| None, &|_| Err("no Ollama in tests".into()))
+        .unwrap_or_else(|e| panic!("open: {}", e.0));
+    w.notifier = Notifier::None;
+    w.placement = Placement::Print;
+    w.wake_clock = Duration::from_secs(30);
+    match &mut w.provider {
+        Provider::Cli(cli) => {
+            cli.program = fake;
+            cli.exe = PathBuf::from(env!("CARGO_BIN_EXE_pair-watcher"));
+        }
+        Provider::Api(_) => panic!("backend = claude-p built the API provider"),
+    }
+    fx.start();
+    fx.turn(1, "Starting the 6th review round.");
+    fs::write(fx.repo.join("a.txt"), "two\n").unwrap();
+    fx.stop();
+    w.step(now()).unwrap();
+    fs::write(fx.repo.join("a.txt"), "three\n").unwrap();
+
+    assert!(server.requests().is_empty(), "no direct API call");
+    let wakes = fx.wakes();
+    assert_eq!(wakes.len(), 1, "{:?}", fx.events());
+    assert_eq!(wakes[0].outcome, Outcome::Concern, "{:?}", wakes[0].error);
+    assert_eq!(wakes[0].tools, 1);
+    assert_eq!(wakes[0].tokens.expect("tokens").input, 900);
+    assert!(wakes[0].spend > 0.0, "same rate as the API (V47)");
+    let seen: Value = serde_json::from_str(&fs::read_to_string(&log).unwrap()).unwrap();
+    assert_eq!(seen["guard"], "1");
+    assert_eq!(seen["watcher"], true);
+    assert_eq!(seen["tools"], json!(["read_file", "grep", "git_log", "git_show"]));
+    assert_eq!(seen["read"], "1\ttwo\n", "the wake's snapshot, not the live tree");
+    let model = fx.status().into_iter().find_map(|op| match op {
+        Op::Model { model, shares_quota, .. } => Some((model, shares_quota)),
+        _ => None,
+    });
+    let (model, shares_quota) = model.expect("model chosen without an API key");
+    assert!(model.starts_with("claude-"), "{model}");
+    assert!(shares_quota);
+}
+
+/// I15: a subscription backend runs its own vendor only.
+#[test]
+fn subscription_backend_refuses_other_vendor_model() {
+    let server = Server::start(|_| (500, json!({})));
+    let fx = Fx::new("companion", &server);
+    watch::write_json(
+        &fx.mb.dir().join(watch::LAUNCH_FILE),
+        &Launch { flags: vec!["backend=codex-exec".into(), "model=claude-sonnet-5-5".into()], only: vec![] },
+    )
+    .unwrap();
+    let err =
+        Watch::open_with(&fx.home, fx.mb.clone(), &|_| None, &|_| Err("no Ollama".into())).err().expect("refused");
+    assert!(err.0.contains("backend codex-exec runs no anthropic models"), "{}", err.0);
 }

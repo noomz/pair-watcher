@@ -1,7 +1,7 @@
 //! CLI surface (I1). Commands owned by later §T tasks parse fully and report which task builds them.
 
 use std::ffi::OsStr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -48,8 +48,19 @@ pub enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
         rest: Vec<String>,
     },
-    /// Serve read tools over MCP for the `claude -p` backend
-    Mcp,
+    /// Serve read tools over MCP for a subscription backend (one wake's snapshot)
+    Mcp {
+        #[arg(long, hide = true)]
+        mailbox: Option<PathBuf>,
+        #[arg(long, hide = true)]
+        repo: Option<PathBuf>,
+        #[arg(long, hide = true)]
+        tree: Option<String>,
+        #[arg(long, hide = true)]
+        head: Option<String>,
+        #[arg(long, hide = true)]
+        stats: Option<PathBuf>,
+    },
     /// Install adapters into a harness's user config
     Install { target: Target },
     /// Remove installed adapters
@@ -325,7 +336,28 @@ fn dispatch(command: Command, via: Via) -> ExitCode {
         Command::Prune => prune(),
         Command::Replay { variant, wake_set } => replay(variant, &wake_set),
         Command::Audit { yes, max_usd, sample, model, resume } => audit(yes, max_usd, sample, model.as_deref(), resume),
-        Command::Mcp => later("T20"),
+        Command::Mcp { mailbox, repo, tree, head, stats } => mcp(mailbox, repo, tree, head, stats),
+    }
+}
+
+/// `mcp` (I15): started per wake by a subscription backend, never by hand.
+fn mcp(
+    mailbox: Option<PathBuf>,
+    repo: Option<PathBuf>,
+    tree: Option<String>,
+    head: Option<String>,
+    stats: Option<PathBuf>,
+) -> ExitCode {
+    let (Some(mailbox), Some(repo), Some(tree)) = (mailbox, repo, tree) else {
+        eprintln!("pair-watcher mcp: started per wake by a subscription backend (needs --mailbox, --repo, --tree)");
+        return ExitCode::from(2);
+    };
+    match crate::mcp::run(&mailbox, &repo, tree, head, stats) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("pair-watcher mcp: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -800,11 +832,6 @@ fn doctor_cmd() -> ExitCode {
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
-}
-
-fn later(task: &str) -> ExitCode {
-    eprintln!("pair-watcher: not implemented yet ({task})");
-    ExitCode::from(2)
 }
 
 /// Home and the config resolved for the current directory.

@@ -277,14 +277,18 @@ impl Resolved {
     }
 
     fn apply(&mut self, k: &'static Key, raw: Value, origin: Origin) {
+        let pi = k.name == "backend" && raw.as_str().is_some_and(|v| v.trim().starts_with("pi"));
         let value = match normalize(k.kind, raw) {
             Some(v) => Some(v),
             None => {
-                self.problems.push(Problem::BadValue {
-                    origin: origin.clone(),
-                    key: k.name,
-                    expected: expected(k.kind),
-                });
+                let mut expected = expected(k.kind);
+                // C10: no pi backend; a pi subscription login as Watcher backend is refused.
+                if pi {
+                    expected.push_str(
+                        "; pi with a Claude or Gemini subscription login is refused as a Watcher backend (terms)",
+                    );
+                }
+                self.problems.push(Problem::BadValue { origin: origin.clone(), key: k.name, expected });
                 k.default.value()
             }
         };

@@ -41,6 +41,24 @@ pub fn classify(e: &ProviderError) -> Class {
             }
         }
         ProviderError::Timeout | ProviderError::Network(_) | ProviderError::Protocol(_) => Class::Service,
+        // A headless backend: a missing CLI, a lost login or a spent subscription is Key.
+        ProviderError::Cli(msg) => {
+            let msg = msg.to_ascii_lowercase();
+            let key = [
+                "not found",
+                "not logged in",
+                "log in",
+                "login",
+                "unauthorized",
+                "authentication",
+                "api key",
+                "credit balance",
+                "billing",
+                "quota",
+                "usage limit",
+            ];
+            if key.iter().any(|w| msg.contains(w)) { Class::Key } else { Class::Service }
+        }
     }
 }
 

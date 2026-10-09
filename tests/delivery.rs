@@ -504,7 +504,7 @@ fn adapter_poll_draws_the_mod_band_and_pane_and_press_rules() {
     let ruled = w.events().into_iter().find(|e| e.k == Kind::Ruled).expect("ruled logged");
     assert_eq!((ruled.str("via"), ruled.str("surface")), (Some("key"), Some("mod-pane")));
     assert_eq!(press(&["--key", "u", "--band"]), "", "band u undoes");
-    let undone = w.events().into_iter().filter(|e| e.k == Kind::Ruling).last().expect("undone logged");
+    let undone = w.events().into_iter().rfind(|e| e.k == Kind::Ruling).expect("undone logged");
     assert_eq!(undone.str("surface"), Some("band"), "{undone:?}");
     assert_eq!(press(&["--key", "z"]), "mod pane keys are p b h y n d s u, not z");
     assert_eq!(press(&["--key", "1", "--band"]), "nothing waits for a ruling");

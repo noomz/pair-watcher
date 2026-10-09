@@ -82,14 +82,14 @@ fn config_show_unreadable_user_file_fails_with_location() {
 }
 
 #[test]
-fn hook_is_silent_and_later_commands_name_their_task() {
+fn hook_is_silent_and_bare_mcp_refuses() {
     let t = TempDir::new().unwrap();
     let out = pw(t.path(), t.path(), &["hook", "Stop", "--anything"]);
     assert!(out.status.success() && out.stdout.is_empty() && out.stderr.is_empty());
 
     let out = pw(t.path(), t.path(), &["mcp"]);
     assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("(T20)"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("started per wake by a subscription backend"));
 
     let out = pw(t.path(), t.path(), &["report"]);
     assert!(out.status.success());

@@ -856,3 +856,24 @@ fn mod_pane_selects_only_the_focused_row() {
     let c1 = Ui { selected: Some("c1".into()), ..mod_ui() };
     assert_eq!(layout(&b, &c1, 64, 40).selected.as_deref(), Some("c1"));
 }
+
+/// V52: a subscription backend's header notes the shared quota and approximate budgets.
+#[test]
+fn subscription_backend_notes_shared_quota() {
+    let mut f = Fx::repetition();
+    let model = |shares_quota| {
+        StatusOp::Model {
+            watcher: "companion".into(),
+            model: "claude-sonnet-5-5".into(),
+            same_vendor: true,
+            shares_quota,
+        }
+        .event()
+    };
+    f.at(12, 0, model(true));
+    let line = layout(&f.board(), &Ui::default(), 200, 20).lines[0].plain();
+    assert!(line.contains("shares Worker quota, budgets approximate"), "{line}");
+    f.at(12, 1, model(false));
+    let line = layout(&f.board(), &Ui::default(), 200, 20).lines[0].plain();
+    assert!(!line.contains("quota"), "{line}");
+}
