@@ -93,18 +93,17 @@ pub struct Completion {
 }
 
 impl Completion {
-    /// V108: `api-error` by status per V86 (no status = no response: network), `empty-reply` →
-    /// Slice, `aborted` → Service.
+    /// V108: `api-error` by status per V86 (no status = no response: network), `aborted` →
+    /// Service. `empty-reply` is a Watcher with nothing to say: silence, not a failure (B8).
     pub fn into_result(self) -> Result<(String, Usage), (ProviderError, Usage)> {
         let usage = Usage::from(self.usage);
-        if self.is_answered {
+        if self.is_answered || self.reason.as_deref() == Some("empty-reply") {
             return Ok((self.text, usage));
         }
         let error = self.error.unwrap_or_default();
         let e = match (self.reason.as_deref(), self.status) {
             (Some("api-error"), Some(status)) => ProviderError::Http { status, retry_after: None, body: error },
             (Some("api-error"), None) => ProviderError::Network(format!("claude-session: {error}")),
-            (Some("empty-reply"), _) => ProviderError::EmptyReply,
             (Some("aborted"), _) => ProviderError::Network("claude-session: aborted".into()),
             (reason, _) => ProviderError::Protocol(format!("claude-session reason {reason:?}")),
         };

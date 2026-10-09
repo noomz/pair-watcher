@@ -59,8 +59,6 @@ pub enum ProviderError {
     Cli(String),
     /// `claude-session`: no mod claimed the request in time (V108).
     Unanswered,
-    /// `claude-session`: the model replied with no text (V108).
-    EmptyReply,
 }
 
 impl fmt::Display for ProviderError {
@@ -74,7 +72,6 @@ impl fmt::Display for ProviderError {
             ProviderError::Protocol(e) => write!(f, "unexpected response: {e}"),
             ProviderError::Cli(e) => f.write_str(e),
             ProviderError::Unanswered => f.write_str("claude-session: mod not answering"),
-            ProviderError::EmptyReply => f.write_str("empty reply"),
         }
     }
 }

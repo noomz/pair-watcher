@@ -239,7 +239,6 @@ fn failure_mapping() {
         (failed("api-error", Some(403), "permission_error"), Class::Key),
         (failed("api-error", Some(400), "billing_error"), Class::Key),
         (failed("api-error", Some(400), "invalid_request"), Class::Slice),
-        (failed("empty-reply", None, ""), Class::Slice),
         (failed("aborted", None, ""), Class::Service),
     ];
     for (c, class) in cases {
@@ -290,4 +289,18 @@ fn fallback_runs_on_the_api() {
     let f = w.session(Duration::from_millis(200)).call(&call("in", None, true)).unwrap_err();
     assert!(matches!(f.error, ProviderError::Network(_)), "{:?}", f.error);
     assert_eq!(w.completions().claim(0).unwrap(), vec![], "nothing written for the mod");
+}
+
+/// V108 (B8): `empty-reply` is a silent Watcher, not a failure: empty output, usage counted.
+#[test]
+fn empty_reply_is_silence() {
+    let mut c = failed("empty-reply", None, "");
+    c.usage = ModelUsage { output_tokens: 2, cache_creation_input_tokens: 2857, ..usage(4, 2) };
+    assert_eq!(c.into_result(), Ok((String::new(), Usage { input: 4, cached: 0, cache_write: 2857, output: 2 })));
+
+    let w = World::new();
+    let _m = Mod::start(w.completions(), |_, _| Some(failed("empty-reply", None, "")));
+    let reply = w.session(Duration::from_secs(5)).call(&call("in", Some(w.snap()), false)).unwrap();
+    assert_eq!((reply.text.as_str(), reply.requests), ("", 1));
+    assert!(pair_watcher::output::parse(&reply.text).unwrap().is_empty(), "silence parses as no lines");
 }

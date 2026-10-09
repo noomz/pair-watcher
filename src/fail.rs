@@ -29,7 +29,6 @@ const MIN_MS: u64 = 60_000;
 pub fn classify(e: &ProviderError) -> Class {
     match e {
         ProviderError::NoKey(_) | ProviderError::Unanswered => Class::Key,
-        ProviderError::EmptyReply => Class::Slice,
         ProviderError::Http { status, body, .. } => {
             let body = body.to_ascii_lowercase();
             let exhausted =
