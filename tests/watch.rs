@@ -532,6 +532,28 @@ fn blocked_wake_raises_escalation() {
     assert_eq!(fx.wakes()[0].trigger, "blocked");
 }
 
+/// V11: the blocked wake's Task carries the open turn's prompt (live 2026-10-09: it showed only
+/// the last committed turn's), and the cursor stays for that turn's own wake.
+#[test]
+fn blocked_wake_sees_open_turn_prompt() {
+    let server = Server::start(|_| reply(""));
+    let fx = Fx::new("companion", &server);
+    let mut w = fx.open();
+    fx.start();
+    fx.turn(1, "Done.");
+    fx.stop();
+    w.step(now()).unwrap();
+    let committed = w.state().focus["approach"].cursor.clone();
+
+    fx.line(json!({"type": "user", "uuid": "u2", "message": {"role": "user", "content": "prompt 2"}}));
+    fx.hook("PermissionRequest", json!({"tool_name": "Bash", "tool_input": {"command": "grep add calc.py"}}));
+    w.step(now()).unwrap();
+    let input = input_of(&server.requests()[1]);
+    assert!(section(&input, "Task").contains("prompt 2"), "{input}");
+    assert_eq!(fx.wakes()[1].trigger, "blocked");
+    assert_eq!(w.state().focus["approach"].cursor, committed, "blocked wake commits nothing");
+}
+
 /// V90: a Swarm Focus task that crash-loops stays out of wakes until `attach` lifts it.
 #[test]
 fn crash_looped_focus_sits_out() {

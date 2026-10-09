@@ -1286,8 +1286,14 @@ impl Watch {
             instructions: &self.instructions,
         };
         let briefs: Vec<&Focus> = self.focuses.iter().filter(|f| w.focuses.contains(&f.name)).collect();
+        let all = match &self.state.transcript {
+            Some(path) => tailer::read(format(self.harness), path, &pos.cursor).map(|t| t.entries).unwrap_or_default(),
+            None => Vec::new(),
+        };
         if due.trigger == Trigger::Blocked {
-            let input = wake::blocked(&pos.history, due.payload.as_ref().unwrap_or(&Value::Null), &ctx);
+            // The open turn's prompts and actions are seen, not committed: the cursor stays (V11).
+            let seen = pos.history.ingest(&all);
+            let input = wake::blocked(&seen, due.payload.as_ref().unwrap_or(&Value::Null), &ctx);
             return Ok(Built {
                 input: input.render(PROMPT, &briefs),
                 sections: input,
@@ -1298,10 +1304,6 @@ impl Watch {
                 merged: None,
             });
         }
-        let all = match &self.state.transcript {
-            Some(path) => tailer::read(format(self.harness), path, &pos.cursor).map(|t| t.entries).unwrap_or_default(),
-            None => Vec::new(),
-        };
         let (slice, omitted, merged) = cut(all, held);
         let replayed = !merged.is_some() && slice.last().is_some_and(|e| e.next != self.state.code)
             || self.state.health.get(&w.name).is_some_and(|h| h.lagging_since.is_some() || h.rewake_at.is_some());

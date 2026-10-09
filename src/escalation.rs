@@ -500,25 +500,8 @@ impl Notifier {
     /// Shows one notification; title and body go as argv, never through a shell or script text,
     /// and never where they could read as options (text may start with `-`).
     pub fn show(&self, title: &str, body: &str) -> io::Result<()> {
-        let body_opt = format!("--body={body}");
-        let (bin, args): (&PathBuf, Vec<&str>) = match self {
-            Notifier::Herdr(bin) => (bin, vec!["notification", "show", &body_opt, "--sound", "request", "--", title]),
-            Notifier::Osascript(bin) => (
-                bin,
-                vec![
-                    "-e",
-                    "on run argv",
-                    "-e",
-                    "display notification (item 2 of argv) with title (item 1 of argv)",
-                    "-e",
-                    "end run",
-                    "--",
-                    title,
-                    body,
-                ],
-            ),
-            Notifier::NotifySend(bin) => (bin, vec!["--", title, body]),
-            Notifier::None => return Err(io::Error::new(io::ErrorKind::Unsupported, "no notifier")),
+        let Some((bin, args)) = self.argv(title, body) else {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "no notifier"));
         };
         let mut child =
             Command::new(bin).args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
@@ -538,5 +521,29 @@ impl Notifier {
             }
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// Program + argv for one notification. Herdr's parser takes no `--` and no `--body=`; the
+    /// title goes first (read as the title even when it starts with `-`), the body as `--body`'s value.
+    pub fn argv<'a>(&'a self, title: &'a str, body: &'a str) -> Option<(&'a PathBuf, Vec<&'a str>)> {
+        Some(match self {
+            Notifier::Herdr(bin) => (bin, vec!["notification", "show", title, "--body", body, "--sound", "request"]),
+            Notifier::Osascript(bin) => (
+                bin,
+                vec![
+                    "-e",
+                    "on run argv",
+                    "-e",
+                    "display notification (item 2 of argv) with title (item 1 of argv)",
+                    "-e",
+                    "end run",
+                    "--",
+                    title,
+                    body,
+                ],
+            ),
+            Notifier::NotifySend(bin) => (bin, vec!["--", title, body]),
+            Notifier::None => return None,
+        })
     }
 }

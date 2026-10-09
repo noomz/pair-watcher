@@ -348,8 +348,9 @@ fn notifier_detect_and_argv() {
 
     let dir = TempDir::new().unwrap();
     let bin = fake(dir.path(), 0);
-    Notifier::Herdr(bin.clone()).show("T \"quoted\"", "line 1\nline 2").unwrap();
-    assert_eq!(calls(dir.path())[0], "notification\nshow\n--body=line 1\nline 2\n--sound\nrequest\n--\nT \"quoted\"\n");
+    // Herdr 0.9.3 rejects `--` and `--body=` (exit 2, live 2026-10-09): title first, body as a value.
+    Notifier::Herdr(bin.clone()).show("-T \"quoted\"", "-line 1\nline 2").unwrap();
+    assert_eq!(calls(dir.path())[0], "notification\nshow\n-T \"quoted\"\n--body\n-line 1\nline 2\n--sound\nrequest\n");
     Notifier::Osascript(bin).show("T", "B").unwrap();
     assert!(calls(dir.path())[1].ends_with("end run\n--\nT\nB\n"), "{}", calls(dir.path())[1]);
     assert!(Notifier::None.show("T", "B").is_err());
