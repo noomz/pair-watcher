@@ -47,6 +47,7 @@ use crate::prefilter::{self, Gate, Tag, Verdict, Wakeup};
 use crate::provider::{Api, Backend, Call, Provider, ProviderError};
 use crate::record::{self, WakeRecord};
 use crate::repo;
+use crate::session::{self, Completions, Session};
 use crate::snapshot::Store;
 use crate::status::{Class, Coverage, Op, Outcome, Wake, WatcherOp};
 use crate::tailer::{self, Cursor, Entry, Format, Item};
@@ -225,7 +226,7 @@ impl Cfg {
             band_digits: flag("band_digits", true),
             model: ours("model").unwrap_or_else(|| "auto".into()),
             fallback: ours("fallback_model").filter(|m| !m.trim().is_empty()),
-            backend: Backend::from_config(&ours("backend").unwrap_or_default()),
+            backend: Backend::from_config(&r.backend_for(harness.name()).0),
             telemetry: flag("telemetry", false),
             retention: crate::retention::Policy::from(r),
         }
@@ -238,6 +239,14 @@ struct TurnWait {
     due: Due,
     since: u64,
     rescanned: bool,
+}
+
+/// What one Watcher runs this wake: its model, whether it is the primary probe during a fallback
+/// (V51, no retries), and whether it is the fallback (a session backend runs that on the API).
+struct Plan {
+    choice: Choice,
+    probe: bool,
+    fallback: bool,
 }
 
 /// One Watcher's call result (runs on its task).
@@ -383,6 +392,11 @@ impl Watch {
         let cfg = Cfg::from(&loaded.resolved, harness);
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pair-watcher"));
         let provider = match cfg.backend.headless() {
+            None if cfg.backend == Backend::ClaudeSession => Provider::Session(Session {
+                completions: Completions::new(mailbox.dir()),
+                api: Api::new(keys.clone(), env, fail::WAKE_CLOCK),
+                unclaimed: session::UNCLAIMED,
+            }),
             None => Provider::Api(Api::new(keys.clone(), env, fail::WAKE_CLOCK)),
             Some(kind) => Provider::Cli(crate::headless::Cli {
                 kind,
@@ -449,7 +463,8 @@ impl Watch {
             let op = Op::Model {
                 watcher: w.name.clone(),
                 model: choice.model,
-                same_vendor: choice.same_vendor,
+                // The Worker's own session runs it (V106).
+                same_vendor: choice.same_vendor || self.cfg.backend == Backend::ClaudeSession,
                 shares_quota: self.cfg.backend.subscription(),
             };
             if self.board.models.get(&w.name).map(|m| m.0.as_str()) != Some(op_model(&op)) {
@@ -464,13 +479,21 @@ impl Watch {
         self.choose(setting).map_err(|e| format!("model {setting}: {e}"))
     }
 
+    /// A `claude-session` fallback runs on the direct API's keys (V108).
     fn fallback_choice(&self) -> Option<Choice> {
-        self.choose(self.cfg.fallback.as_deref()?).ok()
+        let backend = match self.cfg.backend {
+            Backend::ClaudeSession => Backend::Api,
+            b => b,
+        };
+        self.choose_on(backend, self.cfg.fallback.as_deref()?).ok()
+    }
+
+    fn choose(&self, setting: &str) -> Result<Choice, String> {
+        self.choose_on(self.cfg.backend, setting)
     }
 
     /// A subscription backend runs its own vendor's models only, on its login (I15).
-    fn choose(&self, setting: &str) -> Result<Choice, String> {
-        let backend = self.cfg.backend;
+    fn choose_on(&self, backend: Backend, setting: &str) -> Result<Choice, String> {
         let configured = backend.vendor().map_or_else(|| self.keys.configured(), |v| vec![v]);
         models::choose(&self.table, setting, worker_vendor(self.harness), &configured).map_err(|e| match e {
             models::ChoiceError::NoKey(v) if backend.subscription() => {
@@ -1006,11 +1029,11 @@ impl Watch {
         let deadline = Instant::now() + clock;
         let fallback = self.fallback_choice().filter(|_| self.state.fallback.active.is_some());
         let probe = fallback.is_some() && self.state.fallback.probe(now);
-        let plans: Vec<(Choice, bool)> = roster
+        let plans: Vec<Plan> = roster
             .iter()
             .map(|w| match (&fallback, probe) {
-                (Some(f), false) => Ok((f.clone(), false)),
-                _ => self.primary(w).map(|c| (c, fallback.is_some())),
+                (Some(f), false) => Ok(Plan { choice: f.clone(), probe: false, fallback: true }),
+                _ => self.primary(w).map(|choice| Plan { choice, probe: fallback.is_some(), fallback: false }),
             })
             .collect::<Result<_, String>>()
             .map_err(io::Error::other)?;
@@ -1025,8 +1048,7 @@ impl Watch {
                     (Some(store), Some(tree)) if !blocked => Some(Snapshot { store, tree, head: head.as_deref() }),
                     _ => None,
                 };
-                let (choice, probe) = &plans[i];
-                ask(&provider, &table, choice, &inputs[i], tools, deadline, !probe, *probe)
+                ask(&provider, &table, &plans[i], &inputs[i], tools, deadline)
             })
         });
         let results = if blocked { join(calls)? } else { self.alongside(calls)? };
@@ -1670,18 +1692,17 @@ fn join<T>(calls: thread::JoinHandle<T>) -> io::Result<T> {
 }
 
 /// One Watcher's call inside the wake clock (V86, V87): Service errors retried, invalid output
-/// asked again once, then failed with its class. `retries = false` for a primary probe (V51).
-#[allow(clippy::too_many_arguments)]
+/// asked again once, then failed with its class. A primary probe is not retried (V51).
 fn ask(
     provider: &Provider,
     table: &Table,
-    choice: &Choice,
+    plan: &Plan,
     input: &str,
     tools: Option<Snapshot>,
     deadline: Instant,
-    retries: bool,
-    probe: bool,
 ) -> Asked {
+    let Plan { choice, probe, fallback } = plan;
+    let (retries, probe) = (!probe, *probe);
     let price = table.price(&choice.model).ok();
     let cost = |u: &Usage| price.map_or(0.0, |p| p.cost(u));
     let started = Instant::now();
@@ -1689,7 +1710,14 @@ fn ask(
     let mut tries = 0;
     let mut invalid = None;
     let result = loop {
-        let call = Call { model: &choice.model, vendor: choice.vendor, input, tools, deadline: Some(deadline) };
+        let call = Call {
+            model: &choice.model,
+            vendor: choice.vendor,
+            input,
+            tools,
+            deadline: Some(deadline),
+            fallback: *fallback,
+        };
         match provider.call(&call) {
             Ok(reply) => {
                 spend += cost(&reply.usage);

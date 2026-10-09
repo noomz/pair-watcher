@@ -28,6 +28,8 @@ pub struct Call<'a> {
     pub tools: Option<Snapshot<'a>>,
     /// The wake clock (V87): no request runs past it.
     pub deadline: Option<Instant>,
+    /// A `fallback_model` wake (V51): a subscription-session backend runs it on the direct API.
+    pub fallback: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -55,6 +57,10 @@ pub enum ProviderError {
     Protocol(String),
     /// A headless backend failed (`claude -p`, `codex exec`): its message.
     Cli(String),
+    /// `claude-session`: no mod claimed the request in time (V108).
+    Unanswered,
+    /// `claude-session`: the model replied with no text (V108).
+    EmptyReply,
 }
 
 impl fmt::Display for ProviderError {
@@ -67,6 +73,8 @@ impl fmt::Display for ProviderError {
             ProviderError::Network(e) => write!(f, "network: {e}"),
             ProviderError::Protocol(e) => write!(f, "unexpected response: {e}"),
             ProviderError::Cli(e) => f.write_str(e),
+            ProviderError::Unanswered => f.write_str("claude-session: mod not answering"),
+            ProviderError::EmptyReply => f.write_str("empty reply"),
         }
     }
 }
@@ -84,6 +92,8 @@ pub enum Backend {
     Api,
     ClaudeP,
     CodexExec,
+    /// The Claude Worker session's own client, through the mod (V106).
+    ClaudeSession,
 }
 
 impl Backend {
@@ -91,6 +101,7 @@ impl Backend {
         match s {
             "claude-p" => Backend::ClaudeP,
             "codex-exec" => Backend::CodexExec,
+            "claude-session" => Backend::ClaudeSession,
             _ => Backend::Api,
         }
     }
@@ -100,6 +111,7 @@ impl Backend {
             Backend::Api => "api",
             Backend::ClaudeP => "claude-p",
             Backend::CodexExec => "codex-exec",
+            Backend::ClaudeSession => "claude-session",
         }
     }
 
@@ -112,14 +124,14 @@ impl Backend {
     pub fn vendor(self) -> Option<Vendor> {
         match self {
             Backend::Api => None,
-            Backend::ClaudeP => Some(Vendor::Anthropic),
+            Backend::ClaudeP | Backend::ClaudeSession => Some(Vendor::Anthropic),
             Backend::CodexExec => Some(Vendor::Openai),
         }
     }
 
     pub fn headless(self) -> Option<crate::headless::Kind> {
         match self {
-            Backend::Api => None,
+            Backend::Api | Backend::ClaudeSession => None,
             Backend::ClaudeP => Some(crate::headless::Kind::ClaudeP),
             Backend::CodexExec => Some(crate::headless::Kind::CodexExec),
         }
@@ -131,6 +143,7 @@ impl Backend {
 pub enum Provider {
     Api(Api),
     Cli(crate::headless::Cli),
+    Session(crate::session::Session),
 }
 
 impl Provider {
@@ -138,13 +151,15 @@ impl Provider {
         match self {
             Provider::Api(api) => api.call(call),
             Provider::Cli(cli) => cli.call(call),
+            Provider::Session(s) => s.call(call),
         }
     }
 
     /// After `pair-watcher auth` (V51); a subscription backend has no keys.
     pub fn set_keys(&mut self, keys: Keys) {
-        if let Provider::Api(api) = self {
-            api.set_keys(keys);
+        match self {
+            Provider::Api(api) | Provider::Session(crate::session::Session { api, .. }) => api.set_keys(keys),
+            Provider::Cli(_) => {}
         }
     }
 }

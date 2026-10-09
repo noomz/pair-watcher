@@ -44,6 +44,7 @@ pub mod report;
 pub mod retention;
 pub mod ruling;
 pub mod run;
+pub mod session;
 pub mod snapshot;
 pub mod standing;
 pub mod status;

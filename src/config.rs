@@ -103,7 +103,9 @@ const fn key(name: &'static str, kind: Kind, default: Default, repo: RepoRule) -
     Key { name, kind, default, repo }
 }
 
-const BACKENDS: Kind = Kind::Choice(&["api", "claude-p", "codex-exec"]);
+const BACKENDS: Kind = Kind::Choice(&["api", "claude-p", "codex-exec", "claude-session"]);
+/// Runs only under a Claude Worker (V106).
+const CLAUDE_SESSION: &str = "claude-session";
 
 /// `[harness.<h>]` overrides (V109): unset by default, never from a repo file (V80).
 const fn per_harness(name: &'static str, kind: Kind) -> Key {
@@ -191,6 +193,25 @@ impl Resolved {
 
     pub fn get_for(&self, key: &str, harness: &str) -> Option<&Value> {
         self.for_harness(key, harness).value.as_ref()
+    }
+
+    /// `backend` for a Worker on `harness`. `claude-session` under a Codex or pi Worker is a bad
+    /// value (V106, V83): the key default applies and the problem is returned.
+    pub fn backend_for(&self, harness: &str) -> (String, Option<Problem>) {
+        let entry = self.for_harness("backend", harness);
+        let value = entry.value.as_ref().and_then(Value::as_str).unwrap_or("api");
+        if value != CLAUDE_SESSION || harness == "claude" {
+            return (value.to_owned(), None);
+        }
+        let table = format!("harness.{harness}.backend");
+        let key = match key_names().find(|k| *k == table) {
+            Some(k) if !std::ptr::eq(entry, self.entry("backend")) => k,
+            _ => "backend",
+        };
+        let expected = format!("api|claude-p|codex-exec for a {harness} Worker; claude-session runs only for Claude");
+        let default = spec("backend").and_then(|k| k.default.value());
+        let fallback = default.as_ref().and_then(Value::as_str).unwrap_or("api").to_owned();
+        (fallback, Some(Problem::BadValue { origin: entry.origin.clone(), key, expected }))
     }
 
     pub fn entries(&self) -> impl Iterator<Item = (&'static str, &Entry)> {

@@ -247,7 +247,7 @@ describe('band (I8, I17, V76)', () => {
     await start($)
     await w.tick()
     expect(polls(w.runs)[0]).toEqual(['--session', 's1', '--route', 'mod', '--worker', 'idle'])
-    expect(w.runs.find(r => r.argv[2] === 'poll')?.argv.slice(9)).toEqual(['--band', '80'])
+    expect(w.runs.find(r => r.argv[2] === 'poll')?.argv.slice(9)).toEqual(['--band', '80', '--completions'])
     const ui = await band($)
     const texts = (await ui.findAll({ type: 'Text' })).map((t: { text: string }) => t.text).join('\n')
     expect(texts).toContain('Debate unresolved')
@@ -347,5 +347,62 @@ describe('mod pane (I8, I17, V67)', () => {
     const ui = await pane($)
     await ui.press({ key: 'key:d' })
     expect(w.statuses).toContain('nothing selected')
+  })
+})
+
+describe('claude-session completions (V107, V108)', () => {
+  const REQ = {
+    id: 'r1',
+    model: 'claude-sonnet-5-5',
+    system: 'You are a read-only reviewer.',
+    prompt: [{ text: 'wake input', cache: true }, { text: 'tool results' }],
+    maxTokens: 8192,
+    timeoutMs: 170000,
+  }
+  const results = (runs: Run[]) =>
+    runs.filter(r => r.argv[2] === 'complete-result').map(r => [r.argv[6], JSON.parse(r.argv[8])])
+
+  test('the poll claims requests; each runs on the session client and its result goes back', async ($, on) => {
+    const w = world(on, { status: null, commentary: [], item: null, completions: [REQ] })
+    const asked: any[] = []
+    const usage = { input_tokens: 900, output_tokens: 40, cache_read_input_tokens: 0, cache_creation_input_tokens: 800 }
+    on('model.complete', (_$: any, e: any) => {
+      asked.push(e)
+      return { value: { isAnswered: true, text: '{"op":"add"}', usage } }
+    })
+    await start($)
+    await w.tick()
+    const poll = w.runs.find(r => r.argv[2] === 'poll')!
+    expect(poll.argv).toContain('--completions')
+    expect(asked.length).toBe(1)
+    expect(asked[0].model).toBe('claude-sonnet-5-5')
+    expect(asked[0].promptBlocks).toEqual(REQ.prompt)
+    expect(asked[0].system).toBe(REQ.system)
+    expect(asked[0].maxTokens).toBe(8192)
+    expect(asked[0].timeoutMs).toBe(170000)
+    expect(results(w.runs)).toEqual([['r1', { isAnswered: true, text: '{"op":"add"}', usage }]])
+  })
+
+  test('a provider failure is passed back as it came', async ($, on) => {
+    const w = world(on, { status: null, commentary: [], item: null, completions: [REQ] })
+    const zero = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+    const failed = { isAnswered: false, reason: 'api-error', status: 529, error: 'overloaded', usage: zero }
+    on('model.complete', () => ({ value: failed }))
+    await start($)
+    await w.tick()
+    expect(results(w.runs)).toEqual([['r1', failed]])
+  })
+
+  test('no claimed request: no completion runs', async ($, on) => {
+    const w = world(on, { status: null, commentary: [], item: null })
+    let asked = 0
+    on('model.complete', () => {
+      asked++
+      return { value: { isAnswered: false, reason: 'aborted' } }
+    })
+    await start($)
+    await w.tick()
+    expect(asked).toBe(0)
+    expect(results(w.runs)).toEqual([])
   })
 })

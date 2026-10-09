@@ -1099,7 +1099,7 @@ print({result})
             cli.program = fake;
             cli.exe = PathBuf::from(env!("CARGO_BIN_EXE_pair-watcher"));
         }
-        Provider::Api(_) => panic!("backend = claude-p built the API provider"),
+        Provider::Api(_) | Provider::Session(_) => panic!("backend = claude-p built another provider"),
     }
     fx.start();
     fx.turn(1, "Starting the 6th review round.");
@@ -1161,4 +1161,109 @@ fn worker_harness_table_picks_the_model() {
     w.step(now()).unwrap();
     let models: Vec<Value> = server.requests().iter().map(|b| b["model"].clone()).collect();
     assert_eq!(models, [json!("claude-haiku-4-5")]);
+}
+
+/// V106, V107: with `backend = claude-session` a Claude Worker's wakes run through the session
+/// mailbox (the mod's `$.model.complete`), priced from usage, labelled same vendor + shared quota;
+/// no API request is made.
+#[test]
+fn claude_session_backend_wakes_through_the_mod() {
+    use pair_watcher::session::{Completion, Completions, ModelUsage};
+    let server = Server::start(|_| reply(""));
+    let fx = Fx::new("companion", &server);
+    fs::write(fx.home.config_file(), "backend = \"claude-session\"\n").unwrap();
+    let mut w = fx.open();
+    let completions = Completions::new(fx.mb.dir());
+    let stop = Arc::new(AtomicBool::new(false));
+    let halt = Arc::clone(&stop);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    thread::spawn(move || {
+        while !halt.load(Ordering::Relaxed) {
+            for r in completions.claim(0).unwrap() {
+                log.lock().unwrap().push(r.model.clone());
+                let usage = ModelUsage { input_tokens: 1000, output_tokens: 100, ..Default::default() };
+                let c = Completion { is_answered: true, text: ADD.into(), usage, ..Default::default() };
+                completions.result(&r.id, c, 0).unwrap();
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    });
+    fx.start();
+    fx.turn(1, "Done.");
+    fx.stop();
+    w.step(now()).unwrap();
+    stop.store(true, Ordering::Relaxed);
+    assert_eq!(server.requests().len(), 0, "no API call");
+    assert_eq!(*seen.lock().unwrap(), ["claude-sonnet-5-5"], "auto = Claude mid-tier");
+    let wake = &fx.wakes()[0];
+    assert_eq!((wake.outcome, wake.model.as_str()), (Outcome::Concern, "claude-sonnet-5-5"));
+    assert!(wake.spend > 0.0, "priced from usage (V47)");
+    let model = fx.status().into_iter().find(|o| matches!(o, Op::Model { .. })).unwrap();
+    assert!(matches!(model, Op::Model { same_vendor: true, shares_quota: true, .. }), "{model:?}");
+}
+
+/// V106: on a Codex Worker `claude-session` is a bad value: the key default (`api`) runs.
+#[test]
+fn claude_session_on_codex_runs_the_api() {
+    let server = Server::start(|b| {
+        if b.get("input").is_some() {
+            (200, json!({"output": [], "usage": {"input_tokens": 10, "output_tokens": 1}}))
+        } else {
+            reply("")
+        }
+    });
+    let fx = Fx::with_harness("companion", "codex", &server);
+    fs::write(fx.home.config_file(), "backend = \"claude-session\"\nmodel = \"claude-sonnet-5-5\"\n").unwrap();
+    let mut w = fx.open();
+    let payload = json!({"transcript_path": fx.transcript, "session_id": "019a-thread"});
+    fx.hook("SessionStart", payload.clone());
+    for line in [
+        json!({"type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "UserMessage", "content": "go"}}}),
+        json!({"type": "response_item", "payload": {"type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": "Done."}]}}),
+        json!({"type": "event_msg", "payload": {"type": "task_complete"}}),
+    ] {
+        fx.line(line);
+    }
+    fx.hook("Stop", payload);
+    w.step(now()).unwrap();
+    assert_eq!(server.requests().len(), 1, "the direct API ran the wake");
+    assert!(!fx.mb.dir().join(pair_watcher::session::FILE).exists());
+}
+
+/// V108: no mod claims the request → Key: BLIND `claude-session: mod not answering`, or with a
+/// `fallback_model` the switch (V51), whose wakes run on the direct API, never `claude -p`.
+#[test]
+fn claude_session_unanswered_is_blind_or_falls_back_to_the_api() {
+    for fallback in [false, true] {
+        let server = Server::start(|_| reply(""));
+        let fx = Fx::new("companion", &server);
+        fs::write(fx.home.config_file(), "backend = \"claude-session\"\n").unwrap();
+        if fallback {
+            let launch = Launch { flags: vec!["fallback_model=claude-haiku-4-5".into()], only: vec![] };
+            watch::write_json(&fx.mb.dir().join(watch::LAUNCH_FILE), &launch).unwrap();
+        }
+        let mut w = fx.open();
+        let Provider::Session(s) = &mut w.provider else { panic!("claude-session builds the session provider") };
+        s.unclaimed = Duration::from_millis(200);
+        fx.start();
+        fx.turn(1, "Done.");
+        fx.stop();
+        let t0 = now();
+        w.step(t0).unwrap();
+        if !fallback {
+            let blind = fx.status().into_iter().any(|s| {
+                matches!(s, Op::Blind { focus: None, reason } if reason.contains("claude-session: mod not answering"))
+            });
+            assert!(blind, "{:?}", fx.status());
+            assert_eq!(server.requests().len(), 0);
+            continue;
+        }
+        let key = pair_watcher::status::Class::Key;
+        assert!(fx.status().contains(&Op::Fallback { model: "claude-haiku-4-5".into(), class: key }));
+        w.step(t0 + 1).unwrap();
+        let models: Vec<Value> = server.requests().iter().map(|b| b["model"].clone()).collect();
+        assert_eq!(models, [json!("claude-haiku-4-5")]);
+    }
 }

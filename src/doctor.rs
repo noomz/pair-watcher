@@ -73,7 +73,9 @@ pub fn check(home: &Home, cwd: &Path, p: &Probes) -> Vec<Line> {
             return out;
         }
     };
-    let problems: Vec<_> = loaded.resolved.problems.iter().chain(&loaded.focuses.problems).collect();
+    // V106: a `claude-session` backend some Worker harness would refuse.
+    let refused: Vec<_> = Harness::ALL.iter().filter_map(|h| loaded.resolved.backend_for(h.name()).1).collect();
+    let problems: Vec<_> = loaded.resolved.problems.iter().chain(&loaded.focuses.problems).chain(&refused).collect();
     if problems.is_empty() {
         push(Level::Ok, "config".into());
     }

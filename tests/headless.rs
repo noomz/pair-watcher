@@ -96,7 +96,7 @@ fn recorder(dir: &Path) -> String {
 }
 
 fn call<'a>(input: &'a str, tools: Option<Snapshot<'a>>) -> Call<'a> {
-    Call { model: "claude-sonnet-5-5", vendor: Vendor::Anthropic, input, tools, deadline: None }
+    Call { model: "claude-sonnet-5-5", vendor: Vendor::Anthropic, input, tools, deadline: None, fallback: false }
 }
 
 struct Mcp {

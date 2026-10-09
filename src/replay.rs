@@ -164,7 +164,7 @@ pub fn ask_once(
 ) -> (Result<String, String>, f64) {
     let Ok(price) = table.price(model) else { return (Err(format!("model `{model}` is unpriced")), 0.0) };
     let deadline = Some(Instant::now() + crate::fail::WAKE_CLOCK);
-    let call = Call { model, vendor: price.vendor, input, tools, deadline };
+    let call = Call { model, vendor: price.vendor, input, tools, deadline, fallback: false };
     match api.call(&call) {
         Ok(reply) => (Ok(reply.text), price.cost(&reply.usage)),
         Err(f) => (Err(f.error.to_string()), price.cost(&f.usage)),

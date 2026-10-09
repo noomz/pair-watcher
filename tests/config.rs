@@ -372,3 +372,24 @@ fn harness_table_in_show_and_hash() {
     assert!(r.canonical().contains("harness.pi.model = \"gpt-6.1-sol\"\n"));
     assert_ne!(config_hash(&r, &w.focuses(&[]).enabled), base);
 }
+
+// ── V106: claude-session is for a Claude Worker only ────────────────────────
+
+#[test]
+fn claude_session_refused_on_codex_and_pi() {
+    let w = World::new();
+    w.global("backend = \"claude-session\"\n[harness.pi]\nbackend = \"claude-session\"");
+    let r = w.resolve();
+    assert!(r.problems.is_empty(), "a valid value: {:?}", r.problems);
+    assert_eq!(r.backend_for("claude"), ("claude-session".into(), None));
+    let global = Origin::Global(w.home.config_file());
+    for (h, key) in [("codex", "backend"), ("pi", "harness.pi.backend")] {
+        let (value, problem) = r.backend_for(h);
+        assert_eq!(value, "api", "{h}: key default");
+        let Some(Problem::BadValue { origin, key: k, expected }) = problem else { panic!("{h}: {problem:?}") };
+        assert_eq!((origin, k), (global.clone(), key));
+        assert!(expected.contains("claude-session runs only for Claude"), "{expected}");
+    }
+    w.global("backend = \"claude-p\"");
+    assert_eq!(w.resolve().backend_for("codex"), ("claude-p".into(), None));
+}

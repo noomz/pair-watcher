@@ -6,6 +6,9 @@ import type { EngineInterface, Register } from 'claude-code'
 // shim, hands claimed items to the Worker and forwards keys. The Board is drawn by the binary;
 // the module holds only the focused row and the expanded logs. Nothing enters the system prompt,
 // and every command returns {} so the model reads none of it.
+// `claude-session` backend (V107): the poll also claims the Watcher's completion requests; each
+// runs on this session's own client by `$.model.complete` and its result goes back to the mailbox.
+// Only a claimed request is ever run.
 
 const POLL_MS = 1000
 const NOTE_MS = 5000
@@ -21,7 +24,22 @@ type Board = {
   band?: Band
   pane?: { lines: Span[][]; items: (string | null)[]; order: string[]; selected: string | null }
 }
-type Poll = { status: string | null; commentary: string[]; item: Item | null; board?: Board }
+// A Watcher completion request (Rust `session::Request`); `prompt` blocks are ModelTextBlocks.
+type Completion = {
+  id: string
+  model: string
+  system: string
+  prompt: { text: string; cache?: true }[]
+  maxTokens: number
+  timeoutMs?: number
+}
+type Poll = {
+  status: string | null
+  commentary: string[]
+  item: Item | null
+  board?: Board
+  completions?: Completion[]
+}
 
 // The pane's keys (I17): each acts on the focused row; `p` asks for a remark first (V20).
 const KEYS: [string, string][] = [
@@ -112,7 +130,7 @@ async function press($: EngineInterface, key: string, band: boolean, remark = ''
 }
 
 function pollArgs(worker: string) {
-  const args = ['poll', '--session', session!, '--route', 'mod', '--worker', worker, '--band', String(bandColumns)]
+  const args = ['poll', '--session', session!, '--route', 'mod', '--worker', worker, '--band', String(bandColumns), '--completions']
   if (paneSize) {
     args.push('--pane', `${paneSize.columns}x${paneSize.rows}`)
     if (focused) args.push('--selected', focused)
@@ -131,6 +149,7 @@ async function tick($: EngineInterface) {
     const r = await adapter($, pollArgs(worker))
     if (r.exitCode !== 0 || !r.stdout.trim()) return
     const poll = JSON.parse(r.stdout) as Poll
+    for (const c of poll.completions ?? []) void complete($, c)
     const changed =
       poll.commentary.join('\n') !== commentary.join('\n') ||
       JSON.stringify(poll.board) !== JSON.stringify(board) ||
@@ -152,6 +171,20 @@ async function tick($: EngineInterface) {
   } finally {
     polling = false
   }
+}
+
+/** Runs one claimed request; its result, whatever it is, goes back to the Watcher (V108). */
+async function complete($: EngineInterface, c: Completion) {
+  const request = { model: c.model, system: c.system, prompt: c.prompt, maxTokens: c.maxTokens }
+  const timeout = c.timeoutMs && c.timeoutMs > 0 ? { timeoutMs: Math.min(c.timeoutMs, 2_147_483_647) } : {}
+  // A request the engine refuses to send (a blocked model, a bad cap) is the Watcher's to fix.
+  const zero = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+  const result = await $.model
+    .complete({ ...request, ...timeout })
+    .catch(e => ({ isAnswered: false, reason: 'api-error', status: 400, error: String(e).slice(0, 200), usage: zero }))
+  await adapter($, ['complete-result', '--session', session!, '--id', c.id, '--result', JSON.stringify(result)]).catch(
+    () => undefined,
+  )
 }
 
 // Never typed into the box, never mid-turn (V25). A draft or a turn that appeared since the poll

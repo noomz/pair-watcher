@@ -243,3 +243,18 @@ fn stale_price_table_and_store_over_cap_warn() {
     w.global("[store]\ncap_gb = 0.000001\n");
     assert!(has(&w.check(), Level::Warn, "over cap 0.000001 GB: pair-watcher prune"));
 }
+
+/// V106: `backend = claude-session` names the Worker harnesses that refuse it.
+#[test]
+fn claude_session_backend_flags_codex_and_pi() {
+    let w = World::new();
+    w.global("backend = \"claude-session\"");
+    let lines = w.check();
+    for h in ["codex", "pi"] {
+        assert!(
+            has(&lines, Level::Warn, &format!("for a {h} Worker; claude-session runs only for Claude")),
+            "{lines:#?}"
+        );
+    }
+    assert!(!has(&lines, Level::Warn, "for a claude Worker"));
+}

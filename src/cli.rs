@@ -19,6 +19,7 @@ use crate::models::Vendor;
 use crate::outbox::Claim;
 use crate::problem::{Problem, tilde};
 use crate::ruling::{self, Rulings, Surface, Via};
+use crate::session::Completions;
 use crate::status::Op as StatusOp;
 use crate::{config, doctor, hook, install, launch, mailbox, models, pane, repo, run, standing, supervisor};
 
@@ -418,6 +419,10 @@ enum AdapterCmd {
         /// Rows whose Debate log is expanded
         #[arg(long)]
         expanded: Vec<String>,
+        /// Claude mod: claims every open `claude-session` completion request into `completions`;
+        /// the mod runs only these (V107)
+        #[arg(long)]
+        completions: bool,
     },
     /// A Claude mod pane key (`p b h y n d s u`) or band Button (`1 2 3 u`); prints why it was refused
     Press {
@@ -450,6 +455,15 @@ enum AdapterCmd {
         id: String,
         #[arg(long)]
         token: String,
+    },
+    /// `claude-session` backend: the `$.model.complete` result (JSON) for a claimed request
+    CompleteResult {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        result: String,
     },
     /// `/pw <command> …`: a session command for this session
     Pw {
@@ -490,6 +504,7 @@ fn adapter(args: &[String]) -> ExitCode {
         | AdapterCmd::Press { session, .. }
         | AdapterCmd::Ack { session, .. }
         | AdapterCmd::Release { session, .. }
+        | AdapterCmd::CompleteResult { session, .. }
         | AdapterCmd::Pw { session, .. } => session,
     };
     let Some((home, mailbox)) =
@@ -500,7 +515,7 @@ fn adapter(args: &[String]) -> ExitCode {
     let now = now_ms();
     let ack = matches!(cmd, AdapterCmd::Ack { .. });
     let result = match cmd {
-        AdapterCmd::Poll { route, worker, band, pane, selected, expanded, .. } => {
+        AdapterCmd::Poll { route, worker, band, pane, selected, expanded, completions, .. } => {
             let route = match route {
                 AdapterRoute::Mod => Route::Mod,
                 AdapterRoute::Pi => Route::PiFollowUp,
@@ -515,6 +530,9 @@ fn adapter(args: &[String]) -> ExitCode {
                 if band.is_some() || pane.is_some() {
                     let view = mod_view(&home, &mailbox, band, pane, selected, &expanded)?;
                     out["board"] = serde_json::to_value(view)?;
+                }
+                if completions {
+                    out["completions"] = serde_json::to_value(Completions::new(mailbox.dir()).claim(now)?)?;
                 }
                 println!("{out}");
                 Ok(())
@@ -535,6 +553,10 @@ fn adapter(args: &[String]) -> ExitCode {
                 Err(e) => Err(e),
             }
         }
+        AdapterCmd::CompleteResult { id, result, .. } => match serde_json::from_str(&result) {
+            Ok(result) => Completions::new(mailbox.dir()).result(&id, result, now).map(drop),
+            Err(e) => return fail(&format!("result: {e}")),
+        },
         AdapterCmd::Pw { session, args } => {
             if !args.first().is_some_and(|c| PW_COMMANDS.contains(&c.as_str())) {
                 return fail(&format!("/pw takes {}", PW_COMMANDS.join("|")));

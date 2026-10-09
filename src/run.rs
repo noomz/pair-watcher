@@ -71,7 +71,9 @@ fn prepare(harness: Harness, worker: &[OsString], flags: &[String], only: &[Stri
     if approve_pending(&home, loaded.repo.as_ref(), &loaded.focuses.pending).map_err(|e| e.to_string())? {
         loaded = load(&home, &cwd, flags, only).map_err(|u| u.to_string())?;
     }
-    let problems: Vec<Problem> = loaded.resolved.problems.iter().chain(&loaded.focuses.problems).cloned().collect();
+    let refused = loaded.resolved.backend_for(harness.name()).1;
+    let problems: Vec<Problem> =
+        loaded.resolved.problems.iter().chain(&loaded.focuses.problems).chain(&refused).cloned().collect();
     if let Some(line) = ticker_line(&problems) {
         eprintln!("pair-watcher: {line}");
     }
