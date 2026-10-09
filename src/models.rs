@@ -60,7 +60,8 @@ pub struct Price {
 }
 
 /// Tokens one call (or a sum of calls) billed. `input` excludes cache reads and writes.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(default)]
 pub struct Usage {
     pub input: u64,
     pub cached: u64,

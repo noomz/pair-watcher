@@ -44,13 +44,14 @@ use crate::pane::{self, Board};
 use crate::placement::{Placement, pane_command};
 use crate::prefilter::{self, Gate, Tag, Verdict, Wakeup};
 use crate::provider::{Api, Call, ProviderError};
+use crate::record::{self, WakeRecord};
 use crate::repo;
 use crate::snapshot::Store;
 use crate::status::{Class, Coverage, Op, Outcome, Wake, WatcherOp};
 use crate::tailer::{self, Cursor, Entry, Format, Item};
 use crate::tools::Snapshot;
 use crate::trigger::{self, CHECKPOINT_FLOOR_MS, Due, Signal, Trigger, Triggers};
-use crate::wake::{self, Context, Diff, TURN_MAX};
+use crate::wake::{self, Context, Diff, Input, TURN_MAX};
 use crate::{models, run, standing, supervisor};
 
 pub const STATE_FILE: &str = "watch.json";
@@ -211,7 +212,12 @@ struct TurnWait {
 /// One Watcher's call result (runs on its task).
 struct Asked {
     result: Result<Vec<Line>, (Class, String, bool)>,
+    /// The accepted answer's text, for the wake record.
+    text: Option<String>,
     spend: f64,
+    usage: Usage,
+    tools: usize,
+    latency_ms: u64,
     model: String,
     /// Ran on the primary while on a Service fallback (V51 probe).
     probe: bool,
@@ -221,6 +227,8 @@ struct Asked {
 #[derive(Clone)]
 struct Built {
     input: String,
+    /// The shared sections `input` rendered, for the wake record (V93).
+    sections: Input,
     /// Entries shown or folded; empty for a blocked wake.
     slice: Vec<Entry>,
     /// Entries a merged wake folded into history without showing (V50).
@@ -428,7 +436,7 @@ impl Watch {
                     replayed: false,
                     rulings: vec![],
                     prefilter: None,
-                    input: None,
+                    ..Default::default()
                 }
                 .event(),
             )?;
@@ -896,11 +904,12 @@ impl Watch {
         for i in (0..roster.len()).rev() {
             if verdicts[i].as_ref().is_some_and(|v| v.skipped) {
                 let (w, b, v) = (roster.remove(i), built.remove(i), verdicts.remove(i));
-                let input = prefilter::keep_input(self.mailbox.dir(), self.state.n + 1, &w.name, &b.input)?;
+                let trigger = trigger_name(due.trigger, false);
+                let record = self.record(&w, trigger, &b, tree.as_deref(), None)?;
                 skipped.push(Wake {
                     n: self.state.n + 1,
                     watcher: w.name,
-                    trigger: trigger_name(due.trigger, false).into(),
+                    trigger: trigger.into(),
                     outcome: Outcome::Skipped,
                     class: None,
                     error: None,
@@ -909,7 +918,9 @@ impl Watch {
                     replayed: false,
                     rulings: vec![],
                     prefilter: v,
-                    input: Some(input),
+                    diff_bytes: b.sections.diff_bytes,
+                    record: Some(record),
+                    ..Default::default()
                 });
             }
         }
@@ -950,10 +961,11 @@ impl Watch {
         let mut spend = 0.0;
         let mut failed: Vec<(usize, Class, String)> = Vec::new();
         for (i, (w, r)) in roster.iter().zip(results).enumerate() {
+            let trigger = trigger_name(due.trigger, built[i].replayed || built[i].merged.is_some());
             let mut wake = Wake {
                 n: self.state.n + 1,
                 watcher: w.name.clone(),
-                trigger: trigger_name(due.trigger, built[i].replayed || built[i].merged.is_some()).into(),
+                trigger: trigger.into(),
                 outcome: Outcome::Silent,
                 class: None,
                 error: None,
@@ -962,18 +974,25 @@ impl Watch {
                 replayed: built[i].replayed,
                 rulings: vec![],
                 prefilter: verdicts[i].clone(),
-                input: None,
+                diff_bytes: built[i].sections.diff_bytes,
+                ..Default::default()
             };
+            let tree = tree.as_deref().filter(|_| !blocked);
             match r {
                 Err(panic) => {
                     wake.outcome = Outcome::Failed;
                     wake.error = Some(format!("crashed: {panic}"));
+                    wake.record = Some(self.record(w, trigger, &built[i], tree, None)?);
                     self.crashed(&w.name, &panic, now)?;
                 }
                 Ok(asked) => {
                     spend += asked.spend;
                     wake.spend = asked.spend;
                     wake.model = asked.model;
+                    wake.tokens = Some(asked.usage);
+                    wake.tools = asked.tools;
+                    wake.latency_ms = Some(asked.latency_ms);
+                    wake.record = Some(self.record(w, trigger, &built[i], tree, asked.text)?);
                     match asked.result {
                         Ok(lines) => {
                             if asked.probe {
@@ -1042,7 +1061,7 @@ impl Watch {
             self.covered(&built[*i])?;
         }
         for (i, class, error) in &failed {
-            self.failure(&roster[*i], &built[*i], *class, error, blocked, now)?;
+            wakes[*i].poison_advance = self.failure(&roster[*i], &built[*i], *class, error, blocked, now)?;
         }
 
         // Then Debate, Escalation, rulings, the next Challenge, delivery (escalation.rs order).
@@ -1214,6 +1233,7 @@ impl Watch {
             let input = wake::blocked(&pos.history, due.payload.as_ref().unwrap_or(&Value::Null), &ctx);
             return Ok(Built {
                 input: input.render(PROMPT, &briefs),
+                sections: input,
                 slice: vec![],
                 omitted: vec![],
                 next: pos,
@@ -1248,7 +1268,29 @@ impl Watch {
             history: next_history,
             t: last.map_or(pos.t, |e| e.t),
         };
-        Ok(Built { input: input.render(PROMPT, &briefs), slice, omitted, next, replayed, merged })
+        Ok(Built { input: input.render(PROMPT, &briefs), sections: input, slice, omitted, next, replayed, merged })
+    }
+
+    /// Writes `w`'s record of the coming wake (V93); returns its session-relative ref.
+    fn record(
+        &self,
+        w: &Watcher,
+        trigger: &str,
+        b: &Built,
+        tree: Option<&str>,
+        output: Option<String>,
+    ) -> io::Result<String> {
+        let rec = WakeRecord {
+            n: self.state.n + 1,
+            watcher: w.name.clone(),
+            trigger: trigger.into(),
+            focuses: w.focuses.clone(),
+            input: b.sections.clone(),
+            tree: tree.map(str::to_owned),
+            head: self.store.as_ref().and_then(Store::head),
+            output,
+        };
+        record::write(self.mailbox.dir(), &rec)
     }
 
     /// The oldest committed position among `w`'s Focuses (V10).
@@ -1312,21 +1354,22 @@ impl Watch {
         error: &str,
         blocked: bool,
         now: u64,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         if self.state.fallback.failed(class, self.fallback_choice().is_some(), now) {
             let model = self.cfg.fallback.clone().unwrap_or_default();
             self.append(Op::Fallback { model, class }.event())?;
             if class == Class::Key {
                 // The fallback takes the next wake; the slice waits for it.
                 self.state.health.entry(w.name.clone()).or_default().rewake_at = Some(now);
-                return Ok(());
+                return Ok(false);
             }
         }
         if blocked && class != Class::Key {
-            return Ok(());
+            return Ok(false);
         }
         let effects = self.state.health.entry(w.name.clone()).or_default().failed(class, &slice_key(b), error, now);
-        self.effects(&w.name, &effects, Some(&skip_of(b, now)))
+        self.effects(&w.name, &effects, Some(&skip_of(b, now)))?;
+        Ok(effects.contains(&Effect::Advance))
     }
 
     /// A Focus task panicked (V90): BLIND (crashed); the third in 10 min keeps it BLIND.
@@ -1502,7 +1545,8 @@ fn ask(
 ) -> Asked {
     let price = table.price(&choice.model).ok();
     let cost = |u: &Usage| price.map_or(0.0, |p| p.cost(u));
-    let mut spend = 0.0;
+    let started = Instant::now();
+    let (mut spend, mut usage, mut calls, mut text) = (0.0, Usage::default(), 0, None);
     let mut tries = 0;
     let mut invalid = None;
     let result = loop {
@@ -1510,8 +1554,13 @@ fn ask(
         match api.call(&call) {
             Ok(reply) => {
                 spend += cost(&reply.usage);
+                usage += reply.usage;
+                calls += reply.tools.calls;
                 match output::parse(&reply.text) {
-                    Ok(lines) => break Ok(lines),
+                    Ok(lines) => {
+                        text = Some(reply.text);
+                        break Ok(lines);
+                    }
                     // Invalid twice is a Slice failure (V86).
                     Err(why) if invalid.is_some() => break Err((Class::Slice, format!("invalid output: {why}"), true)),
                     Err(why) => invalid = Some(why),
@@ -1519,6 +1568,7 @@ fn ask(
             }
             Err(f) => {
                 spend += cost(&f.usage);
+                usage += f.usage;
                 let wait = retries.then(|| fail::retry_delay(tries, &f.error, fail::jitter())).flatten();
                 match wait {
                     Some(wait) if Instant::now() + wait < deadline => {
@@ -1533,7 +1583,8 @@ fn ask(
             break Err((Class::Service, ProviderError::Timeout.to_string(), false));
         }
     };
-    Asked { result, spend, model: choice.model.clone(), probe }
+    let latency_ms = started.elapsed().as_millis() as u64;
+    Asked { result, text, spend, usage, tools: calls, latency_ms, model: choice.model.clone(), probe }
 }
 
 /// The Watcher process's heartbeat (V90): its own thread, sharing no lock with wake tasks.

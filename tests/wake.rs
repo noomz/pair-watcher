@@ -166,7 +166,7 @@ fn golden_repetition_blocked() {
     let input = wake::blocked(&history, &payload, &ctx(&concerns, Some("debate"), "", &[]));
     let text = input.render(PROMPT, &[]);
     golden("repetition.blocked.golden", &text);
-    let titles: Vec<&str> = input.sections.iter().map(|s| s.title).collect();
+    let titles: Vec<&str> = input.sections.iter().map(|s| s.title.as_str()).collect();
     assert_eq!(titles, ["Wake", "Blocked question", "Task", "Concerns", "History"]);
     let q = input.section("Blocked question").unwrap();
     assert!(!q.contains("session_id") && !q.contains("transcript_path") && q.contains("Keep requesting"));

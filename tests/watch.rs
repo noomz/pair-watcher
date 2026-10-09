@@ -19,6 +19,7 @@ use pair_watcher::home::Home;
 use pair_watcher::human::Act;
 use pair_watcher::mailbox::{Hook, Mailbox};
 use pair_watcher::placement::Placement;
+use pair_watcher::record;
 use pair_watcher::status::{Coverage, Op, Outcome, Wake};
 use pair_watcher::watch::{self, Inflight, Launch, Watch};
 use serde_json::{Value, json};
@@ -263,6 +264,16 @@ fn turn_end_wakes_and_commits() {
         (Outcome::Concern, "turn-end", "companion")
     );
     assert!(wakes[0].spend > 0.0);
+    // V93, V94: tokens, latency and the record the wake body lives in.
+    let tokens = wakes[0].tokens.expect("tokens");
+    assert_eq!((tokens.input, tokens.output), (1000, 100));
+    assert!(wakes[0].latency_ms.is_some());
+    let rec = record::read(fx.mb.dir(), wakes[0].record.as_deref().expect("record ref")).unwrap();
+    assert_eq!((rec.n, rec.watcher.as_str(), rec.output.as_deref()), (1, "companion", Some(ADD)));
+    assert_eq!(rec.focuses, ["approach", "correctness", "security"]);
+    assert!(rec.tree.is_some(), "tools served from a snapshot");
+    assert!(rec.input.section("Turn").unwrap().contains("Starting the 6th review round."));
+    assert!(input.ends_with(&rec.input.render("", &[]).trim_start().to_owned()), "record = what was sent");
     assert_eq!(w.board().concerns.all().len(), 1);
     let code = w.state().code.clone();
     assert!(code.id.is_some());
@@ -338,9 +349,11 @@ fn poison_guard_skips_then_blind() {
     let t0 = now();
     w.step(t0).unwrap();
     assert_eq!(fx.wakes()[0].class, Some(pair_watcher::status::Class::Slice));
+    assert!(!fx.wakes()[0].poison_advance);
     assert_ne!(w.state().focus["approach"].cursor, w.state().code, "first failure holds");
     w.step(t0 + MIN + 1).unwrap();
     assert_eq!(w.state().focus["approach"].cursor, w.state().code, "second failure advances");
+    assert!(fx.wakes()[1].poison_advance);
     assert!(matches!(fx.coverage().as_slice(), [Coverage::Lost { cause, .. }] if cause == "poison-skip"));
 
     fx.turn(2, "Again.");
@@ -444,7 +457,7 @@ fn budget_hold_then_merged_catch_up() {
         replayed: false,
         rulings: vec![],
         prefilter: None,
-        input: None,
+        ..Default::default()
     };
     fx.mb.log().append(spent.event()).unwrap();
     fx.turn(1, "First turn text.");
@@ -791,8 +804,8 @@ fn skip_holds_the_cursor_and_keeps_the_input() {
     let wake = fx.wakes()[0].clone();
     assert_eq!(wake.outcome, Outcome::Skipped);
     assert!(wake.prefilter.as_ref().is_some_and(|v| v.skipped && v.score == Some(0.1)));
-    let kept = fs::read_to_string(fx.mb.dir().join(wake.input.unwrap())).unwrap();
-    assert!(kept.contains("Bumped a comment."));
+    let kept = record::read(fx.mb.dir(), &wake.record.unwrap()).unwrap();
+    assert!(kept.input.section("Turn").unwrap().contains("Bumped a comment.") && kept.output.is_none());
     assert!(w.state().focus.get("approach").is_none_or(|p| p.cursor != w.state().code), "cursor held");
 
     *score.lock().unwrap() = 0.9;

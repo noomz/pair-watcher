@@ -34,6 +34,7 @@ pub mod placement;
 pub mod prefilter;
 pub mod problem;
 pub mod provider;
+pub mod record;
 pub mod repo;
 pub mod ruling;
 pub mod run;

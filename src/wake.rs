@@ -4,6 +4,7 @@
 
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::action::{self, Outcome};
@@ -67,13 +68,13 @@ pub struct Diff<'a> {
     pub session: &'a [FileDiff],
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Section {
-    pub title: &'static str,
+    pub title: String,
     pub body: String,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Input {
     pub sections: Vec<Section>,
     /// Full (unclipped) patch bytes since the last wake, for the wake record (V5).
@@ -131,11 +132,15 @@ pub fn normal(
     let lend: usize = shared.iter().map(|(_, body, cap)| cap.saturating_sub(body.len())).sum();
     let turn = turn_section(entries, (TURN_CAP + lend).min(TURN_MAX));
 
-    let mut sections = vec![Section { title: "Wake", body: wake_line(trigger).to_owned() }];
+    let mut sections = vec![Section { title: "Wake".into(), body: wake_line(trigger).to_owned() }];
     let (diff_part, rest): (Vec<_>, Vec<_>) = shared.into_iter().partition(|(t, _, _)| *t == "Diff");
-    sections.extend(rest.into_iter().filter(|(_, b, _)| !b.is_empty()).map(|(title, body, _)| Section { title, body }));
-    sections.push(Section { title: "Turn", body: turn });
-    sections.extend(diff_part.into_iter().map(|(title, body, _)| Section { title, body }));
+    sections.extend(
+        rest.into_iter()
+            .filter(|(_, b, _)| !b.is_empty())
+            .map(|(title, body, _)| Section { title: title.into(), body }),
+    );
+    sections.push(Section { title: "Turn".into(), body: turn });
+    sections.extend(diff_part.into_iter().map(|(title, body, _)| Section { title: title.into(), body }));
     (Input { sections, diff_bytes }, next)
 }
 
@@ -156,8 +161,11 @@ pub fn blocked(history: &History, payload: &Value, ctx: &Context) -> Input {
         ("Concerns", concern_section(ctx.concerns, true)),
         ("History", history_section(history, history)),
     ];
-    let sections =
-        sections.into_iter().filter(|(_, b)| !b.is_empty()).map(|(title, body)| Section { title, body }).collect();
+    let sections = sections
+        .into_iter()
+        .filter(|(_, b)| !b.is_empty())
+        .map(|(title, body)| Section { title: title.into(), body })
+        .collect();
     Input { sections, diff_bytes: 0 }
 }
 

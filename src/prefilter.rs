@@ -419,14 +419,3 @@ fn save_thresholds(path: &Path, t: &Thresholds) -> io::Result<()> {
     }
     write_atomic(path, &serde_json::to_vec_pretty(t)?)
 }
-
-/// A skipped wake's input, kept for the silent-session audit (V55); returns the session-relative ref.
-pub fn keep_input(session: &Path, n: u64, watcher: &str, input: &str) -> io::Result<String> {
-    let rel = format!("skipped/{n}-{watcher}.txt");
-    let path = session.join(&rel);
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    write_atomic(&path, input.as_bytes())?;
-    Ok(rel)
-}

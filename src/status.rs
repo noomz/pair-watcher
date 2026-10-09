@@ -9,9 +9,10 @@ use serde::{Deserialize, Serialize};
 use crate::event::{Event, Kind};
 
 /// What one Watcher's wake ended as (V94 `wake` outcome).
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Outcome {
+    #[default]
     Silent,
     Concern,
     Challenge,
@@ -34,7 +35,7 @@ pub enum Class {
 
 /// `wake` event body, one per Watcher per wake. `n` numbers the wake: every Watcher of one wake
 /// shares it, so the pane draws one strip cell per wake.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct Wake {
     pub n: u64,
     pub watcher: String,
@@ -58,9 +59,27 @@ pub struct Wake {
     /// Pre-filter score, threshold key, would-skip (V53, V94).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefilter: Option<crate::prefilter::Verdict>,
-    /// A skipped wake's kept input, session-relative (V55).
+    /// Tokens billed over the call's requests (V94).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input: Option<String>,
+    pub tokens: Option<crate::models::Usage>,
+    /// Read tool calls made (V8, V94).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub tools: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+    /// Full patch bytes since the last wake (V5).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub diff_bytes: usize,
+    /// The poison guard advanced the cursor past this slice (V88).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub poison_advance: bool,
+    /// Session-relative wake record (`record.rs`); a skipped wake's kept input (V55).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<String>,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 impl Wake {

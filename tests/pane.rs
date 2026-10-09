@@ -60,7 +60,7 @@ fn wake(n: u64, outcome: Outcome) -> Event {
         replayed: false,
         rulings: vec![],
         prefilter: None,
-        input: None,
+        ..Default::default()
     }
     .event()
 }

@@ -257,7 +257,7 @@ fn wake(outcome: Outcome, v: Option<Verdict>) -> Wake {
         replayed: false,
         rulings: vec![],
         prefilter: v,
-        input: None,
+        ..Default::default()
     }
 }
 
