@@ -1143,3 +1143,22 @@ fn subscription_backend_refuses_other_vendor_model() {
         Watch::open_with(&fx.home, fx.mb.clone(), &|_| None, &|_| Err("no Ollama".into())).err().expect("refused");
     assert!(err.0.contains("backend codex-exec runs no anthropic models"), "{}", err.0);
 }
+
+/// V109: the Watcher runs the Worker harness's `[harness.<h>]` model, not another harness's.
+#[test]
+fn worker_harness_table_picks_the_model() {
+    let server = Server::start(|_| reply(""));
+    let fx = Fx::new("companion", &server);
+    fs::write(
+        fx.home.config_file(),
+        "model = \"claude-sonnet-5-5\"\n[harness.claude]\nmodel = \"claude-haiku-4-5\"\n[harness.codex]\nmodel = \"claude-sonnet-5-5\"\n",
+    )
+    .unwrap();
+    let mut w = fx.open();
+    fx.start();
+    fx.turn(1, "Done.");
+    fx.stop();
+    w.step(now()).unwrap();
+    let models: Vec<Value> = server.requests().iter().map(|b| b["model"].clone()).collect();
+    assert_eq!(models, [json!("claude-haiku-4-5")]);
+}

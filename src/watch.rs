@@ -212,18 +212,20 @@ struct Cfg {
 }
 
 impl Cfg {
-    fn from(r: &Resolved) -> Cfg {
+    /// `harness` = the Worker's: its `[harness.<h>]` table applies (V109).
+    fn from(r: &Resolved, harness: Harness) -> Cfg {
         let flag = |k: &str, d: bool| r.get(k).and_then(toml::Value::as_bool).unwrap_or(d);
         let text = |k: &str| r.get(k).and_then(toml::Value::as_str).map(str::to_owned);
+        let ours = |k: &str| r.get_for(k, harness.name()).and_then(toml::Value::as_str).map(str::to_owned);
         Cfg {
             checkpoints: flag("checkpoints", true),
             infer_rulings: flag("infer_rulings", true),
             auto_challenge: flag("auto_challenge", true),
             escalate: EscalateAt::from_config(&text("escalate_unresolved").unwrap_or_else(|| "warn".into())),
             band_digits: flag("band_digits", true),
-            model: text("model").unwrap_or_else(|| "auto".into()),
-            fallback: text("fallback_model").filter(|m| !m.trim().is_empty()),
-            backend: Backend::from_config(&text("backend").unwrap_or_default()),
+            model: ours("model").unwrap_or_else(|| "auto".into()),
+            fallback: ours("fallback_model").filter(|m| !m.trim().is_empty()),
+            backend: Backend::from_config(&ours("backend").unwrap_or_default()),
             telemetry: flag("telemetry", false),
             retention: crate::retention::Policy::from(r),
         }
@@ -378,7 +380,7 @@ impl Watch {
         for note in gate.iter().flat_map(|g| &g.notes) {
             eprintln!("pair-watcher: {note}");
         }
-        let cfg = Cfg::from(&loaded.resolved);
+        let cfg = Cfg::from(&loaded.resolved, harness);
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pair-watcher"));
         let provider = match cfg.backend.headless() {
             None => Provider::Api(Api::new(keys.clone(), env, fail::WAKE_CLOCK)),

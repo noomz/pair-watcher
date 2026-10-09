@@ -104,6 +104,15 @@ pub fn check(home: &Home, cwd: &Path, p: &Probes) -> Vec<Line> {
             {
                 push(Level::Warn, format!("fallback_model {fallback}: {e}"));
             }
+            // `[harness.<h>]` models (V109).
+            for h in Harness::ALL {
+                for (key, level) in [("model", Level::Fail), ("fallback_model", Level::Warn)] {
+                    let Some(m) = text(&format!("harness.{}.{key}", h.name())) else { continue };
+                    if let Err(e) = models::choose(&table, &m, None, &configured) {
+                        push(level, format!("harness.{}.{key} {m}: {e}", h.name()));
+                    }
+                }
+            }
             let swarm = text("mode").as_deref() == Some("swarm");
             for f in &loaded.focuses.enabled {
                 let (Some(m), FocusSource::User(file)) = (&f.model, &f.source) else { continue };

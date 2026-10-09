@@ -274,3 +274,101 @@ fn config_hash_tracks_resolved_values_and_briefs() {
     w.user_focus("security", "Only look at auth code.");
     assert_ne!(config_hash(&w.resolve(), &w.focuses(&[]).enabled), lowered);
 }
+
+// ── V109: per-harness table ─────────────────────────────────────────────────
+
+#[test]
+fn harness_table_beats_top_level_within_a_layer() {
+    let w = World::new();
+    w.global("model = \"g\"\nbackend = \"api\"\n[harness.claude]\nmodel = \"gc\"\nbackend = \"claude-p\"");
+    let r = w.resolve();
+    let global = Origin::Global(w.home.config_file());
+    assert_eq!(r.get_for("model", "claude"), Some(&s("gc")));
+    assert_eq!(r.for_harness("model", "claude").origin, global);
+    assert_eq!(r.get_for("backend", "claude"), Some(&s("claude-p")));
+    assert_eq!(r.get_for("model", "codex"), Some(&s("g")), "another harness keeps the top-level key");
+    assert_eq!(r.get_for("fallback_model", "claude"), None);
+    assert_eq!(r.get("model"), Some(&s("g")), "the top-level key itself is unchanged");
+}
+
+#[test]
+fn harness_table_layer_order_unchanged() {
+    let mut w = World::new();
+    w.global("[harness.claude]\nmodel = \"gc\"");
+    w.user_repo("model = \"ur\"");
+    assert_eq!(w.resolve().get_for("model", "claude"), Some(&s("ur")), "higher layer's top-level key wins");
+
+    w.user_repo("[harness.claude]\nmodel = \"urc\"");
+    w.env.insert(env_var("model"), "e".into());
+    assert_eq!(w.resolve().get_for("model", "claude"), Some(&s("e")), "top-level env beats a file's table");
+
+    w.env.insert(env_var("harness.claude.model"), "ec".into());
+    let r = w.resolve();
+    assert_eq!(r.get_for("model", "claude"), Some(&s("ec")), "same layer: the table wins");
+    assert_eq!(r.for_harness("model", "claude").origin, Origin::Env("PAIR_WATCHER_HARNESS__CLAUDE__MODEL".into()));
+
+    w.flags.push("model=f".into());
+    assert_eq!(w.resolve().get_for("model", "claude"), Some(&s("f")));
+    w.flags.push("harness.claude.model=fc".into());
+    let r = w.resolve();
+    assert_eq!(
+        (r.get_for("model", "claude"), &r.for_harness("model", "claude").origin),
+        (Some(&s("fc")), &Origin::Flag)
+    );
+    assert_eq!(r.get_for("model", "pi"), Some(&s("f")));
+}
+
+#[test]
+fn harness_env_names() {
+    assert_eq!(env_var("harness.codex.backend"), "PAIR_WATCHER_HARNESS__CODEX__BACKEND");
+    assert_eq!(env_var("harness.pi.fallback_model"), "PAIR_WATCHER_HARNESS__PI__FALLBACK_MODEL");
+    let mut w = World::new();
+    w.env.insert("PAIR_WATCHER_HARNESS__CODEX__BACKEND".into(), "codex-exec".into());
+    assert_eq!(w.resolve().get_for("backend", "codex"), Some(&s("codex-exec")));
+}
+
+#[test]
+fn repo_file_cannot_set_harness_table() {
+    let w = World::new();
+    w.global("[harness.claude]\nmodel = \"gc\"").repo_file("[harness.claude]\nmodel = \"x\"\nbackend = \"claude-p\"");
+    let r = w.resolve();
+    assert_eq!(r.get_for("model", "claude"), Some(&s("gc")));
+    assert_eq!(r.get_for("backend", "claude"), Some(&s("api")));
+    for key in ["harness.claude.model", "harness.claude.backend"] {
+        let ignored = r.problems.iter().any(|p| matches!(p, Problem::RepoIgnored { key: k, .. } if *k == key));
+        assert!(ignored, "{key} reported");
+    }
+}
+
+#[test]
+fn harness_table_problems() {
+    let w = World::new();
+    w.global(
+        "backend = \"claude-p\"\n[harness.codex]\nbackend = \"pi\"\nmodl = \"x\"\n[harness.cursor]\nmodel = \"y\"",
+    );
+    let r = w.resolve();
+    assert_eq!(r.get_for("backend", "codex"), Some(&s("claude-p")), "bad value falls back to the top-level key");
+    assert!(r.problems.iter().any(|p| matches!(p, Problem::BadValue { key: "harness.codex.backend", .. })));
+    let unknown: Vec<(String, Option<&str>)> = r
+        .problems
+        .iter()
+        .filter_map(|p| match p {
+            Problem::UnknownKey { key, hint, .. } => Some((key.clone(), *hint)),
+            _ => None,
+        })
+        .collect();
+    assert!(unknown.contains(&("harness.codex.modl".into(), Some("harness.codex.model"))));
+    assert!(unknown.iter().any(|(k, _)| k == "harness.cursor"));
+}
+
+#[test]
+fn harness_table_in_show_and_hash() {
+    let w = World::new();
+    let base = config_hash(&w.resolve(), &w.focuses(&[]).enabled);
+    w.global("[harness.pi]\nmodel = \"gpt-6.1-sol\"");
+    let r = w.resolve();
+    let shown: Vec<_> = r.entries().filter(|(_, e)| e.value.is_some()).map(|(k, e)| (k, e.origin.clone())).collect();
+    assert!(shown.contains(&("harness.pi.model", Origin::Global(w.home.config_file()))));
+    assert!(r.canonical().contains("harness.pi.model = \"gpt-6.1-sol\"\n"));
+    assert_ne!(config_hash(&r, &w.focuses(&[]).enabled), base);
+}

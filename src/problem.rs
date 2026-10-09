@@ -16,6 +16,20 @@ pub enum Origin {
     Flag,
 }
 
+impl Origin {
+    /// Layer precedence (V79): a higher rank wins.
+    pub fn rank(&self) -> u8 {
+        match self {
+            Origin::Default => 0,
+            Origin::Global(_) => 1,
+            Origin::Repo(_) => 2,
+            Origin::UserRepo(_) => 3,
+            Origin::Env(_) => 4,
+            Origin::Flag => 5,
+        }
+    }
+}
+
 impl fmt::Display for Origin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

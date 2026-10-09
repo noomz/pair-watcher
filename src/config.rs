@@ -103,14 +103,30 @@ const fn key(name: &'static str, kind: Kind, default: Default, repo: RepoRule) -
     Key { name, kind, default, repo }
 }
 
+const BACKENDS: Kind = Kind::Choice(&["api", "claude-p", "codex-exec"]);
+
+/// `[harness.<h>]` overrides (V109): unset by default, never from a repo file (V80).
+const fn per_harness(name: &'static str, kind: Kind) -> Key {
+    key(name, kind, Default::Unset, RepoRule::Ignored)
+}
+
 const KEYS: &[Key] = &[
     key("auto_challenge", Kind::Bool, Default::Bool(true), RepoRule::TrueOnly),
-    key("backend", Kind::Choice(&["api", "claude-p", "codex-exec"]), Default::Str("api"), RepoRule::Ignored),
+    key("backend", BACKENDS, Default::Str("api"), RepoRule::Ignored),
     key("band_digits", Kind::Bool, Default::Bool(true), RepoRule::Ignored),
     key("ceiling_usd", Kind::Num, Default::Num(5.0), RepoRule::LowerOnly),
     key("checkpoints", Kind::Bool, Default::Bool(true), RepoRule::Ignored),
     key("escalate_unresolved", Kind::Choice(&["warn", "note", "off"]), Default::Str("warn"), RepoRule::TowardNote),
     key("fallback_model", Kind::Str, Default::Unset, RepoRule::Ignored),
+    per_harness("harness.claude.backend", BACKENDS),
+    per_harness("harness.claude.fallback_model", Kind::Str),
+    per_harness("harness.claude.model", Kind::Str),
+    per_harness("harness.codex.backend", BACKENDS),
+    per_harness("harness.codex.fallback_model", Kind::Str),
+    per_harness("harness.codex.model", Kind::Str),
+    per_harness("harness.pi.backend", BACKENDS),
+    per_harness("harness.pi.fallback_model", Kind::Str),
+    per_harness("harness.pi.model", Kind::Str),
     key("infer_rulings", Kind::Bool, Default::Bool(true), RepoRule::Ignored),
     key("mode", Kind::Choice(&["companion", "swarm"]), Default::Str("companion"), RepoRule::Free),
     key("model", Kind::Str, Default::Str("auto"), RepoRule::Ignored),
@@ -160,6 +176,21 @@ impl Resolved {
 
     pub fn get(&self, key: &str) -> Option<&Value> {
         self.entries.get(key).and_then(|e| e.value.as_ref())
+    }
+
+    /// `key` for a Worker on `harness` (V109): within one layer `[harness.<harness>]` beats the
+    /// top-level key; across layers precedence holds (V79), so a top-level env or flag beats a
+    /// file's table.
+    pub fn for_harness(&self, key: &str, harness: &str) -> &Entry {
+        let top = self.entry(key);
+        match self.entries.get(format!("harness.{harness}.{key}").as_str()) {
+            Some(h) if h.value.is_some() && h.origin.rank() >= top.origin.rank() => h,
+            _ => top,
+        }
+    }
+
+    pub fn get_for(&self, key: &str, harness: &str) -> Option<&Value> {
+        self.for_harness(key, harness).value.as_ref()
     }
 
     pub fn entries(&self) -> impl Iterator<Item = (&'static str, &Entry)> {

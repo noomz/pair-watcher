@@ -122,6 +122,19 @@ fn no_key_or_unpriced_model_cannot_start() {
     assert!(has(&lines, Level::Warn, "fallback_model mystery-2"));
 }
 
+/// V109: each `[harness.<h>]` model is checked like the top-level one.
+#[test]
+fn harness_table_models_are_checked() {
+    let w = World::new();
+    w.global(
+        "[harness.codex]
+model = \"mystery-3\"\nfallback_model = \"mystery-4\"",
+    );
+    let lines = w.check();
+    assert!(has(&lines, Level::Fail, "harness.codex.model mystery-3"), "{lines:#?}");
+    assert!(has(&lines, Level::Warn, "harness.codex.fallback_model mystery-4"), "{lines:#?}");
+}
+
 #[test]
 fn config_problems_repo_values_and_pending_focuses_are_listed() {
     let w = World::new();
