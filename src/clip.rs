@@ -18,6 +18,11 @@ pub fn prefix(s: &str, n: usize) -> &str {
     &s[..floor(s, n)]
 }
 
+/// The longest suffix of at most `n` bytes.
+pub fn suffix(s: &str, n: usize) -> &str {
+    &s[ceil(s, s.len().saturating_sub(n))..]
+}
+
 /// At most `max` bytes; a cut ends in `…`.
 pub fn head(s: &str, max: usize) -> String {
     if s.len() <= max {

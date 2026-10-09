@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use pair_watcher::jsonl::now_ms;
 use pair_watcher::tailer::{self, Cursor, Format, Item, Reanchor, Tail, find_guardian};
+use serde_json::json;
 use tempfile::TempDir;
 
 const WORKER: &str = "rollout-2026-10-05T16-46-20-01a10b75-04dc-7bd1-b3af-3f0785e5bc6e.jsonl";
@@ -109,6 +110,21 @@ fn guardian_capture() {
         read_items(Format::Guardian, &fixture(GUARDIAN)),
         [Item::ReviewStarted, allow.clone(), Item::ReviewStarted, allow]
     );
+}
+
+/// V101: a guardian turn that aborts, or completes with no `outcome`, has no verdict.
+#[test]
+fn guardian_without_verdict() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("g.jsonl");
+    let lines = [
+        json!({"type": "event_msg", "payload": {"type": "task_started"}}),
+        json!({"type": "event_msg", "payload": {"type": "turn_aborted", "reason": "interrupted"}}),
+        json!({"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": null}}),
+    ];
+    fs::write(&path, lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+    let none = Item::ReviewDone { outcome: None };
+    assert_eq!(read_items(Format::Guardian, &path), [Item::ReviewStarted, none.clone(), none]);
 }
 
 #[test]

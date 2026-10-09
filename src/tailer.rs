@@ -61,7 +61,7 @@ pub enum Item {
     TurnEnd,
     /// Guardian auto-review started: no human is being asked (V56).
     ReviewStarted,
-    /// Guardian auto-review finished; `allow` = the tool runs.
+    /// Guardian auto-review finished; `allow` = the tool runs, `None` = no verdict (V101).
     ReviewDone {
         outcome: Option<String>,
     },
@@ -280,6 +280,8 @@ fn guardian(v: &Value) -> Vec<Item> {
             let verdict = p["last_agent_message"].as_str().and_then(|m| serde_json::from_str::<Value>(m).ok());
             vec![Item::ReviewDone { outcome: verdict.and_then(|m| m["outcome"].as_str().map(str::to_owned)) }]
         }
+        // Aborted (input budget, interrupt): no verdict, so Codex asks the human (V101).
+        Some("turn_aborted") => vec![Item::ReviewDone { outcome: None }],
         _ => Vec::new(),
     }
 }

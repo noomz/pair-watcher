@@ -8,6 +8,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -20,6 +21,10 @@ use crate::provider::{Call, Failure, ProviderError, Reply};
 
 const MAX_MESSAGE: usize = 512;
 const POLL: Duration = Duration::from_millis(50);
+/// Output kept per stream when the deadline kills a call, for diagnosis (V87).
+const TIMEOUT_TAIL: usize = 400;
+/// How long a killed call's readers get to take in what was already written.
+const TIMEOUT_DRAIN: Duration = Duration::from_millis(500);
 
 /// The Watcher instructions travel in the wake input; this only replaces Claude Code's own.
 const CLAUDE_SYSTEM: &str = "You are a read-only reviewer. Follow the user message exactly. \
@@ -45,6 +50,7 @@ impl Kind {
 }
 
 /// A headless backend bound to one session.
+#[derive(Clone)]
 pub struct Cli {
     pub kind: Kind,
     /// The harness binary (`claude`, `codex`, or a path).
@@ -205,31 +211,69 @@ fn run(mut cmd: Command, input: &str, deadline: Option<Instant>) -> Result<Outpu
     let writer = thread::spawn(move || {
         let _ = stdin.write_all(input.as_bytes());
     });
-    let reader = |pipe: Option<Box<dyn Read + Send>>| {
-        thread::spawn(move || {
-            let mut s = String::new();
-            if let Some(mut p) = pipe {
-                let _ = p.read_to_string(&mut s);
-            }
-            s
-        })
-    };
-    let out = reader(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
-    let errs = reader(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let out = Pipe::read(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let errs = Pipe::read(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if deadline.is_some_and(|d| Instant::now() >= d) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(err(ProviderError::Timeout));
+                // A grandchild may hold a pipe open: take what arrived, never wait for EOF.
+                let drained = Instant::now() + TIMEOUT_DRAIN;
+                while !(out.done() && errs.done()) && Instant::now() < drained {
+                    thread::sleep(POLL);
+                }
+                let tail = [("stderr", errs.text()), ("stdout", out.text())]
+                    .into_iter()
+                    .filter(|(_, s)| !s.trim().is_empty())
+                    .map(|(name, s)| format!("{name} …{}", crate::clip::suffix(s.trim_end(), TIMEOUT_TAIL)))
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                return Err(err(ProviderError::Timeout(tail)));
             }
             Ok(None) => thread::sleep(POLL),
             Err(e) => return Err(err(ProviderError::Cli(format!("{program}: {e}")))),
         }
     };
     let _ = writer.join();
-    Ok(Output { status, stdout: out.join().unwrap_or_default(), stderr: errs.join().unwrap_or_default() })
+    Ok(Output { status, stdout: out.finish(), stderr: errs.finish() })
+}
+
+/// One child stream read on its own thread into a buffer readable before EOF.
+struct Pipe {
+    buf: Arc<Mutex<Vec<u8>>>,
+    reader: thread::JoinHandle<()>,
+}
+
+impl Pipe {
+    fn read(pipe: Option<Box<dyn Read + Send>>) -> Pipe {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let into = Arc::clone(&buf);
+        let reader = thread::spawn(move || {
+            let Some(mut p) = pipe else { return };
+            let mut chunk = [0; 8192];
+            while let Ok(n @ 1..) = p.read(&mut chunk) {
+                into.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(&chunk[..n]);
+            }
+        });
+        Pipe { buf, reader }
+    }
+
+    fn done(&self) -> bool {
+        self.reader.is_finished()
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.buf.lock().unwrap_or_else(|e| e.into_inner())).into_owned()
+    }
+
+    /// Everything, once the stream closes.
+    fn finish(self) -> String {
+        let Pipe { buf, reader } = self;
+        let _ = reader.join();
+        String::from_utf8_lossy(&buf.lock().unwrap_or_else(|e| e.into_inner())).into_owned()
+    }
 }
 
 fn message(s: &str) -> String {

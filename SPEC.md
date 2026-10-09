@@ -206,7 +206,7 @@ T20|x|Opt-in Watcher backends: `claude -p` (MCP read tools via `pair-watcher mcp
 T21|x|Live checks not yet run: Codex guardian `deny` outcome (timer/blocked semantics); blocked-wake latency per default model; real per-session cost (thinking tokens, tokenizer inflation); re-check pre-filter candidates still exist + System One shape|V48,V55,V56
 T22|.|Trial: unproductive-repetition scenario end-to-end on Claude, Codex, pi (6th review round with no new findings → repeat hint → approach-level Concern → verified Challenge → Debate → outcome/Escalation), Companion and Swarm; record results in ticket|V4,V16,V17,V26,V27,V31,V36
 T23|.|Packaging: `dist` release binaries macOS/Linux, shell installer, Homebrew tap, `cargo install`; adapters embedded via `include_str!`|C6
-T24|.|Blocked-path fixes from T21 live: guardian no-verdict re-arms timer; blocked wake runs alongside in-flight normal wake; keep child stdout/stderr tail on headless timeout for diagnosis|V56,V87,V101,V102
+T24|x|Blocked-path fixes from T21 live: guardian no-verdict re-arms timer; blocked wake runs alongside in-flight normal wake; keep child stdout/stderr tail on headless timeout for diagnosis|V56,V87,V101,V102
 
 ## §B
 

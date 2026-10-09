@@ -40,7 +40,7 @@ pub fn classify(e: &ProviderError) -> Class {
                 _ => Class::Slice,
             }
         }
-        ProviderError::Timeout | ProviderError::Network(_) | ProviderError::Protocol(_) => Class::Service,
+        ProviderError::Timeout(_) | ProviderError::Network(_) | ProviderError::Protocol(_) => Class::Service,
         // A headless backend: a missing CLI, a lost login or a spent subscription is Key.
         ProviderError::Cli(msg) => {
             let msg = msg.to_ascii_lowercase();

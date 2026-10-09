@@ -252,7 +252,26 @@ fn deadline_kills_the_cli() {
     let mut c = call("x", None);
     c.deadline = Some(Instant::now() + Duration::from_millis(300));
     let f = w.cli(Kind::ClaudeP, fake).call(&c).unwrap_err();
-    assert_eq!(f.error, ProviderError::Timeout);
+    assert_eq!(f.error, ProviderError::Timeout(String::new()));
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+/// V87: a killed call keeps the tail of what it printed, for diagnosis (live 2026-10-09: a
+/// `claude -p` hung to the 180 s clock left no trace), even while a grandchild holds the pipes.
+#[test]
+fn deadline_keeps_output_tail() {
+    let w = World::new();
+    let noise = "x".repeat(2_000);
+    let fake =
+        w.fake("claude", &format!("echo '{noise}' >&2\necho 'waiting on MCP server' >&2\necho partial\nsleep 20\n"));
+    let started = Instant::now();
+    let mut c = call("x", None);
+    c.deadline = Some(Instant::now() + Duration::from_millis(500));
+    let f = w.cli(Kind::ClaudeP, fake).call(&c).unwrap_err();
+    let ProviderError::Timeout(tail) = &f.error else { panic!("{:?}", f.error) };
+    assert!(tail.contains("stderr …") && tail.ends_with("waiting on MCP server | stdout …partial"), "{tail}");
+    assert!(tail.len() < 1_000, "clipped: {}", tail.len());
+    assert!(f.error.to_string().starts_with("timed out; last output: "));
     assert!(started.elapsed() < Duration::from_secs(5));
 }
 

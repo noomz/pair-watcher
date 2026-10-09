@@ -58,6 +58,8 @@ use crate::{models, run, standing, supervisor};
 pub const STATE_FILE: &str = "watch.json";
 /// The wake under way: its start (the supervisor's progress deadline) and slices (V88, V90).
 pub const INFLIGHT_FILE: &str = "inflight.json";
+/// A blocked wake under way beside a normal one (V102).
+pub const BLOCKED_INFLIGHT_FILE: &str = "inflight-blocked.json";
 pub const HEARTBEAT_FILE: &str = "watcher.hb";
 /// Focus task crashes; `attach` removes it (V90).
 pub const CRASHES_FILE: &str = "crashes.json";
@@ -74,6 +76,8 @@ pub const CRASH_MAX: usize = 3;
 /// Final drain wake (V90).
 pub const DRAIN_CLOCK: Duration = Duration::from_secs(60);
 const TICK: Duration = Duration::from_millis(250);
+/// How often a normal wake in flight looks for a blocked one to run beside it (V102).
+const ALONGSIDE_POLL: Duration = Duration::from_millis(50);
 /// A turn end with no transcript turn this long, one rescan included, is BLIND (V89).
 const TRANSCRIPT_WAIT_MS: u64 = 10_000;
 const RESCAN_MS: u64 = TRANSCRIPT_WAIT_MS / 2;
@@ -303,6 +307,10 @@ pub struct Watch {
     prefilter: Option<Gate>,
     /// The final drain's wake: never skipped (V54).
     draining: bool,
+    /// A normal wake's calls are out; blocked wakes run beside it (V102).
+    mid_wake: bool,
+    /// A transcript hooked mid-wake, adopted once that wake commits (V10).
+    adopt_after: Option<(PathBuf, bool)>,
 }
 
 /// Why the Watcher cannot run at all: logged as BLIND (V89).
@@ -412,6 +420,8 @@ impl Watch {
             pane_opened: mailbox.dir().join(PANE_OPENED).exists(),
             prefilter: gate,
             draining: false,
+            mid_wake: false,
+            adopt_after: None,
             mailbox,
         };
         w.choose_models()?;
@@ -465,10 +475,16 @@ impl Watch {
         })
     }
 
-    /// A wake cut off by a crash or kill counts once against its slices (V86, V88).
+    /// Wakes cut off by a crash or kill: each counts once against its slices (V86, V88).
     fn interrupted(&mut self) -> io::Result<()> {
-        let path = self.mailbox.dir().join(INFLIGHT_FILE);
-        let Some(inflight) = read_json::<Inflight>(&path)? else { return Ok(()) };
+        for file in [INFLIGHT_FILE, BLOCKED_INFLIGHT_FILE] {
+            self.interrupted_in(&self.mailbox.dir().join(file))?;
+        }
+        Ok(())
+    }
+
+    fn interrupted_in(&mut self, path: &Path) -> io::Result<()> {
+        let Some(inflight) = read_json::<Inflight>(path)? else { return Ok(()) };
         let now = now_ms();
         let blocked = inflight.trigger == "blocked";
         for (watcher, slice) in &inflight.slices {
@@ -558,7 +574,8 @@ impl Watch {
             self.round(&d, Some(&rewake), now)?;
         }
         self.clocks(now)?;
-        if self.turn_wait.is_none() {
+        // A turn end taken in beside a wake (V102) has not woken yet (V21).
+        if self.turn_wait.is_none() && !self.triggers.turn_end_held() {
             self.mailbox.settle(self.state.inbox)?;
         }
         self.save()
@@ -656,7 +673,11 @@ impl Watch {
                 && self.state.transcript.as_ref() != Some(&path)
             {
                 let resumed = p.get("source").and_then(Value::as_str) == Some("resume");
-                self.adopt(path, resumed);
+                if self.mid_wake {
+                    self.adopt_after = Some((path, resumed));
+                } else {
+                    self.adopt(path, resumed);
+                }
             }
             if let Some(signal) = trigger::signal(self.harness, &r.body.event) {
                 self.triggers.observe(r.t, signal, p);
@@ -691,7 +712,8 @@ impl Watch {
         self.state.guardian = None;
     }
 
-    /// Codex guardian reviews cancel the blocked timer (V56).
+    /// A Codex guardian review holds the blocked timer; its verdict cancels it, its end with no
+    /// verdict re-arms it (V56, V101).
     fn guardian(&mut self) -> io::Result<()> {
         if self.harness != Harness::Codex {
             return Ok(());
@@ -709,9 +731,13 @@ impl Watch {
         let Ok(tail) = tailer::read(Format::Guardian, path, cursor) else { return Ok(()) };
         for e in &tail.entries {
             for i in &e.items {
-                if matches!(i, Item::ReviewStarted | Item::ReviewDone { .. }) {
-                    self.triggers.observe(e.t, Signal::Activity, &Value::Null);
-                }
+                let signal = match i {
+                    Item::ReviewStarted => Signal::Review,
+                    Item::ReviewDone { outcome: Some(_) } => Signal::Activity,
+                    Item::ReviewDone { outcome: None } => Signal::NoVerdict,
+                    _ => continue,
+                };
+                self.triggers.observe(e.t, signal, &Value::Null);
             }
         }
         self.state.guardian = Some((path.clone(), tail.cursor));
@@ -952,30 +978,12 @@ impl Watch {
         let mut skipped = Vec::new();
         for i in (0..roster.len()).rev() {
             if verdicts[i].as_ref().is_some_and(|v| v.skipped) {
-                let (w, b, v) = (roster.remove(i), built.remove(i), verdicts.remove(i));
-                let trigger = trigger_name(due.trigger, false);
-                let record = self.record(&w, trigger, &b, tree.as_deref(), None)?;
-                skipped.push(Wake {
-                    n: self.state.n + 1,
-                    watcher: w.name,
-                    trigger: trigger.into(),
-                    outcome: Outcome::Skipped,
-                    class: None,
-                    error: None,
-                    model: String::new(),
-                    spend: 0.0,
-                    replayed: false,
-                    rulings: vec![],
-                    prefilter: v,
-                    diff_bytes: b.sections.diff_bytes,
-                    record: Some(record),
-                    ..Default::default()
-                });
+                skipped.push((roster.remove(i), built.remove(i), verdicts.remove(i)));
             }
         }
         let slices = roster.iter().zip(&built).map(|(w, b)| (w.name.clone(), slice_key(b))).collect();
         let skip = roster.iter().zip(&built).map(|(w, b)| (w.name.clone(), skip_of(b, now))).collect();
-        let inflight = self.mailbox.dir().join(INFLIGHT_FILE);
+        let inflight = self.mailbox.dir().join(if blocked { BLOCKED_INFLIGHT_FILE } else { INFLIGHT_FILE });
         let trigger = trigger_name(due.trigger, false).into();
         write_json(&inflight, &Inflight { started: now, trigger, slices, skip })?;
 
@@ -992,16 +1000,21 @@ impl Watch {
             .collect::<Result<_, String>>()
             .map_err(io::Error::other)?;
         let head = self.store.as_ref().and_then(Store::head);
-        let (provider, table, store) = (&self.provider, &self.table, self.store.as_ref());
-        let results = arbiter::run(&roster, |w| {
-            let i = roster.iter().position(|r| r.name == w.name).expect("in roster");
-            let tools = match (store, &tree) {
-                (Some(store), Some(tree)) if !blocked => Some(Snapshot { store, tree, head: head.as_deref() }),
-                _ => None,
-            };
-            let (choice, probe) = &plans[i];
-            ask(provider, table, choice, &built[i].input, tools, deadline, !probe, *probe)
+        let (provider, table, store) = (self.provider.clone(), self.table.clone(), self.store.clone());
+        let (watchers, inputs, snapshot) =
+            (roster.clone(), built.iter().map(|b| b.input.clone()).collect::<Vec<_>>(), tree.clone());
+        let calls = thread::spawn(move || {
+            arbiter::run(&watchers, |w| {
+                let i = watchers.iter().position(|r| r.name == w.name).expect("in roster");
+                let tools = match (&store, &snapshot) {
+                    (Some(store), Some(tree)) if !blocked => Some(Snapshot { store, tree, head: head.as_deref() }),
+                    _ => None,
+                };
+                let (choice, probe) = &plans[i];
+                ask(&provider, &table, choice, &inputs[i], tools, deadline, !probe, *probe)
+            })
         });
+        let results = if blocked { join(calls)? } else { self.alongside(calls)? };
 
         // The arbiter takes accepted outputs only (V10, V43).
         let mut ran: Vec<Watcher> = Vec::new();
@@ -1182,7 +1195,23 @@ impl Watch {
                 wakes[i].outcome = Outcome::Escalation;
             }
         }
-        for wake in skipped.into_iter().chain(wakes) {
+        // Skipped Watchers: logged with their input, cursor held, no model call (V55).
+        for (w, b, v) in skipped {
+            let trigger = trigger_name(due.trigger, false);
+            let record = self.record(&w, trigger, &b, tree.as_deref(), None)?;
+            let wake = Wake {
+                n: self.state.n + 1,
+                watcher: w.name,
+                trigger: trigger.into(),
+                outcome: Outcome::Skipped,
+                prefilter: v,
+                diff_bytes: b.sections.diff_bytes,
+                record: Some(record),
+                ..Default::default()
+            };
+            self.append(wake.event())?;
+        }
+        for wake in wakes {
             self.append(wake.event())?;
         }
         self.state.n += 1;
@@ -1208,7 +1237,33 @@ impl Watch {
                 self.state.health.entry(w.name.clone()).or_default().rewake_at = Some(now);
             }
         }
+        if !blocked && let Some((path, resumed)) = self.adopt_after.take() {
+            self.adopt(path, resumed);
+        }
         Ok(())
+    }
+
+    /// A blocked wake never waits on a normal one (V102): until the normal wake's calls return,
+    /// the loop takes in hooks and runs each blocked wake that comes due beside it, under its
+    /// own clock. A new transcript waits until the normal wake commits.
+    fn alongside<T>(&mut self, calls: thread::JoinHandle<T>) -> io::Result<T> {
+        self.mid_wake = true;
+        let mut waited = || -> io::Result<()> {
+            while !calls.is_finished() {
+                let now = now_ms();
+                self.hooks(now)?;
+                self.guardian()?;
+                if let Some(due) = self.triggers.blocked_due(now) {
+                    self.round(&due, None, now)?;
+                }
+                thread::sleep(ALONGSIDE_POLL);
+            }
+            Ok(())
+        };
+        let r = waited();
+        self.mid_wake = false;
+        r?;
+        join(calls)
     }
 
     /// Scores each eligible Watcher's input in parallel (V53–V55); `None` = not scored. A failure
@@ -1595,6 +1650,10 @@ fn item_len(i: &Item) -> usize {
     }
 }
 
+fn join<T>(calls: thread::JoinHandle<T>) -> io::Result<T> {
+    calls.join().map_err(|_| io::Error::other("wake calls panicked"))
+}
+
 /// One Watcher's call inside the wake clock (V86, V87): Service errors retried, invalid output
 /// asked again once, then failed with its class. `retries = false` for a primary probe (V51).
 #[allow(clippy::too_many_arguments)]
@@ -1645,7 +1704,7 @@ fn ask(
             }
         }
         if Instant::now() >= deadline {
-            break Err((Class::Service, ProviderError::Timeout.to_string(), false));
+            break Err((Class::Service, ProviderError::Timeout(String::new()).to_string(), false));
         }
     };
     let latency_ms = started.elapsed().as_millis() as u64;

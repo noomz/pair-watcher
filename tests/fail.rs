@@ -20,7 +20,7 @@ fn classes() {
     for s in [429, 500, 502, 503, 529, 408] {
         assert_eq!(fail::classify(&http(s, "overloaded")), Class::Service, "{s}");
     }
-    assert_eq!(fail::classify(&ProviderError::Timeout), Class::Service);
+    assert_eq!(fail::classify(&ProviderError::Timeout(String::new())), Class::Service);
     assert_eq!(fail::classify(&ProviderError::Network("reset".into())), Class::Service);
     assert_eq!(fail::classify(&http(400, "prompt is too long: context window exceeded")), Class::Slice);
     assert_eq!(fail::classify(&http(413, "")), Class::Slice);

@@ -554,6 +554,44 @@ fn blocked_wake_sees_open_turn_prompt() {
     assert_eq!(w.state().focus["approach"].cursor, committed, "blocked wake commits nothing");
 }
 
+/// V102: a blocked hook during a slow normal wake (live 2026-10-09: queued 167.8 s behind a hung
+/// `claude -p`) wakes beside it and raises its Escalation before the normal wake ends.
+#[test]
+fn blocked_wake_runs_beside_slow_normal_wake() {
+    let server = Server::start(|b| {
+        if b.get("tools").is_some() {
+            thread::sleep(Duration::from_millis(1_500));
+            return reply("");
+        }
+        reply(r#"{"op":"consider","text":"the migration is irreversible"}"#)
+    });
+    let fx = Fx::new("companion", &server);
+    let mut w = fx.open();
+    fx.start();
+    fx.turn(1, "Done.");
+    fx.stop();
+    let mb = fx.mb.clone();
+    let blocker = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(300));
+        let payload = json!({"tool_name": "Bash", "tool_input": {"command": "rm -rf data"}});
+        mb.append_hook(&Hook { event: "PermissionRequest".into(), payload }).unwrap();
+    });
+    w.step(now()).unwrap();
+    blocker.join().unwrap();
+
+    let events = fx.events();
+    let raised = events.iter().position(|e| e.k == Kind::Escalation && e.str("op") == Some("raised"));
+    let normal = events.iter().position(|e| e.k == Kind::Wake && e.str("trigger") == Some("turn-end"));
+    assert!(raised.is_some() && normal.is_some(), "{events:?}");
+    assert!(raised < normal, "blocked Escalation before the normal wake ends");
+    let triggers: Vec<String> = fx.wakes().into_iter().map(|w| w.trigger).collect();
+    assert_eq!(triggers, ["blocked", "turn-end"]);
+    let ns: Vec<u64> = fx.wakes().into_iter().map(|w| w.n).collect();
+    assert_eq!(ns, [1, 2], "wake numbers follow log order");
+    assert!(!fx.mb.dir().join(watch::INFLIGHT_FILE).exists());
+    assert!(!fx.mb.dir().join(watch::BLOCKED_INFLIGHT_FILE).exists());
+}
+
 /// V90: a Swarm Focus task that crash-loops stays out of wakes until `attach` lifts it.
 #[test]
 fn crash_looped_focus_sits_out() {

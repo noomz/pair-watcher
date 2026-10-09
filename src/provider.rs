@@ -48,7 +48,8 @@ pub enum ProviderError {
         retry_after: Option<Duration>,
         body: String,
     },
-    Timeout,
+    /// Past the deadline; a headless backend's last output before the kill, else empty (V87).
+    Timeout(String),
     Network(String),
     /// Response not in the vendor's shape.
     Protocol(String),
@@ -61,7 +62,8 @@ impl fmt::Display for ProviderError {
         match self {
             ProviderError::NoKey(v) => write!(f, "no {} API key", v.name()),
             ProviderError::Http { status, body, .. } => write!(f, "HTTP {status}: {body}"),
-            ProviderError::Timeout => f.write_str("timed out"),
+            ProviderError::Timeout(tail) if tail.is_empty() => f.write_str("timed out"),
+            ProviderError::Timeout(tail) => write!(f, "timed out; last output: {tail}"),
             ProviderError::Network(e) => write!(f, "network: {e}"),
             ProviderError::Protocol(e) => write!(f, "unexpected response: {e}"),
             ProviderError::Cli(e) => f.write_str(e),
@@ -125,6 +127,7 @@ impl Backend {
 }
 
 /// One interface over every backend (I15).
+#[derive(Clone)]
 pub enum Provider {
     Api(Api),
     Cli(crate::headless::Cli),
@@ -146,6 +149,7 @@ impl Provider {
     }
 }
 
+#[derive(Clone)]
 pub struct Api {
     agent: ureq::Agent,
     keys: Keys,
@@ -204,9 +208,11 @@ impl Api {
 
     fn post(&self, vendor: Vendor, key: &str, body: &Value, deadline: Option<Instant>) -> Result<Value, ProviderError> {
         let left = match deadline {
-            Some(d) => {
-                Some(d.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()).ok_or(ProviderError::Timeout)?)
-            }
+            Some(d) => Some(
+                d.checked_duration_since(Instant::now())
+                    .filter(|d| !d.is_zero())
+                    .ok_or(ProviderError::Timeout(String::new()))?,
+            ),
             None => None,
         };
         let req = match vendor {
@@ -242,7 +248,7 @@ impl Api {
 
 fn transport(e: ureq::Error) -> ProviderError {
     match e {
-        ureq::Error::Timeout(_) => ProviderError::Timeout,
+        ureq::Error::Timeout(_) => ProviderError::Timeout(String::new()),
         ureq::Error::Json(e) => ProviderError::Protocol(e.to_string()),
         e => ProviderError::Network(e.to_string()),
     }

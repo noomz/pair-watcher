@@ -87,7 +87,7 @@ fn codex_permission_request_waits_for_quiet() {
     assert!(t.due(NOW + 2 * CODEX_BLOCKED_MS, NOW, true, || false).is_empty(), "fires once");
 }
 
-/// V56: a tool hook or guardian review start cancels the timer; `Stop` cancels it and wakes.
+/// V56: a tool hook cancels the timer; `Stop` cancels it and wakes.
 #[test]
 fn codex_activity_cancels_blocked_timer() {
     for (cancel, want) in [(Signal::Activity, vec![]), (Signal::TurnEnd, vec![Trigger::TurnEnd])] {
@@ -96,4 +96,41 @@ fn codex_activity_cancels_blocked_timer() {
         t.observe(NOW + 1_000, cancel, &Value::Null);
         assert_eq!(kinds(&t.due(NOW + CODEX_BLOCKED_MS * 2, NOW, true, || false)), want);
     }
+}
+
+/// V56, V101: a guardian review holds the timer; its verdict (allow or deny) leaves the Worker
+/// unblocked; an end with no verdict re-arms 10 s from that end, with the request's payload.
+#[test]
+fn codex_guardian_review_holds_then_rearms_without_verdict() {
+    let review = |end: Signal| {
+        let mut t = Triggers::default();
+        t.observe(NOW, Signal::MaybeBlocked, &json!({"q": 1}));
+        t.observe(NOW + 1_000, Signal::Review, &Value::Null);
+        assert!(t.due(NOW + 30_000, NOW, true, || false).is_empty(), "review holds the timer");
+        t.observe(NOW + 40_000, end, &Value::Null);
+        t
+    };
+    let mut verdict = review(Signal::Activity);
+    assert!(verdict.due(NOW + 100_000, NOW, true, || false).is_empty());
+
+    let mut none = review(Signal::NoVerdict);
+    assert!(none.due(NOW + 40_000 + CODEX_BLOCKED_MS - 1, NOW, true, || false).is_empty());
+    let due = none.due(NOW + 40_000 + CODEX_BLOCKED_MS, NOW, true, || false);
+    assert_eq!(kinds(&due), [Trigger::Blocked]);
+    assert_eq!(due[0].payload, Some(json!({"q": 1})));
+
+    // A second no-verdict line (aborted after an empty `task_complete`) keeps the re-armed timer.
+    let mut twice = review(Signal::NoVerdict);
+    twice.observe(NOW + 41_000, Signal::NoVerdict, &Value::Null);
+    assert_eq!(kinds(&twice.due(NOW + 40_000 + CODEX_BLOCKED_MS, NOW, true, || false)), [Trigger::Blocked]);
+
+    // Worker activity after the re-arm: Codex did not ask after all.
+    let mut busy = review(Signal::NoVerdict);
+    busy.observe(NOW + 42_000, Signal::Activity, &Value::Null);
+    assert!(busy.due(NOW + 100_000, NOW, true, || false).is_empty());
+
+    // No pending request: a review's no-verdict end alone never blocks.
+    let mut bare = Triggers::default();
+    bare.observe(NOW, Signal::NoVerdict, &Value::Null);
+    assert!(bare.due(NOW + 100_000, NOW, true, || false).is_empty());
 }

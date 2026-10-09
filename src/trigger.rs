@@ -24,9 +24,12 @@ pub enum Signal {
     Blocked,
     /// Codex `PermissionRequest`: blocked unless activity follows within `CODEX_BLOCKED_MS`.
     MaybeBlocked,
-    /// Codex tool hook, prompt submit, or guardian review start: the Worker is working, not
-    /// waiting on the human.
+    /// Codex tool hook or prompt submit: the Worker is working, not waiting on the human.
     Activity,
+    /// Codex guardian review started: it, not the human, answers the request.
+    Review,
+    /// Codex guardian review ended with no verdict: Codex asks the human after all (V101).
+    NoVerdict,
 }
 
 /// What a hook event means for wakes; `None` for events that never wake (`SessionStart`).
@@ -56,19 +59,53 @@ pub struct Triggers {
     blocked: Option<(u64, Value)>,
     /// Codex `PermissionRequest` arrival time + payload, until activity cancels it.
     maybe_blocked: Option<(u64, Value)>,
+    /// The last Codex `PermissionRequest` payload while a guardian reviews it (V101).
+    reviewed: Option<Value>,
 }
 
 impl Triggers {
     pub fn observe(&mut self, at: u64, signal: Signal, payload: &Value) {
-        if signal != Signal::MaybeBlocked {
-            self.maybe_blocked = None;
-        }
         match signal {
-            Signal::TurnEnd => self.turn_end = Some(at),
-            Signal::Blocked => self.blocked = Some((at, payload.clone())),
-            Signal::MaybeBlocked => self.maybe_blocked = Some((at, payload.clone())),
-            Signal::Activity => {}
+            Signal::MaybeBlocked => {
+                self.maybe_blocked = Some((at, payload.clone()));
+                self.reviewed = None;
+            }
+            Signal::Review => {
+                if let Some((_, asked)) = self.maybe_blocked.take() {
+                    self.reviewed = Some(asked);
+                }
+            }
+            // The 10 s wait restarts from the review's end (V101).
+            Signal::NoVerdict => {
+                if let Some(asked) = self.reviewed.take() {
+                    self.maybe_blocked = Some((at, asked));
+                }
+            }
+            Signal::TurnEnd | Signal::Blocked | Signal::Activity => {
+                self.maybe_blocked = None;
+                self.reviewed = None;
+                match signal {
+                    Signal::TurnEnd => self.turn_end = Some(at),
+                    Signal::Blocked => self.blocked = Some((at, payload.clone())),
+                    _ => {}
+                }
+            }
         }
+    }
+
+    /// The blocked wake due at `now`, if any; normal wakes stay held (V102).
+    pub fn blocked_due(&mut self, now: u64) -> Option<Due> {
+        if let Some((at, _)) = &self.maybe_blocked
+            && now.saturating_sub(*at) >= CODEX_BLOCKED_MS
+        {
+            self.blocked = self.maybe_blocked.take();
+        }
+        self.blocked.take().map(|(at, payload)| Due { trigger: Trigger::Blocked, payload: Some(payload), at })
+    }
+
+    /// A turn end hooked but not yet taken by [`due`](Self::due).
+    pub fn turn_end_held(&self) -> bool {
+        self.turn_end.is_some()
     }
 
     /// Wakes due at `now`: at most one blocked, then at most one normal. Turn end and blocked
@@ -82,15 +119,7 @@ impl Triggers {
         checkpoints: bool,
         repo_changed: impl FnOnce() -> bool,
     ) -> Vec<Due> {
-        if let Some((at, _)) = &self.maybe_blocked
-            && now.saturating_sub(*at) >= CODEX_BLOCKED_MS
-        {
-            self.blocked = self.maybe_blocked.take();
-        }
-        let mut due = Vec::new();
-        if let Some((at, payload)) = self.blocked.take() {
-            due.push(Due { trigger: Trigger::Blocked, payload: Some(payload), at });
-        }
+        let mut due: Vec<Due> = self.blocked_due(now).into_iter().collect();
         if let Some(at) = self.turn_end.take() {
             due.push(Due { trigger: Trigger::TurnEnd, payload: None, at });
         } else if checkpoints && now.saturating_sub(last_wake) >= CHECKPOINT_FLOOR_MS && repo_changed() {

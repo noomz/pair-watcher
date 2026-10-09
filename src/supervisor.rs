@@ -21,7 +21,9 @@ use crate::jsonl::now_ms;
 use crate::mailbox::Mailbox;
 use crate::pane::Board;
 use crate::status::{Op, WatcherOp};
-use crate::watch::{self, DRAIN_CLOCK, DRAIN_FILE, HEARTBEAT, HEARTBEAT_FILE, INFLIGHT_FILE, Inflight};
+use crate::watch::{
+    self, BLOCKED_INFLIGHT_FILE, DRAIN_CLOCK, DRAIN_FILE, HEARTBEAT, HEARTBEAT_FILE, INFLIGHT_FILE, Inflight,
+};
 
 const POLL: Duration = Duration::from_millis(250);
 pub const PID_FILE: &str = "supervisor.pid";
@@ -148,8 +150,11 @@ pub fn supervise(home: &Home, session: &str, worker_pid: i32) -> io::Result<()> 
                 Some(status) => Some((format!("exited: {}", describe(status)), false)),
                 None => {
                     let hb = watch::beat_of(&dir.join(HEARTBEAT_FILE)).unwrap_or(0).max(started);
-                    let inflight =
-                        watch::read_json::<Inflight>(&dir.join(INFLIGHT_FILE)).ok().flatten().map(|i| i.started);
+                    let inflight = [INFLIGHT_FILE, BLOCKED_INFLIGHT_FILE]
+                        .iter()
+                        .filter_map(|f| watch::read_json::<Inflight>(&dir.join(f)).ok().flatten())
+                        .map(|i| i.started)
+                        .min();
                     hung(now, hb, inflight).map(|why| (why.to_owned(), true))
                 }
             };
