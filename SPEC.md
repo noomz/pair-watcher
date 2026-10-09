@@ -181,6 +181,7 @@ V101|Codex guardian review end with no `outcome` (`task_complete` lacking verdic
 V102|Blocked wake never waits on in-flight normal wake: runs alongside it under own 60 s clock. hook→Escalation ≤ detection delay (Codex 10 s timer) + 60 s.
 V103|Concern list entry for Debate-closed Concern carries Debate outcome + Worker's last verdict reason (≤200 B, inside Concern list cap, V7). Watcher must not raise new Concern on a Debate-closed objection (watcher-concedes / withdrawn / unresolved / sided-*) unless new evidence answers that reason; model-judged, no code matching (V13, V22).
 V104|Cited hint verifies (V17, V19) when current History holds hint for same signature with count ≥ cited count; lower or absent → unverifiable.
+V105|Waiting challenge-ready Concern takes freed slot (V19) only after its owner's wake that saw the closed Debate (V103 entry); owner may withdraw the flag there. Never queued in the round that ended the Debate.
 
 ## §T
 
@@ -210,6 +211,7 @@ T22|x|Trial: unproductive-repetition scenario end-to-end on Claude, Codex, pi (6
 T23|.|Packaging: `dist` release binaries macOS/Linux, shell installer, Homebrew tap, `cargo install`; adapters embedded via `include_str!`|C6
 T24|x|Blocked-path fixes from T21 live: guardian no-verdict re-arms timer; blocked wake runs alongside in-flight normal wake; keep child stdout/stderr tail on headless timeout for diagnosis|V56,V87,V101,V102
 T25|x|T22 live fixes: Debate-closed Concern entries in wake input + no-reraise prompt rule; hint count-monotone verify; prompt concede rule = constraint verified in transcript/Task (V32); `claude -p` expired OAuth → Key (V86); invalid wake record keeps input + raw output (I10)|V7,V13,V17,V19,V32,V86,V103,V104,I10
+T26|.|Slot admission after owner sees closed Debate (Swarm); test: sibling Debate ends unresolved → waiting Concern not queued same round, queued next round only if owner keeps flag|V19,V103,V105
 
 ## §B
 
@@ -219,3 +221,4 @@ B2|2026-10-09|guardian review aborted w/o verdict (input budget) → Codex falls
 B3|2026-10-09|blocked wake serialized behind in-flight normal wake (claude -p hung to 180 s clock) → hook→Escalation 167.8 s|V102
 B4|2026-10-09|resolved Concerns in wake input = id + headline only → Watcher unaware it conceded Debate → re-raised same objection as new id → fresh auto-Challenge (3 Challenges in 4 min)|V103
 B5|2026-10-09|hint re-verify required exact line; count grows each turn → stronger evidence judged unverifiable|V104
+B6|2026-10-09|Swarm: waiting Concern queued in same round sibling Debate ended unresolved on same objection; owner never saw outcome → 2 notifications 43 s apart, one root cause|V105
