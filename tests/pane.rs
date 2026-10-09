@@ -44,6 +44,7 @@ fn concern(id: &str, focus: &str, severity: Severity, headline: &str) -> Concern
         alternative: Some("stop reviewing; run the failing test instead".into()),
         verified: false,
         tag: None,
+        debate: None,
     }
 }
 

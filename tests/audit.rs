@@ -110,6 +110,7 @@ fn concern(id: &str, focus: &str, headline: &str) -> Concern {
         alternative: None,
         verified: false,
         tag: None,
+        debate: None,
     }
 }
 

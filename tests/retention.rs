@@ -174,6 +174,7 @@ fn telemetry_weekly_aggregate_only() {
         alternative: None,
         verified: false,
         tag: None,
+        debate: None,
     };
     log.append(Change::Add { watcher: "payments-team".into(), concern: c }.event()).unwrap();
     log.append(human::shown("A1")).unwrap();

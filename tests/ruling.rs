@@ -47,6 +47,7 @@ fn concern(id: &str) -> Concern {
         alternative: Some(ALT.into()),
         verified: true,
         tag: None,
+        debate: None,
     }
 }
 

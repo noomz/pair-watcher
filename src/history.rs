@@ -202,6 +202,15 @@ impl History {
     }
 }
 
+/// A repeat hint line (with or without its `hint:` prefix) as signature + sighting count.
+pub fn parse_hint(line: &str) -> Option<(&str, usize)> {
+    let rest = line.trim().strip_prefix("hint:").unwrap_or(line.trim()).trim();
+    let rest = rest.strip_prefix("signature \"")?;
+    let (sig, tail) = rest.rsplit_once("\" seen ")?;
+    let (count, _) = tail.split_once('×')?;
+    Some((sig, count.parse().ok()?))
+}
+
 impl Turn {
     /// `T<n> "<text>" · <sig> → <outcome>[ ×k] · …`, ≤400 B; identical actions merge.
     fn line(&self, open: bool) -> String {

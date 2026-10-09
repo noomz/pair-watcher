@@ -241,7 +241,7 @@ struct TurnWait {
 /// One Watcher's call result (runs on its task).
 struct Asked {
     result: Result<Vec<Line>, (Class, String, bool)>,
-    /// The accepted answer's text, for the wake record.
+    /// The model's last answer, accepted or invalid, for the wake record.
     text: Option<String>,
     spend: f64,
     usage: Usage,
@@ -1680,11 +1680,11 @@ fn ask(
                 spend += cost(&reply.usage);
                 usage += reply.usage;
                 calls += reply.tools.calls;
-                match output::parse(&reply.text) {
-                    Ok(lines) => {
-                        text = Some(reply.text);
-                        break Ok(lines);
-                    }
+                let parsed = output::parse(&reply.text);
+                // An invalid answer is kept too: the record is its only diagnostic (I10).
+                text = Some(reply.text);
+                match parsed {
+                    Ok(lines) => break Ok(lines),
                     // Invalid twice is a Slice failure (V86).
                     Err(why) if invalid.is_some() => break Err((Class::Slice, format!("invalid output: {why}"), true)),
                     Err(why) => invalid = Some(why),

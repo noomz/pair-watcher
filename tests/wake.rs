@@ -36,6 +36,7 @@ fn concern(id: &str, focus: &str, state: State, detail: usize) -> Concern {
         alternative: None,
         verified: false,
         tag: None,
+        debate: None,
     }
 }
 
@@ -106,6 +107,7 @@ fn repetition_input() -> (Input, History) {
             alternative: None,
             verified: false,
             tag: None,
+            debate: None,
         },
         Concern {
             id: "c2".into(),
@@ -120,6 +122,7 @@ fn repetition_input() -> (Input, History) {
             alternative: None,
             verified: false,
             tag: None,
+            debate: None,
         },
     ];
     let instructions = ["AGENTS.md".to_owned()];
@@ -461,4 +464,33 @@ fn diff_cap_holds_with_partial_files() {
     assert!(diff.len() <= 10 * 1024, "{}", diff.len());
     let session_part = &diff[diff.find("Session since start").unwrap()..];
     assert!(session_part.len() <= 2048 && !session_part.contains("long/long/"), "{}", session_part.len());
+}
+
+/// V103: a Concern whose Debate ended carries the outcome and the Worker's last verdict reason
+/// into the wake input, also after its owner updates it; a later exchange replaces the reason.
+#[test]
+fn debate_closed_concern_shows_outcome_and_reason() {
+    use pair_watcher::concern::{Change, ConcernList};
+    use pair_watcher::event::{Event, Kind};
+    let debate = |op: &str| Event::new(Kind::Debate).with("op", op).with("challenge", "c1");
+    let mut open = concern("c2", "approach", State::Open, 1);
+    open.id = "c2".into();
+    let events = vec![
+        Change::Add { watcher: "companion".into(), concern: concern("c1", "approach", State::Open, 1) }.event(),
+        Change::Add { watcher: "companion".into(), concern: open }.event(),
+        debate("exchange").with("reason", "first reason"),
+        debate("exchange").with("reason", "policy says keep the loop running"),
+        Change::Update { watcher: "companion".into(), concern: concern("c1", "approach", State::Open, 1) }.event(),
+        debate("end").with("concern", "c1").with("outcome", "watcher-concedes"),
+    ];
+    let list = ConcernList::rebuild(&events);
+    let (input, _) = wake::normal(Trigger::TurnEnd, &History::default(), &[], None, &ctx(list.all(), None, "", &[]));
+    let section = input.section("Concerns").unwrap();
+    assert!(
+        section.contains(
+            "c1 (approach) resolved: headline of c1\n  Debate ended watcher-concedes; Worker: \"policy says keep the loop running\""
+        ),
+        "{section}"
+    );
+    assert!(!section.contains("c2 [note] (approach) headline of c2\n  Debate"), "no Debate, no line");
 }

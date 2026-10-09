@@ -198,6 +198,7 @@ fn added(list: &ConcernList, pending: &[Candidate], w: &Watcher, line: &Line) ->
         alternative: alternative.clone(),
         verified: false,
         tag: None,
+        debate: None,
     };
     let key = norm(headline);
     for c in list.all().iter().filter(|c| norm(&c.headline) == key) {

@@ -179,6 +179,7 @@ fn concern(id: &str, challenge: bool, evidence: Vec<Evidence>) -> Concern {
         alternative: Some("exponential backoff with a cap".into()),
         verified: false,
         tag: None,
+        debate: None,
     }
 }
 
@@ -766,4 +767,26 @@ fn text_cannot_forge_lines() {
         ),
         "{t}"
     );
+}
+
+/// V104: a cited hint still verifies once the repeat goes on and its count grows; a count above
+/// what the history holds, or another signature, does not.
+#[test]
+fn hint_count_only_grows() {
+    let f = fx();
+    let grown = concern(
+        "c1",
+        true,
+        vec![Evidence::Hint { excerpt: "hint: signature \"Bash cargo test\" seen 2× in last 2 turns".into() }],
+    );
+    assert_eq!(challenge::failing(&grown, &f.sources()), Vec::<String>::new());
+    let bad = concern(
+        "c2",
+        true,
+        vec![
+            Evidence::Hint { excerpt: "hint: signature \"Bash cargo test\" seen 4× in last 4 turns".into() },
+            Evidence::Hint { excerpt: "signature \"Bash cargo build\" seen 3× in last 3 turns".into() },
+        ],
+    );
+    assert_eq!(challenge::failing(&bad, &f.sources()).len(), 2);
 }

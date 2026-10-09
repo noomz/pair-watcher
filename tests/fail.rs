@@ -30,6 +30,9 @@ fn classes() {
     assert_eq!(fail::classify(&http(429, r#"{"error":{"code":"insufficient_quota"}}"#)), Class::Key);
     assert_eq!(fail::classify(&http(400, "Your credit balance is too low")), Class::Key);
     assert_eq!(fail::classify(&ProviderError::NoKey(Vendor::Openai)), Class::Key);
+    // A headless backend's lost login (T22 live: `claude -p`).
+    let expired = "claude -p: Failed to authenticate: OAuth session expired and could not be refreshed";
+    assert_eq!(fail::classify(&ProviderError::Cli(expired.into())), Class::Key);
 }
 
 /// V87: 2 s / 8 s / 30 s + jitter, then stop; Retry-After ≤60 s honoured, longer ends retries;

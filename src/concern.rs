@@ -3,6 +3,8 @@
 //! `ruling undone` (V43, V75), the Debate engine writes `debate end` (V35); anything that reads the
 //! log (pane, restart) rebuilds the same list.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::event::{Event, Kind};
@@ -83,6 +85,16 @@ pub struct Concern {
     /// Set by the `debate end` that left it open (V35).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<Tag>,
+    /// How its Debate ended and the Worker's last verdict reason, folded from the log (V103).
+    #[serde(skip)]
+    pub debate: Option<Settled>,
+}
+
+/// A Debate's end as the wake input shows it on its Concern (V103).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Settled {
+    pub outcome: String,
+    pub reason: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,6 +164,8 @@ pub fn dismissal(id: &str) -> Event {
 pub struct ConcernList {
     concerns: Vec<Concern>,
     rulings: Live,
+    /// The Worker's last verdict reason per Challenge, until its Debate ends (V103).
+    reasons: HashMap<String, String>,
 }
 
 impl ConcernList {
@@ -193,7 +207,8 @@ impl ConcernList {
                 Some(Change::Add { concern, .. }) => self.concerns.push(concern),
                 Some(Change::Update { concern, .. }) => {
                     if let Some(c) = self.find(&concern.id) {
-                        *c = concern;
+                        let debate = c.debate.take();
+                        *c = Concern { debate, ..concern };
                     }
                 }
                 Some(Change::Resolve { id, .. } | Change::Duplicate { id, .. }) => self.close(&id, State::Resolved),
@@ -210,8 +225,17 @@ impl ConcernList {
                     self.close(id, State::Dismissed);
                 }
             }
+            Kind::Debate if event.str("op") == Some("exchange") => {
+                if let (Some(ch), Some(reason)) = (event.str("challenge"), event.str("reason")) {
+                    self.reasons.insert(ch.to_owned(), reason.to_owned());
+                }
+            }
             Kind::Debate if event.str("op") == Some("end") => {
                 let Some(id) = event.str("concern") else { return };
+                let reason = event.str("challenge").and_then(|ch| self.reasons.remove(ch));
+                if let (Some(c), Some(outcome)) = (self.find(id), event.str("outcome")) {
+                    c.debate = Some(Settled { outcome: outcome.to_owned(), reason });
+                }
                 let escalated = event.fields.get("escalated").and_then(serde_json::Value::as_bool);
                 match event.str("outcome") {
                     Some("worker-concedes") => self.tag(id, Tag::Conceded),

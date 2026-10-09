@@ -102,6 +102,7 @@ fn concern() -> Concern {
         alternative: Some("stop and bisect the failing test".into()),
         verified: true,
         tag: None,
+        debate: None,
     }
 }
 

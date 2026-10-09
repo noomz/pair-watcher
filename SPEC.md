@@ -179,6 +179,8 @@ V98|`report` over a date range scans `sessions/*/` filtering on `session` start 
 V99|`report --export`: aggregate JSON (ratios with n, harness/model/version, Focus names) + only the rulings cited in exported wakes; shared by hand. Telemetry: off by default; `telemetry on` → weekly aggregate of the same ratios, never text/paths/repo names/prompts; built-in Focus names as-is, custom → `custom`; rulings as counts only (held, added, removed, cited); `preview` prints next payload; failed send dropped, no retry, nothing queued past 7 days.
 V101|Codex guardian review end with no `outcome` (`task_complete` lacking verdict, or guardian `turn_aborted`) → Codex asks human → re-arm 10 s blocked timer from that arrival. `allow` = tool runs, `deny` = rejection back to model (no human ask; repeated denies = `TooManyDenials` interrupt) → both not blocked.
 V102|Blocked wake never waits on in-flight normal wake: runs alongside it under own 60 s clock. hook→Escalation ≤ detection delay (Codex 10 s timer) + 60 s.
+V103|Concern list entry for Debate-closed Concern carries Debate outcome + Worker's last verdict reason (≤200 B, inside Concern list cap, V7). Watcher must not raise new Concern on a Debate-closed objection (watcher-concedes / withdrawn / unresolved / sided-*) unless new evidence answers that reason; model-judged, no code matching (V13, V22).
+V104|Cited hint verifies (V17, V19) when current History holds hint for same signature with count ≥ cited count; lower or absent → unverifiable.
 
 ## §T
 
@@ -204,9 +206,10 @@ T18|x|Metrics: human-correction prompt classifier for audit candidates (builder 
 T19|x|Claude mod band + mod pane: band mini + Buttons `1/2/3` (`band_digits`), mod pane Button rows + `p b h` + `y n d s u`; cursor = Up/Down over Button rows (settled); verify live how `d`/`p`/`y`/`n` target the focused row (mod-held current row, detail view, or Select); lowercase keys only (no `Z`, `P`; mod uses `/pw pause`)|V76,I8,I17
 T20|x|Opt-in Watcher backends: `claude -p` (MCP read tools via `pair-watcher mcp`, built-ins off, hooks off, env guard) and `codex exec` (read-only sandbox, `--output-schema`, `--ignore-user-config`); pane quota note; refuse pi subscription logins|V52,I15,C10
 T21|x|Live checks not yet run: Codex guardian `deny` outcome (timer/blocked semantics); blocked-wake latency per default model; real per-session cost (thinking tokens, tokenizer inflation); re-check pre-filter candidates still exist + System One shape|V48,V55,V56
-T22|.|Trial: unproductive-repetition scenario end-to-end on Claude, Codex, pi (6th review round with no new findings → repeat hint → approach-level Concern → verified Challenge → Debate → outcome/Escalation), Companion and Swarm; record results in ticket|V4,V16,V17,V26,V27,V31,V36
+T22|~|Trial: unproductive-repetition scenario end-to-end on Claude, Codex, pi (6th review round with no new findings → repeat hint → approach-level Concern → verified Challenge → Debate → outcome/Escalation), Companion and Swarm; record results in ticket|V4,V16,V17,V26,V27,V31,V36
 T23|.|Packaging: `dist` release binaries macOS/Linux, shell installer, Homebrew tap, `cargo install`; adapters embedded via `include_str!`|C6
 T24|x|Blocked-path fixes from T21 live: guardian no-verdict re-arms timer; blocked wake runs alongside in-flight normal wake; keep child stdout/stderr tail on headless timeout for diagnosis|V56,V87,V101,V102
+T25|x|T22 live fixes: Debate-closed Concern entries in wake input + no-reraise prompt rule; hint count-monotone verify; prompt concede rule = constraint verified in transcript/Task (V32); `claude -p` expired OAuth → Key (V86); invalid wake record keeps input + raw output (I10)|V7,V13,V17,V19,V32,V86,V103,V104,I10
 
 ## §B
 
@@ -214,3 +217,5 @@ id|date|cause|fix
 B1|2026-10-06|snapshot store `git add --all` under store `--git-dir` read store excludes, not Worker's: `.git/info/exclude` + repo-local `core.excludesFile` skipped → Worker-excluded files (`.env`) in snapshots + wake Diff to provider|V5
 B2|2026-10-09|guardian review aborted w/o verdict (input budget) → Codex falls back to human dialog; `task_started` already cancelled blocked timer → human block missed outside Herdr|V101
 B3|2026-10-09|blocked wake serialized behind in-flight normal wake (claude -p hung to 180 s clock) → hook→Escalation 167.8 s|V102
+B4|2026-10-09|resolved Concerns in wake input = id + headline only → Watcher unaware it conceded Debate → re-raised same objection as new id → fresh auto-Challenge (3 Challenges in 4 min)|V103
+B5|2026-10-09|hint re-verify required exact line; count grows each turn → stronger evidence judged unverifiable|V104

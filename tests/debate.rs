@@ -65,6 +65,7 @@ fn concern(severity: Severity) -> Concern {
         alternative: Some("stop and bisect".into()),
         verified: true,
         tag: None,
+        debate: None,
     }
 }
 

@@ -145,13 +145,18 @@ fn check(e: &Evidence, s: &Sources) -> Result<(), String> {
             });
             seen.then_some(()).ok_or_else(fail)
         }
-        // A whole repeat-hint line, as code wrote it.
+        // A repeat-hint line as code wrote it; its count only grows while the repeat goes on, so a
+        // hint for the same signature seen at least as often still backs it (V104).
         Evidence::Hint { excerpt } => {
             let want = norm(excerpt);
+            let cited = history::parse_hint(&want);
             s.history
                 .hints()
                 .iter()
-                .any(|l| *l == want || l.strip_prefix("hint:").map(str::trim) == Some(want.as_str()))
+                .any(|l| match (cited, history::parse_hint(l)) {
+                    (Some((sig, n)), Some((now, m))) => sig == now && m >= n,
+                    _ => *l == want || l.strip_prefix("hint:").map(str::trim) == Some(want.as_str()),
+                })
                 .then_some(())
                 .ok_or_else(|| format!("hint {}: not in this wake's history", quote(excerpt)))
         }

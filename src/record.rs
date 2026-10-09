@@ -31,7 +31,8 @@ pub struct WakeRecord {
     pub tree: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head: Option<String>,
-    /// The model's accepted answer; `None` when the wake failed or was skipped.
+    /// The model's last answer, also when invalid (I10); `None` when no answer came back or the
+    /// wake was skipped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
 }

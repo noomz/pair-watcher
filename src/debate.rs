@@ -824,12 +824,13 @@ impl Debate {
         out.push(
             match (&o.phase, o.n) {
                 (Phase::Owed(Verdict::Defend), 1) => {
-                    "Due: concede (the defence refutes the evidence or names a missed constraint) | rebut (only \
-                     with new ground answering its reason) | escalate (real trade-off only) | switched (its \
-                     actions changed approach)."
+                    "Due: concede (the defence refutes the evidence or names a missed constraint you can find in \
+                     the input) | rebut (only with new ground answering its reason) | escalate (real trade-off, \
+                     or a constraint only asserted) | switched (its actions changed approach)."
                 }
                 (Phase::Owed(Verdict::Defend), _) => {
-                    "Due, last word (no third message): concede | escalate (real trade-off only) | switched."
+                    "Due, last word (no third message): concede | escalate (real trade-off, or a constraint only \
+                     asserted) | switched."
                 }
                 (Phase::Owed(_), 1) => "No verdict line: code re-asks, unless its actions settle it (switched).",
                 (Phase::Owed(_), _) => "Still no verdict line: unresolved, unless its actions settle it (switched).",

@@ -369,6 +369,23 @@ fn poison_guard_skips_then_blind() {
     );
 }
 
+/// I10: an invalid answer is never a Concern, but its record keeps the raw text for diagnosis.
+#[test]
+fn invalid_answer_kept_in_record() {
+    let server = Server::start(|_| reply("Looks fine to me."));
+    let fx = Fx::new("companion", &server);
+    let mut w = fx.open();
+    fx.start();
+    fx.turn(1, "Done.");
+    fx.stop();
+    w.step(now()).unwrap();
+    let wake = &fx.wakes()[0];
+    assert_eq!(wake.outcome, Outcome::Invalid);
+    let rec = record::read(fx.mb.dir(), wake.record.as_deref().expect("record ref")).unwrap();
+    assert_eq!(rec.output.as_deref(), Some("Looks fine to me."));
+    assert!(w.board().concerns.all().is_empty());
+}
+
 /// V86, V89: a Key failure is BLIND at once, no retry.
 #[test]
 fn key_failure_is_blind() {

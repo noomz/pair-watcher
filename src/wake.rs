@@ -22,6 +22,8 @@ pub const PROMPT_CAP: usize = 6 * K;
 pub const TASK_CAP: usize = TASK_MAX;
 pub const CONCERNS_CAP: usize = 8 * K;
 pub const DEBATE_CAP: usize = 4 * K;
+/// The Worker's reason on a Debate-closed Concern (V103).
+const DEBATE_REASON_CAP: usize = 200;
 pub const DIGEST_CAP: usize = 4 * K;
 pub const RULINGS_CAP: usize = 2 * K;
 pub const TURN_CAP: usize = 16 * K;
@@ -258,7 +260,8 @@ fn history_section(before: &History, next: &History) -> String {
     (hints + &digest).trim_end().to_owned()
 }
 
-/// Open Concerns in full, dismissed/resolved as id + headline (V7). Over the cap: oldest resolved
+/// Open Concerns in full, dismissed/resolved as id + headline (V7); a Concern whose Debate ended
+/// also shows the outcome and the Worker's last reason (V103). Over the cap: oldest resolved
 /// dropped, then oldest open collapse to headline, then oldest dismissed dropped.
 fn concern_section(concerns: &[Concern], open_only: bool) -> String {
     let list: Vec<&Concern> = concerns.iter().filter(|c| !open_only || c.state == State::Open).collect();
@@ -287,10 +290,15 @@ fn concern_section(concerns: &[Concern], open_only: bool) -> String {
 }
 
 fn concern_line(c: &Concern, full: bool) -> String {
+    let settled = c.debate.as_ref().map(|d| match &d.reason {
+        Some(r) => format!("\n  Debate ended {}; Worker: \"{}\"", d.outcome, clip::head(r, DEBATE_REASON_CAP)),
+        None => format!("\n  Debate ended {}", d.outcome),
+    });
     if c.state != State::Open {
-        return format!("{} ({}) {}: {}", c.id, c.focus, c.state.name(), c.headline);
+        return format!("{} ({}) {}: {}{}", c.id, c.focus, c.state.name(), c.headline, settled.unwrap_or_default());
     }
     let mut line = format!("{} [{}] ({}) {}", c.id, c.severity.name(), c.focus, c.headline);
+    line.push_str(&settled.unwrap_or_default());
     if full {
         for d in &c.detail {
             line.push_str(&format!("\n  {d}"));
