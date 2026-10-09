@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 
+use serde::Serialize;
 use unicode_width::UnicodeWidthChar;
 
 use crate::budget::Stage;
@@ -18,7 +19,8 @@ const EVENT_COL: usize = 17;
 const DEBATE_TAIL: usize = 2;
 const TICKER_LINES: usize = 2;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Style {
     Plain,
     Dim,
@@ -33,7 +35,7 @@ pub enum Style {
     Banner,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Span {
     pub style: Style,
     pub text: String,
@@ -105,6 +107,23 @@ pub struct Input {
     pub text: String,
 }
 
+/// Whose keys the hints name: the standalone pane's or the Claude mod pane's (I17).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Keys {
+    #[default]
+    Standalone,
+    Mod,
+}
+
+impl Keys {
+    fn pick(self, standalone: &'static str, by_mod: &'static str) -> &'static str {
+        match self {
+            Keys::Standalone => standalone,
+            Keys::Mod => by_mod,
+        }
+    }
+}
+
 /// Pane-local view state; never written anywhere (V70).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Ui {
@@ -120,11 +139,15 @@ pub struct Ui {
     pub input: Option<Input>,
     /// A local line for the ticker (a refused key), newest.
     pub note: Option<String>,
+    pub keys: Keys,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Frame {
     pub lines: Vec<Line>,
+    /// Per line: the selectable item it draws (NEEDS YOU, Concern or CLOSED row), for the mod pane's
+    /// Button rows.
+    pub items: Vec<Option<String>>,
     /// Concern ids whose row is on screen (V69 `shown`).
     pub visible: Vec<String>,
     /// Selectable ids in screen order (`j`/`k`).
@@ -144,12 +167,14 @@ struct Row {
     line: Line,
     prio: u8,
     concern: Option<String>,
+    /// The selectable item this line draws.
+    item: Option<String>,
     /// A NEEDS YOU item: outranks the `… more` marker when even protected rows overflow.
     needs: bool,
 }
 
 fn row(line: Line, prio: u8) -> Row {
-    Row { line, prio, concern: None, needs: false }
+    Row { line, prio, concern: None, item: None, needs: false }
 }
 
 pub fn layout(b: &Board, ui: &Ui, width: usize, rows: usize) -> Frame {
@@ -158,11 +183,14 @@ pub fn layout(b: &Board, ui: &Ui, width: usize, rows: usize) -> Frame {
         return Frame::default();
     }
     let order = selectable(b, ui);
-    let selected = ui.selected.clone().filter(|s| order.contains(s)).or_else(|| order.first().cloned());
+    // The mod pane selects only the row the human focused; the standalone pane starts on the first.
+    let first = (ui.keys == Keys::Standalone).then(|| order.first().cloned()).flatten();
+    let selected = ui.selected.clone().filter(|s| order.contains(s)).or(first);
     if rows <= 2 {
-        let mut lines = vec![mini(b, width)];
+        let mut lines = vec![mini(b, ui.keys, width)];
         lines.resize(rows, Line::default());
-        return Frame { lines, visible: Vec::new(), order, selected };
+        let items = vec![None; rows];
+        return Frame { lines, items, visible: Vec::new(), order, selected };
     }
     let mut top = header(b, ui, width);
     if let Some(strip) = strip(b, width) {
@@ -194,10 +222,11 @@ pub fn layout(b: &Board, ui: &Ui, width: usize, rows: usize) -> Frame {
     if top.len() + keep > rows && ui.overlay == Overlay::None {
         body = board(b, ui, selected.as_deref(), width, true);
     }
-    let (body, visible) = fit(body, rows.saturating_sub(top.len() + bottom.len()));
+    let (body, body_items, visible) = fit(body, rows.saturating_sub(top.len() + bottom.len()));
+    let items = top.iter().map(|_| None).chain(body_items).chain(bottom.iter().map(|_| None)).collect();
     let lines = top.into_iter().chain(body).chain(bottom).collect();
     let visible = if ui.overlay == Overlay::None { visible } else { Vec::new() };
-    Frame { lines, visible, order, selected }
+    Frame { lines, items, visible, order, selected }
 }
 
 /// Ids `j`/`k` move over: NEEDS YOU, IN DEBATE, OPEN, then CLOSED when expanded.
@@ -252,7 +281,8 @@ fn header(b: &Board, ui: &Ui, width: usize) -> Vec<Line> {
             money(&b.budget, true),
             money(&b.budget, false)
         );
-        return banner(&[first, "  press $ to add $5 and resume".to_owned()], width);
+        let press = ui.keys.pick("  press $ to add $5 and resume", "  press b to add $5 and resume");
+        return banner(&[first, press.to_owned()], width);
     }
     let (word, style) = if b.ended {
         ("■ session ended".to_owned(), Style::Dim)
@@ -358,14 +388,17 @@ fn board(b: &Board, ui: &Ui, selected: Option<&str>, width: usize, compact: bool
         // The header goes before any item does (V65).
         // `y`/`n` rule an unresolved Debate only; a blocked one is answered in the Worker (V72).
         let unresolved = needs.iter().any(|e| e.cause == Cause::Unresolved);
-        let hints = if unresolved { "y · n · d · u · +" } else { "d · u · +" };
+        let hints = match (unresolved, ui.keys) {
+            (true, keys) => keys.pick("y · n · d · u · +", "y · n · d · u · h"),
+            (false, keys) => keys.pick("d · u · +", "d · u · h"),
+        };
         out.push(row(section("NEEDS YOU", needs.len(), hints, width), 1));
         for e in needs {
             let at = b.raised.get(&e.id).map(|t| b.time(*t)).unwrap_or_default();
             if compact {
                 let mark = if sel(&e.id) { "›" } else { " " };
                 let line = Line::one(Style::RedBold, cut(&format!("{mark}▲ {at} {}", e.title), width));
-                out.push(Row { needs: true, ..row(line, 0) });
+                out.push(Row { needs: true, item: Some(e.id.clone()), ..row(line, 0) });
                 continue;
             }
             let inner = width - 4;
@@ -383,7 +416,8 @@ fn board(b: &Board, ui: &Ui, selected: Option<&str>, width: usize, compact: bool
                 let fill = " ".repeat(inner.saturating_sub(l.width()));
                 let mut line = Line::one(Style::Red, format!("┃{}", if i == 0 { mark } else { " " }));
                 line.0.extend(l.0);
-                out.push(row(line.push(Style::Plain, fill).push(Style::Red, " ┃"), 0));
+                let line = line.push(Style::Plain, fill).push(Style::Red, " ┃");
+                out.push(Row { item: Some(e.id.clone()), ..row(line, 0) });
             }
             out.push(row(Line::one(Style::Red, format!("┗{}┛", "━".repeat(width - 2))), 0));
         }
@@ -391,7 +425,10 @@ fn board(b: &Board, ui: &Ui, selected: Option<&str>, width: usize, compact: bool
 
     let debate: Vec<&Concern> = debating(b, ui).collect();
     if !debate.is_empty() {
-        out.push(row(section("IN DEBATE", debate.len(), "y · n · d · ⏎ log · +", width), 1));
+        out.push(row(
+            section("IN DEBATE", debate.len(), ui.keys.pick("y · n · d · ⏎ log · +", "y · n · d · ⏎ log · h"), width),
+            1,
+        ));
         for c in debate {
             out.extend(concern_row(b, c, sel(&c.id), width, 0, compact));
             let entries = b.info.get(&c.id).map(|i| i.entries.as_slice()).unwrap_or_default();
@@ -417,7 +454,7 @@ fn board(b: &Board, ui: &Ui, selected: Option<&str>, width: usize, compact: bool
 
     let open = open(b, ui);
     if !open.is_empty() {
-        out.push(row(section("OPEN", open.len(), "d · P · + · m", width), 2));
+        out.push(row(section("OPEN", open.len(), ui.keys.pick("d · P · + · m", "d · p · h"), width), 2));
         for c in open {
             let selected = sel(&c.id);
             out.extend(concern_row(b, c, selected, width, if selected { 0 } else { 2 }, compact));
@@ -434,7 +471,7 @@ fn board(b: &Board, ui: &Ui, selected: Option<&str>, width: usize, compact: bool
 
     let closed = closed(b, ui);
     if !closed.is_empty() {
-        out.push(row(section("CLOSED", closed.len(), "c · s", width), 4));
+        out.push(row(section("CLOSED", closed.len(), ui.keys.pick("c · s", "s"), width), 4));
         if ui.closed {
             for (c, end) in closed {
                 let selected = sel(&c.id);
@@ -443,7 +480,8 @@ fn board(b: &Board, ui: &Ui, selected: Option<&str>, width: usize, compact: bool
                     .push(Style::Dim, format!("{end} "))
                     .push(Style::Dim, c.headline.clone());
                 let line = clip_line(line, width);
-                out.push(Row { line, prio: if selected { 0 } else { 4 }, concern: Some(c.id.clone()), needs: false });
+                let (prio, item) = (if selected { 0 } else { 4 }, Some(c.id.clone()));
+                out.push(Row { line, prio, concern: item.clone(), item, needs: false });
                 if selected && !compact {
                     for e in b.info.get(&c.id).map(|i| i.entries.as_slice()).unwrap_or_default() {
                         out.extend(entry(b, e, width, true, Style::Dim).into_iter().map(|l| row(l, 1)));
@@ -477,7 +515,7 @@ fn concern_row(b: &Board, c: &Concern, selected: bool, width: usize, prio: u8, c
             } else {
                 Line::one(base, l)
             };
-            Row { line, prio, concern: Some(c.id.clone()), needs: false }
+            Row { line, prio, concern: Some(c.id.clone()), item: Some(c.id.clone()), needs: false }
         })
         .collect()
 }
@@ -534,7 +572,7 @@ fn ticker(b: &Board, ui: &Ui, width: usize) -> Vec<Line> {
 
 /// Drops the most trimmable rows, bottom first, until the body fits `rows`, leaving a
 /// `… n more lines` marker; rows with priority 0 always stay (V65). Pads to `rows`.
-fn fit(mut body: Vec<Row>, rows: usize) -> (Vec<Line>, Vec<String>) {
+fn fit(mut body: Vec<Row>, rows: usize) -> (Vec<Line>, Vec<Option<String>>, Vec<String>) {
     let mut dropped = 0;
     if body.len() > rows {
         let target = rows.saturating_sub(1);
@@ -558,23 +596,29 @@ fn fit(mut body: Vec<Row>, rows: usize) -> (Vec<Line>, Vec<String>) {
             visible.push(c);
         }
     }
-    let mut lines: Vec<Line> = body.into_iter().map(|r| r.line).collect();
+    let (mut lines, mut items): (Vec<Line>, Vec<Option<String>>) = body.into_iter().map(|r| (r.line, r.item)).unzip();
     if dropped > 0 && lines.len() < rows {
         lines.push(Line::one(Style::Dim, format!("  … {dropped} more lines")));
     }
     lines.resize(rows, Line::default());
-    (lines, visible)
+    items.resize(rows, None);
+    (lines, items, visible)
 }
 
 /// One line by priority: PAUSED = full BLIND > NEEDS YOU > partial BLIND / lagging > in Debate >
 /// watching (V66).
-fn mini(b: &Board, width: usize) -> Line {
+fn mini(b: &Board, keys: Keys, width: usize) -> Line {
     let (style, text) = if let Some((_, reason)) = b.blind.get(&None) {
         (Style::Banner, format!("‖ BLIND — {reason}; not watching"))
     } else if b.budget.stage() == Stage::Paused && !b.ended {
         (
             Style::Banner,
-            format!("‖ PAUSED {}/{} — not watching · $ +$5", money(&b.budget, true), money(&b.budget, false)),
+            format!(
+                "‖ PAUSED {}/{} — not watching · {}",
+                money(&b.budget, true),
+                money(&b.budget, false),
+                keys.pick("$ +$5", "b +$5")
+            ),
         )
     } else if let Some(e) = b.needs_you().next() {
         let more = b.needs_you().count() - 1;
@@ -585,7 +629,7 @@ fn mini(b: &Board, width: usize) -> Line {
     } else if let Some(since) = b.lagging.values().next() {
         (Style::Yellow, format!("◐ lagging since {} · retrying", b.time(*since)))
     } else if b.user_paused {
-        (Style::Yellow, "‖ PAUSED (you) · Z resumes".to_owned())
+        (Style::Yellow, keys.pick("‖ PAUSED (you) · Z resumes", "‖ PAUSED (you) · /pw pause resumes").to_owned())
     } else if let Some(id) = b.in_debate() {
         let head = b.concerns.get(id).map(|c| c.headline.as_str()).unwrap_or_default();
         let state = match (&b.pending, b.debate.open()) {

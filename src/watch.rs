@@ -162,6 +162,24 @@ pub struct Launch {
     pub only: Vec<String>,
 }
 
+/// A boolean config key as this session resolves it: its `run` flags over the config layers of
+/// the session's repo (V79). `default` when unset or unreadable.
+pub fn session_flag(
+    home: &Home,
+    mailbox: &Mailbox,
+    records: &[crate::jsonl::Record<Event>],
+    key: &str,
+    default: bool,
+) -> bool {
+    let start =
+        records.iter().find(|r| r.body.k == crate::event::Kind::Session && r.body.str("phase") == Some("start"));
+    let repo = start.and_then(|r| r.body.str("repo")).and_then(|r| repo::discover(Path::new(r)));
+    let launch: Launch = read_json(&mailbox.dir().join(LAUNCH_FILE)).ok().flatten().unwrap_or_default();
+    let env = |var: &str| std::env::var(var).ok();
+    let sources = crate::config::Sources { home, repo: repo.as_ref(), env: &env, flags: &launch.flags };
+    crate::config::resolve(&sources).ok().and_then(|r| r.get(key).and_then(toml::Value::as_bool)).unwrap_or(default)
+}
+
 pub fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<Option<T>> {
     match fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(io::Error::other),

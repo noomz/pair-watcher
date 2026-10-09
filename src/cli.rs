@@ -374,6 +374,32 @@ enum AdapterCmd {
         route: AdapterRoute,
         #[arg(long)]
         worker: AdapterWorker,
+        /// Claude mod band width: adds `board.band` (mini line, digit ask, last ruling)
+        #[arg(long)]
+        band: Option<usize>,
+        /// Claude mod pane `<columns>x<rows>`: adds `board.pane`
+        #[arg(long, value_parser = pane_size)]
+        pane: Option<(usize, usize)>,
+        /// The mod pane's focused row
+        #[arg(long)]
+        selected: Option<String>,
+        /// Rows whose Debate log is expanded
+        #[arg(long)]
+        expanded: Vec<String>,
+    },
+    /// A Claude mod pane key (`p b h y n d s u`) or band Button (`1 2 3 u`); prints why it was refused
+    Press {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        key: char,
+        #[arg(long)]
+        band: bool,
+        #[arg(long)]
+        selected: Option<String>,
+        /// `p`: the one-line remark delivered with the promotion (V20)
+        #[arg(long, default_value = "")]
+        remark: String,
     },
     /// The claimed item was handed to the Worker
     Ack {
@@ -429,17 +455,20 @@ fn adapter(args: &[String]) -> ExitCode {
     };
     let session = match &cmd {
         AdapterCmd::Poll { session, .. }
+        | AdapterCmd::Press { session, .. }
         | AdapterCmd::Ack { session, .. }
         | AdapterCmd::Release { session, .. }
         | AdapterCmd::Pw { session, .. } => session,
     };
-    let Some(mailbox) = Home::from_env().ok().and_then(|home| Mailbox::open_registered(&home, session)) else {
+    let Some((home, mailbox)) =
+        Home::from_env().ok().and_then(|home| Mailbox::open_registered(&home, session).map(|m| (home, m)))
+    else {
         return ExitCode::SUCCESS;
     };
     let now = now_ms();
     let ack = matches!(cmd, AdapterCmd::Ack { .. });
     let result = match cmd {
-        AdapterCmd::Poll { route, worker, .. } => {
+        AdapterCmd::Poll { route, worker, band, pane, selected, expanded, .. } => {
             let route = match route {
                 AdapterRoute::Mod => Route::Mod,
                 AdapterRoute::Pi => Route::PiFollowUp,
@@ -450,9 +479,20 @@ fn adapter(args: &[String]) -> ExitCode {
                 AdapterWorker::Draft => Worker::Draft,
             };
             delivery::poll(&mailbox, route, worker, now).and_then(|poll| {
-                println!("{}", serde_json::to_string(&poll)?);
+                let mut out = serde_json::to_value(&poll)?;
+                if band.is_some() || pane.is_some() {
+                    let view = mod_view(&home, &mailbox, band, pane, selected, &expanded)?;
+                    out["board"] = serde_json::to_value(view)?;
+                }
+                println!("{out}");
                 Ok(())
             })
+        }
+        AdapterCmd::Press { key, band, selected, remark, .. } => {
+            if let Err(why) = pane::mod_press(&mailbox, band, key, selected, &remark, now) {
+                println!("{why}");
+            }
+            Ok(())
         }
         AdapterCmd::Ack { id, token, .. } | AdapterCmd::Release { id, token, .. } => {
             let outbox = mailbox.outbox();
@@ -478,6 +518,27 @@ fn adapter(args: &[String]) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => fail(&e.to_string()),
     }
+}
+
+/// What the Claude mod draws this poll (I8).
+fn mod_view(
+    home: &Home,
+    mailbox: &Mailbox,
+    band: Option<usize>,
+    pane: Option<(usize, usize)>,
+    selected: Option<String>,
+    expanded: &[String],
+) -> std::io::Result<pane::ModView> {
+    let records = mailbox.log().read_from(0)?.records;
+    let mut board = pane::Board::rebuild(crate::term::local_offset(), &records);
+    board.pending = delivery::pending(&board.challenges, &board.debate, board.observe_only, mailbox)?;
+    let digits = band.is_some() && crate::watch::session_flag(home, mailbox, &records, "band_digits", true);
+    Ok(pane::mod_view(&board, band.map(|w| (w, digits)), pane, selected, expanded))
+}
+
+fn pane_size(s: &str) -> Result<(usize, usize), String> {
+    let (w, h) = s.split_once('x').ok_or("expected <columns>x<rows>")?;
+    Ok((w.parse().map_err(|_| "bad columns")?, h.parse().map_err(|_| "bad rows")?))
 }
 
 /// `--session`, else the only live session in the current repo (I1).

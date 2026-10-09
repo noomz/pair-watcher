@@ -14,7 +14,7 @@ use pair_watcher::event::{Event, EventLog, Kind};
 use pair_watcher::home::Home;
 use pair_watcher::human::Act;
 use pair_watcher::jsonl::Record;
-use pair_watcher::layout::{Frame, Overlay, Style, Ui, layout, wrap};
+use pair_watcher::layout::{Frame, Keys, Overlay, Style, Ui, layout, wrap};
 use pair_watcher::mailbox::{self, Mailbox};
 use pair_watcher::outbox::{Item, ItemKind, Outbox};
 use pair_watcher::output::Decision;
@@ -724,4 +724,135 @@ fn f_requests_the_primary_model() {
     assert_eq!(pane::key(&b, &mut ui, &f, Key::Char('F'), 0), Effect::Append(vec![Act::Primary.event()]));
     b.apply(&Record::now(Act::Primary.event()));
     assert_eq!(b.primary_asked, 1);
+}
+
+// §T19 Claude mod band + mod pane (I8, I17, V76).
+
+fn mod_ui() -> Ui {
+    Ui { keys: Keys::Mod, ..Ui::default() }
+}
+
+#[test]
+fn mod_pane_hints_name_the_mod_keys() {
+    let b = Fx::escalated().board();
+    for width in WIDTHS {
+        let text = texts(&layout(&b, &mod_ui(), width, 40));
+        assert!(text.contains("y · n · d · u · h"), "{width}: {text}");
+        assert!(text.contains("d · p · h"), "{width}: {text}");
+        assert!(!text.contains("d · P · + · m"), "{width}: {text}");
+    }
+    let mut paused = Fx::repetition();
+    paused.at(12, 0, StatusOp::UserPause.event());
+    let mini = texts(&layout(&paused.board(), &mod_ui(), 64, 1));
+    assert!(mini.contains("/pw pause resumes"), "{mini}");
+}
+
+#[test]
+fn every_selectable_row_is_tagged_with_its_item() {
+    let b = Fx::escalated().board();
+    for width in WIDTHS {
+        let f = layout(&b, &mod_ui(), width, 40);
+        assert_eq!(f.items.len(), f.lines.len());
+        for id in &f.order {
+            let first = f.items.iter().position(|i| i.as_deref() == Some(id.as_str())).expect("row drawn");
+            let line = f.lines[first].plain();
+            assert!(line.contains(id.as_str()) || line.contains('▲'), "{id}: {line}");
+        }
+        // Box borders, headers and the ticker are not rows.
+        let header = f.lines.iter().position(|l| l.plain().starts_with("NEEDS YOU")).unwrap();
+        assert_eq!(f.items[header], None);
+        assert_eq!(f.items[header + 1], None, "box top border");
+    }
+}
+
+#[test]
+fn mod_keys_map_onto_the_standalone_ones() {
+    assert_eq!(pane::mod_key('b'), Some(Key::Char('$')));
+    assert_eq!(pane::mod_key('h'), Some(Key::Char('+')));
+    for c in ['y', 'n', 'd', 's', 'u'] {
+        assert_eq!(pane::mod_key(c), Some(Key::Char(c)));
+    }
+    for c in ['p', 'P', 'Z', 'm', 'j', '$', '+'] {
+        assert_eq!(pane::mod_key(c), None, "{c}");
+    }
+}
+
+#[test]
+fn mod_p_promotes_the_focused_concern_with_its_remark() {
+    let b = Fx::repetition().board();
+    let mut ui = Ui { selected: Some("c1".into()), ..mod_ui() };
+    let f = layout(&b, &ui, 64, 30);
+    assert_eq!(
+        pane::promote(&b, &mut ui, &f, "too slow", 0),
+        Effect::Append(vec![Act::Promote { id: "c1".into(), remark: Some("too slow".into()) }.event()])
+    );
+    let mut ui = Ui { selected: Some("c1".into()), ..mod_ui() };
+    assert_eq!(
+        pane::promote(&b, &mut ui, &f, " ", 0),
+        Effect::Append(vec![Act::Promote { id: "c1".into(), remark: None }.event()])
+    );
+}
+
+#[test]
+fn mod_rulings_are_logged_from_the_mod_pane() {
+    let b = Fx::escalated().board();
+    let mut ui = Ui { selected: Some("e1".into()), ..mod_ui() };
+    let f = layout(&b, &ui, 64, 40);
+    let Effect::Append(events) = pane::key(&b, &mut ui, &f, Key::Char('y'), at(12, 5)) else { panic!("{:?}", ui.note) };
+    assert_eq!((events[0].str("surface"), events[0].str("via")), (Some("mod-pane"), Some("key")));
+}
+
+#[test]
+fn band_asks_the_first_needs_you_only_with_band_digits() {
+    let b = Fx::escalated().board();
+    let view = pane::mod_view(&b, Some((60, true)), None, None, &[]);
+    let band = view.band.expect("band");
+    let ask = band.ask.expect("ask");
+    assert_eq!((ask.id.as_str(), ask.sides), ("e1", true));
+    assert!(band.mini.iter().any(|s| s.text.contains("Debate unresolved")), "{:?}", band.mini);
+    assert!(view.opens, "V67");
+    assert!(view.pane.is_none());
+    let off = pane::mod_view(&b, Some((60, false)), None, None, &[]).band.unwrap();
+    assert_eq!(off.ask, None, "V76: band_digits = false");
+    // A blocked Escalation: no sides, `3` dismiss only (V72).
+    let blocked = nasty().board();
+    let ask = pane::mod_view(&blocked, Some((60, true)), None, None, &[]).band.unwrap().ask.unwrap();
+    assert!(!ask.sides);
+}
+
+#[test]
+fn band_digits_rule_on_the_band_item_and_show_the_ruling() {
+    let mut f = Fx::escalated();
+    let b = f.board();
+    let ruled = pane::band(&b, '1', at(12, 5)).unwrap();
+    assert_eq!(
+        (ruled.str("id"), ruled.str("side"), ruled.str("via"), ruled.str("surface")),
+        (Some("e1"), Some("watcher"), Some("band"), Some("band"))
+    );
+    assert!(pane::band(&b, '4', 0).is_err());
+    f.at(12, 5, ruled);
+    let band = pane::mod_view(&f.board(), Some((60, true)), None, None, &[]).band.unwrap();
+    assert_eq!(band.ask, None, "ruled: NEEDS YOU closed");
+    assert_eq!(band.ruled.as_deref(), Some("e1 → Watcher"));
+    assert!(pane::band(&f.board(), '2', 0).is_err(), "nothing left to rule");
+}
+
+#[test]
+fn quiet_session_does_not_open_the_mod_pane() {
+    let b = Fx::new().board();
+    let view = pane::mod_view(&b, Some((60, true)), Some((64, 20)), None, &[]);
+    assert!(!view.opens, "V67");
+    let pane = view.pane.unwrap();
+    assert!(pane.order.is_empty() && pane.items.iter().all(Option::is_none));
+}
+
+#[test]
+fn mod_pane_selects_only_the_focused_row() {
+    let b = Fx::escalated().board();
+    assert_eq!(layout(&b, &mod_ui(), 64, 40).selected, None);
+    assert!(!texts(&layout(&b, &mod_ui(), 64, 40)).contains('›'));
+    let gone = Ui { selected: Some("zz".into()), ..mod_ui() };
+    assert_eq!(layout(&b, &gone, 64, 40).selected, None);
+    let c1 = Ui { selected: Some("c1".into()), ..mod_ui() };
+    assert_eq!(layout(&b, &c1, 64, 40).selected.as_deref(), Some("c1"));
 }

@@ -16,7 +16,8 @@ function world(on: any, answer: object, box: string | string[] = '', stderr = ''
   const statuses: (string | undefined)[] = []
   on('process.run', (_$: any, e: Run) => {
     runs.push({ argv: e.argv })
-    const stdout = e.argv[2] === 'poll' ? JSON.stringify(answer) : ''
+    // `press` answers with `answer.press`: a refusal line, or nothing.
+    const stdout = e.argv[2] === 'poll' ? JSON.stringify(answer) : e.argv[2] === 'press' ? ((answer as any).press ?? '') : ''
     return { value: { exitCode: stderr ? 2 : 0, stdout, stderr, isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('prompt.read', () => {
@@ -34,7 +35,6 @@ function world(on: any, answer: object, box: string | string[] = '', stderr = ''
     statuses.push(e.text)
     return { value: undefined }
   })
-  on('ui.invalidate', () => ({ value: undefined }))
   on('command.register', () => ({ value: undefined }))
   on('session.start', (_$: any, e: { cwd: string }) => ({ cwd: e.cwd }))
   on('turn.start', (_$: any, e: { turnId: string }) => ({ turnId: e.turnId }))
@@ -45,7 +45,9 @@ function world(on: any, answer: object, box: string | string[] = '', stderr = ''
 }
 
 const start = ($: any) => $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
-const polls = (runs: Run[]) => runs.filter(r => r.argv[2] === 'poll').map(r => r.argv.slice(3))
+// The delivery part of each poll: what precedes the band and pane layout args.
+const polls = (runs: Run[]) =>
+  runs.filter(r => r.argv[2] === 'poll').map(r => r.argv.slice(3, r.argv.indexOf('--band')))
 
 describe('idle delivery (V25, V26, I8)', () => {
   test('idle with an empty box: submit the claimed item, then ack it', async ($, on) => {
@@ -174,5 +176,154 @@ describe('commands return {} (I8)', () => {
     } as any)
     const texts = (await ui.findAll({ type: 'Text' })).map((t: { text: string }) => t.text).join('\n')
     expect(texts).toContain('off-by-one in the pager')
+  })
+})
+
+// §T19: the band (mini + Buttons 1/2/3, V76) and the mod pane (Button rows, keys p b h y n d s u).
+const MINI = [{ style: 'red_bold', text: '▲ Debate unresolved: 5th review round (c2)' }]
+const ASK = { id: 'e1', title: 'Debate unresolved: 5th review round (c2)', sides: true }
+const PANE_BOARD = {
+  opens: true,
+  band: { mini: MINI, ask: ASK },
+  pane: {
+    lines: [
+      [{ style: 'bold', text: 'NEEDS YOU 1 ' }],
+      [{ style: 'red', text: '┃ ' }, { style: 'red_bold', text: '▲ 12:00 Debate unresolved' }],
+      [{ style: 'plain', text: '  Watcher (approach): run the failing test' }],
+      [{ style: 'bold', text: 'OPEN 1 ' }],
+      [{ style: 'plain', text: '  c1 ' }, { style: 'dim', text: 'note' }, { style: 'plain', text: ' [correctness] Retry loop' }],
+    ],
+    items: [null, 'e1', 'e1', null, 'c1'],
+    order: ['e1', 'c1'],
+    selected: 'e1',
+  },
+}
+const BAND_PROPS = { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 70, scroll: { offset: 0, bodyRows: 10 }, view: {} }
+const PANE_PROPS = { title: 'pair-watcher', isFocused: true, bodyColumns: 66, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} }
+
+const presses = (runs: Run[]) => runs.filter(r => r.argv[2] === 'press').map(r => r.argv.slice(3))
+
+function opens(on: any) {
+  const opened: string[] = []
+  on('ui.open', (_$: any, e: { id: string }) => {
+    opened.push(e.id)
+    return { value: { isPlaced: true } }
+  })
+  on('ui.focus', () => ({}))
+  return opened
+}
+
+const band = ($: any) =>
+  $.ui.mount({ plugin: 'pair-watcher', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS } as any)
+const pane = ($: any) =>
+  $.ui.mount({ plugin: 'pair-watcher', surface: 'terminal', component: 'Pane', requestId: 'commentary', props: PANE_PROPS } as any)
+
+describe('band (I8, I17, V76)', () => {
+  test('mini line and digit Buttons; 1 rules for the Watcher from the band', async ($, on) => {
+    const w = world(on, { status: null, commentary: [], item: null, board: { opens: true, band: { mini: MINI, ask: ASK } } })
+    opens(on)
+    await start($)
+    await w.tick()
+    expect(polls(w.runs)[0]).toEqual(['--session', 's1', '--route', 'mod', '--worker', 'idle'])
+    expect(w.runs.find(r => r.argv[2] === 'poll')?.argv.slice(9)).toEqual(['--band', '80'])
+    const ui = await band($)
+    const texts = (await ui.findAll({ type: 'Text' })).map((t: { text: string }) => t.text).join('\n')
+    expect(texts).toContain('Debate unresolved')
+    const buttons = await ui.findAll({ type: 'Button' })
+    expect(buttons.map((b: any) => [b.key, b.props.hotkey, b.props.label])).toEqual([
+      ['band:1', '1', 'Watcher'],
+      ['band:2', '2', 'Worker'],
+      ['band:3', '3', 'dismiss'],
+    ])
+    await ui.press({ key: 'band:1' })
+    expect(presses(w.runs)).toEqual([['--session', 's1', '--key', '1', '--band']])
+  })
+
+  test('no digit Buttons while the human has a draft (V76)', async ($, on) => {
+    const w = world(on, { status: null, commentary: [], item: null, board: { opens: true, band: { mini: MINI, ask: ASK } } }, 'half-typed')
+    opens(on)
+    await start($)
+    await w.tick()
+    expect(await (await band($)).findAll({ type: 'Button' })).toEqual([])
+  })
+
+  test('a blocked Escalation offers 3 only (V72)', async ($, on) => {
+    const blocked = { ...ASK, sides: false }
+    const w = world(on, { status: null, commentary: [], item: null, board: { opens: true, band: { mini: MINI, ask: blocked } } })
+    opens(on)
+    await start($)
+    await w.tick()
+    expect((await (await band($)).findAll({ type: 'Button' })).map((b: any) => b.key)).toEqual(['band:3'])
+  })
+
+  test('after a ruling: `<id> → <side> · u undo` until the human prompts again', async ($, on) => {
+    const w = world(on, { status: null, commentary: [], item: null, board: { opens: true, band: { mini: MINI, ruled: 'e1 → Watcher' } } })
+    opens(on)
+    await start($)
+    await w.tick()
+    const ui = await band($)
+    expect((await ui.find({ type: 'Text', text: /e1 → Watcher · / }))).toBeDefined()
+    await ui.press({ key: 'band:u' })
+    expect(presses(w.runs)).toEqual([['--session', 's1', '--key', 'u', '--band']])
+    await $.prompt.submit({ text: 'carry on' })
+    await w.tick()
+    expect(await (await band($)).findAll({ type: 'Button' })).toEqual([])
+  })
+})
+
+describe('mod pane (I8, I17, V67)', () => {
+  test('opens itself on the first Concern, Escalation or BLIND', async ($, on) => {
+    const answer: any = { status: null, commentary: [], item: null, board: { opens: false, band: { mini: MINI } } }
+    const w = world(on, answer)
+    const opened = opens(on)
+    await start($)
+    await w.tick()
+    expect(opened).toEqual([])
+    answer.board = PANE_BOARD
+    await w.tick()
+    await w.tick()
+    expect(opened).toEqual(['commentary'])
+  })
+
+  test('Board rows are Buttons; keys act on the focused row; p asks for a remark', async ($, on) => {
+    const w = world(on, { status: null, commentary: [], item: null, board: PANE_BOARD })
+    opens(on)
+    await start($)
+    await w.tick()
+    const ui = await pane($)
+    // The drawn size goes to the binary for the layout.
+    await w.tick()
+    expect(w.runs.filter(r => r.argv[2] === 'poll').at(-1)?.argv).toContain('64x28')
+    const rows = (await ui.findAll({ type: 'Button' })).map((b: any) => b.key)
+    expect(rows).toEqual(['row:e1', 'row:c1', 'key:p', 'key:b', 'key:h', 'key:y', 'key:n', 'key:d', 'key:s', 'key:u'])
+    const keys = (await ui.findAll({ type: 'Button' })).filter((b: any) => b.key.startsWith('key:'))
+    expect(keys.map((b: any) => b.props.hotkey).join('')).toBe('pbhynd su'.replace(' ', ''))
+
+    // The ring lands on the c1 row: `h` and `d` act on c1.
+    await $.ui.focus({ component: 'Pane', requestId: 'commentary', plugin: 'pair-watcher', element: 'row:c1', origin: { kind: 'person' } } as any)
+    expect(w.runs.filter(r => r.argv[2] === 'poll').at(-1)?.argv).toContain('c1')
+    await ui.press({ key: 'key:h' })
+    expect(presses(w.runs).at(-1)).toEqual(['--session', 's1', '--key', 'h', '--selected', 'c1'])
+
+    // `p`: the remark Input, then the promotion with it (V20).
+    await ui.press({ key: 'key:p' })
+    expect(presses(w.runs)).toHaveLength(1)
+    await ui.input({ key: 'remark', text: ' too slow ' })
+    expect(presses(w.runs).at(-1)).toEqual(['--session', 's1', '--key', 'p', '--selected', 'c1', '--remark', 'too slow'])
+    expect(await ui.find({ type: 'Input' })).toBeUndefined()
+
+    // Enter on a row: its Debate log expands.
+    await ui.press({ key: 'row:e1' })
+    expect(w.runs.filter(r => r.argv[2] === 'poll').at(-1)?.argv.slice(-4)).toEqual(['--selected', 'e1', '--expanded', 'e1'])
+  })
+
+  test('a refused key shows on the status line', async ($, on) => {
+    const w = world(on, { status: null, commentary: [], item: null, board: PANE_BOARD, press: 'nothing selected\n' })
+    opens(on)
+    await start($)
+    await w.tick()
+    const ui = await pane($)
+    await ui.press({ key: 'key:d' })
+    expect(w.statuses).toContain('nothing selected')
   })
 })

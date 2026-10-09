@@ -7,6 +7,8 @@ use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
+
 use crate::budget::{self, Budget, Stage};
 use crate::challenge::{Challenges, Op as ChallengeOp, Origin};
 use crate::concern::{Change, ConcernList, Resolution, State, Tag};
@@ -16,7 +18,7 @@ use crate::escalation::{self, Escalations, Op as EscalationOp};
 use crate::event::{Event, Kind};
 use crate::human::{self, Act};
 use crate::jsonl::Record;
-use crate::layout::{Frame, Input, Overlay, Ui, layout};
+use crate::layout::{Frame, Input, Keys, Overlay, Span, Ui, layout};
 use crate::mailbox::Mailbox;
 use crate::outbox::Outbox;
 use crate::ruling::{self, Cx, Op as RulingOp, Ruled, Rulings, Side, Stage as RulingStage, Standing, Surface, Via};
@@ -131,6 +133,8 @@ pub struct Board {
     pub shown: HashSet<String>,
     /// The item waiting for delivery, read live from the outbox (V26, V65).
     pub pending: Option<Pending>,
+    /// A Concern, Escalation or BLIND was logged: the pane may open (V67).
+    pub opened: bool,
     /// Challenge id → Concern id.
     challenged: HashMap<String, String>,
 }
@@ -171,6 +175,7 @@ impl Board {
             stream: Vec::new(),
             shown: HashSet::new(),
             pending: None,
+            opened: false,
             challenged: HashMap::new(),
         }
     }
@@ -218,6 +223,7 @@ impl Board {
 
     pub fn apply(&mut self, r: &Record<Event>) {
         let (t, e) = (r.t, &r.body);
+        self.opened |= opens(e);
         let stage = self.budget.stage();
         self.concerns.apply(e);
         self.challenges.apply(e);
@@ -876,12 +882,86 @@ fn rule(b: &Board, ui: &mut Ui, selected: Option<&str>, side: Side, now: u64) ->
         ui.note = Some("y / n / d rule on a NEEDS YOU or IN DEBATE item".to_owned());
         return Effect::None;
     };
-    match Rulings::rule(&b.cx(), id, side, Via::Key, Surface::Pane, now) {
+    match Rulings::rule(&b.cx(), id, side, Via::Key, surface(ui.keys), now) {
         Ok(r) => Effect::Append(vec![r.event()]),
         Err(why) => {
             ui.note = Some(why);
             Effect::None
         }
+    }
+}
+
+/// Where a pane key was pressed, for the ruling record.
+pub fn surface(keys: Keys) -> Surface {
+    match keys {
+        Keys::Standalone => Surface::Pane,
+        Keys::Mod => Surface::ModPane,
+    }
+}
+
+/// A Claude mod pane key (I17) as the standalone key it stands for: `b` = `$`, `h` = `+`;
+/// `y n d s u` are the same. `p` (promote) goes through [`promote`] with its remark.
+pub fn mod_key(c: char) -> Option<Key> {
+    match c {
+        'b' => Some(Key::Char('$')),
+        'h' => Some(Key::Char('+')),
+        'y' | 'n' | 'd' | 's' | 'u' => Some(Key::Char(c)),
+        _ => None,
+    }
+}
+
+/// Mod pane `p` (V20): promotes the selected Concern with an optional remark, as `P`, the
+/// remark and Enter would.
+pub fn promote(b: &Board, ui: &mut Ui, frame: &Frame, remark: &str, now: u64) -> Effect {
+    match key(b, ui, frame, Key::Char('P'), now) {
+        Effect::None if ui.input.is_some() => {
+            ui.input.as_mut().expect("in input").text = remark.to_owned();
+            key(b, ui, frame, Key::Enter, now)
+        }
+        other => other,
+    }
+}
+
+/// Band Buttons (I17, V76): the item the band asks about, the first NEEDS YOU Escalation.
+pub fn band_item(b: &Board) -> Option<&escalation::Escalation> {
+    b.needs_you().next()
+}
+
+/// Band digit `1` Watcher / `2` Worker / `3` dismiss on the band's item (V71, V72).
+pub fn band(b: &Board, digit: char, now: u64) -> Result<Event, String> {
+    let side = match digit {
+        '1' => Side::Watcher,
+        '2' => Side::Worker,
+        '3' => Side::Dismissed,
+        _ => return Err(format!("band keys are 1 2 3 u, not {digit}")),
+    };
+    let Some(e) = band_item(b) else { return Err("nothing waits for a ruling".to_owned()) };
+    Rulings::rule(&b.cx(), &e.id, side, Via::Band, Surface::Band, now).map(|r| r.event())
+}
+
+/// Runs a key's [`Effect`] against the session: the events to append, or why it was refused.
+/// `Quit` is the caller's.
+pub fn perform(
+    b: &Board,
+    mailbox: &Mailbox,
+    store: Option<&Path>,
+    effect: Effect,
+    via: Via,
+    surface: Surface,
+    now: u64,
+) -> Result<Vec<Event>, String> {
+    match effect {
+        Effect::Quit | Effect::None => Ok(vec![]),
+        Effect::Append(events) => Ok(events),
+        Effect::Undo => undo(b, &mailbox.outbox(), via, surface).map(|e| vec![e]),
+        Effect::Keep(selected) => match store {
+            Some(store) => keep(b, store, selected.as_deref(), now, via).map(|e| vec![e]),
+            None => Err("keep: the session's repo is unknown".to_owned()),
+        },
+        Effect::Remove(id) => match store {
+            Some(store) => remove(store, &id, via).map(|e| vec![e]),
+            None => Err("remove: the session's repo is unknown".to_owned()),
+        },
     }
 }
 
@@ -1048,17 +1128,7 @@ pub fn run(mailbox: &Mailbox) -> io::Result<()> {
             let now = crate::jsonl::now_ms();
             let events = match key(&board, &mut ui, &frame, k, now) {
                 Effect::Quit => return Ok(()),
-                Effect::Append(events) => Ok(events),
-                Effect::Undo => undo(&board, &mailbox.outbox(), Via::Key, Surface::Pane).map(|e| vec![e]),
-                Effect::Keep(selected) => match &store {
-                    Some(store) => keep(&board, store, selected.as_deref(), now, Via::Key).map(|e| vec![e]),
-                    None => Err("keep: the session's repo is unknown".to_owned()),
-                },
-                Effect::Remove(id) => match &store {
-                    Some(store) => remove(store, &id, Via::Key).map(|e| vec![e]),
-                    None => Err("remove: the session's repo is unknown".to_owned()),
-                },
-                Effect::None => Ok(vec![]),
+                effect => perform(&board, mailbox, store.as_deref(), effect, Via::Key, Surface::Pane, now),
             };
             match events {
                 Ok(events) if !events.is_empty() => {
@@ -1077,4 +1147,123 @@ pub fn run(mailbox: &Mailbox) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// What the Claude mod draws (I8): the band and, while placed, the mod pane. Rebuilt from the log
+/// each poll; the mod holds only the focused row and the expanded logs.
+#[derive(Serialize, Debug, PartialEq)]
+pub struct ModView {
+    /// A Concern, Escalation or BLIND has been logged: the pane may open (V67).
+    pub opens: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub band: Option<BandView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane: Option<PaneView>,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+pub struct BandView {
+    pub mini: Vec<Span>,
+    /// The NEEDS YOU item the digit Buttons rule on, when `band_digits` is on (V76).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ask: Option<Ask>,
+    /// `<id> → <side>`: the last live ruling; the mod adds `· u undo` as a Button (V76).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ruled: Option<String>,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+pub struct Ask {
+    pub id: String,
+    pub title: String,
+    /// `1`/`2` apply: an unresolved Debate. A blocked Escalation is answered in the Worker (V72).
+    pub sides: bool,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+pub struct PaneView {
+    pub lines: Vec<Vec<Span>>,
+    pub items: Vec<Option<String>>,
+    pub order: Vec<String>,
+    pub selected: Option<String>,
+}
+
+/// The mod's view of `b`: `band` at that width, `pane` at (width, rows) with the mod's selection.
+pub fn mod_view(
+    b: &Board,
+    band: Option<(usize, bool)>,
+    pane: Option<(usize, usize)>,
+    selected: Option<String>,
+    expanded: &[String],
+) -> ModView {
+    let ui = Ui { selected, expanded: expanded.iter().cloned().collect(), keys: Keys::Mod, ..Ui::default() };
+    let band = band.map(|(width, digits)| BandView {
+        mini: layout(b, &ui, width, 1).lines.into_iter().next().map(|l| l.0).unwrap_or_default(),
+        ask: band_item(b).filter(|_| digits).map(|e| Ask {
+            id: e.id.clone(),
+            title: e.title.clone(),
+            sides: e.cause == escalation::Cause::Unresolved,
+        }),
+        ruled: b.rulings.last().map(|r| {
+            let side = match r.ruled.side {
+                Side::Watcher => "Watcher",
+                Side::Worker => "Worker",
+                Side::Dismissed => "dismissed",
+            };
+            format!("{} → {side}", r.ruled.id)
+        }),
+    });
+    let pane = pane.map(|(width, rows)| {
+        let frame = layout(b, &ui, width, rows);
+        PaneView {
+            lines: frame.lines.into_iter().map(|l| l.0).collect(),
+            items: frame.items,
+            order: frame.order,
+            selected: frame.selected,
+        }
+    });
+    ModView { opens: b.opened, band, pane }
+}
+
+/// A mod pane key, or (`on_band`) a band Button `1 2 3 u`, on the session (I17, V76): the events
+/// it appended, or why it was refused. `selected` is the mod's focused row; `remark` goes with
+/// `p` (V20).
+pub fn mod_press(
+    mailbox: &Mailbox,
+    on_band: bool,
+    pressed: char,
+    selected: Option<String>,
+    remark: &str,
+    now: u64,
+) -> Result<Vec<Event>, String> {
+    let log = mailbox.log();
+    let records = log.read_from(0).map_err(|e| format!("event log: {e}"))?.records;
+    let mut b = Board::rebuild(term::local_offset(), &records);
+    b.pending = delivery::pending(&b.challenges, &b.debate, b.observe_only, mailbox).unwrap_or(None);
+    let store = standing::session_path(mailbox);
+    let events = if on_band {
+        match pressed {
+            'u' => vec![undo(&b, &mailbox.outbox(), Via::Band, Surface::Band)?],
+            digit => vec![band(&b, digit, now)?],
+        }
+    } else {
+        let mut ui = Ui { selected, keys: Keys::Mod, ..Ui::default() };
+        // Only the row the human focused: a gone or absent one is never swapped for the first.
+        let frame = layout(&b, &ui, 80, 200);
+        let effect = match pressed {
+            'p' => promote(&b, &mut ui, &frame, remark, now),
+            c => match mod_key(c) {
+                Some(k) => key(&b, &mut ui, &frame, k, now),
+                None => return Err(format!("mod pane keys are p b h y n d s u, not {c}")),
+            },
+        };
+        if let Some(note) = ui.note.take() {
+            return Err(note);
+        }
+        perform(&b, mailbox, store.as_deref(), effect, Via::Key, Surface::ModPane, now)?
+    };
+    for e in &events {
+        log.append(e.clone()).map_err(|e| format!("event log: {e}"))?;
+    }
+    Ok(events)
 }

@@ -467,3 +467,49 @@ fn claim_rereads_the_log_under_the_lock() {
     assert!(delivery::claim(&w.mb, &stale, Route::Mod, now).unwrap().is_none());
     assert!(outbox.pending().unwrap().is_empty(), "dropped as stale");
 }
+
+#[test]
+fn adapter_poll_draws_the_mod_band_and_pane_and_press_rules() {
+    let w = world("claude", false);
+    let poll = |extra: &[&str]| -> Value {
+        let mut args = vec!["hook", "adapter", "poll", "--session", "s1", "--route", "mod", "--worker", "busy"];
+        args.extend(extra);
+        let out = w.cmd(&args, "", false);
+        assert!(out.status.success(), "{out:?}");
+        serde_json::from_str(stdout(&out).trim()).unwrap()
+    };
+    assert!(poll(&[]).get("board").is_none(), "no band or pane asked");
+    let view = poll(&["--band", "60", "--pane", "64x20", "--selected", "c1"]);
+    let board = &view["board"];
+    assert_eq!(board["opens"], true, "V67");
+    assert!(board["band"]["mini"].as_array().is_some_and(|m| !m.is_empty()), "{board}");
+    assert_eq!(board["pane"]["selected"], "c1");
+    let items = board["pane"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), board["pane"]["lines"].as_array().unwrap().len());
+    assert!(items.iter().any(|i| i == "c1"));
+
+    let press = |args: &[&str]| {
+        let mut all = vec!["hook", "adapter", "press", "--session", "s1"];
+        all.extend(args);
+        let out = w.cmd(&all, "", false);
+        assert!(out.status.success(), "{out:?}");
+        stdout(&out).trim().to_owned()
+    };
+    assert_eq!(press(&["--key", "h", "--selected", "c1"]), "");
+    let helpful = w.events().into_iter().filter(|e| e.k == Kind::Human && e.str("action") == Some("helpful")).count();
+    assert_eq!(helpful, 1);
+    assert_eq!(press(&["--key", "d"]), "nothing selected", "no focused row: never the first one");
+    assert_eq!(press(&["--key", "y", "--selected", "gone"]), "y / n / d rule on a NEEDS YOU or IN DEBATE item");
+    assert_eq!(press(&["--key", "y", "--selected", "c1"]), "");
+    let ruled = w.events().into_iter().find(|e| e.k == Kind::Ruled).expect("ruled logged");
+    assert_eq!((ruled.str("via"), ruled.str("surface")), (Some("key"), Some("mod-pane")));
+    assert_eq!(press(&["--key", "u", "--band"]), "", "band u undoes");
+    let undone = w.events().into_iter().filter(|e| e.k == Kind::Ruling).last().expect("undone logged");
+    assert_eq!(undone.str("surface"), Some("band"), "{undone:?}");
+    assert_eq!(press(&["--key", "z"]), "mod pane keys are p b h y n d s u, not z");
+    assert_eq!(press(&["--key", "1", "--band"]), "nothing waits for a ruling");
+
+    // `band_digits = false` from the session's `run` flags (V76).
+    fs::write(w.mb.dir().join("launch.json"), r#"{"flags":["band_digits=false"],"only":[]}"#).unwrap();
+    assert_eq!(poll(&["--band", "60"])["board"]["band"].get("ask"), None);
+}
