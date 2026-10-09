@@ -76,9 +76,23 @@ pub struct Wake {
     /// Session-relative wake record (`record.rs`); a skipped wake's kept input (V55).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record: Option<String>,
+    /// `debate end`s logged before this wake's round began: a wake sees only those (V105).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub ends: u64,
+}
+
+impl Outcome {
+    /// The model's output was taken: the Watcher read this wake's input.
+    pub fn accepted(self) -> bool {
+        matches!(self, Outcome::Silent | Outcome::Concern | Outcome::Challenge | Outcome::Escalation)
+    }
 }
 
 fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+fn is_zero_u64(n: &u64) -> bool {
     *n == 0
 }
 

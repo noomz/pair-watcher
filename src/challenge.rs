@@ -3,7 +3,7 @@
 //! One open Challenge per Worker (V19); one that went stale before delivery never reaches the
 //! Worker (V21). State is a fold over the session event log, like the Concern list (V93).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,7 @@ use crate::outbox::{Gate, Item, ItemKind, Outbox, Withdraw};
 use crate::output;
 use crate::ruling::{Live, Standing};
 use crate::snapshot::Store;
+use crate::status::Wake;
 use crate::tailer::{self, Entry};
 
 /// Watcher decisions a Debate can still owe once its Challenge is out: one per verdict (V31).
@@ -298,6 +299,11 @@ pub struct Challenges {
     /// takes it back (V75).
     freed: Option<Slot>,
     rulings: Live,
+    /// `debate end`s so far (V105).
+    ends: u64,
+    /// Watchers whose accepted normal wake began after the last `debate end`: they saw the closed
+    /// Debate, so their Concerns may take the freed slot (V105).
+    seen: HashSet<String>,
 }
 
 impl Challenges {
@@ -311,6 +317,17 @@ impl Challenges {
 
     pub fn slot(&self) -> Option<&Slot> {
         self.slot.as_ref()
+    }
+
+    /// `debate end`s folded so far; a round stamps the count it began with on its wakes (V105).
+    pub fn ends(&self) -> u64 {
+        self.ends
+    }
+
+    /// `c`'s owner saw every closed Debate (V103 entry) in a later wake (V105). A Swarm Watcher is
+    /// named for its Focus; Companion's wake sees them all.
+    fn owner_saw(&self, c: &Concern) -> bool {
+        self.ends == 0 || self.seen.contains("companion") || self.seen.contains(&c.focus)
     }
 
     /// Folds `challenge` and `concern` events, `human dismiss` and `promote`, and the Debate
@@ -359,6 +376,8 @@ impl Challenges {
                 _ => {}
             },
             Kind::Debate if event.str("op") == Some("end") => {
+                self.ends += 1;
+                self.seen.clear();
                 if let Some(id) = event.str("challenge")
                     && self.slot.as_ref().is_some_and(|s| s.id == id)
                 {
@@ -371,6 +390,15 @@ impl Challenges {
                     && self.freed.as_ref().map(|s| s.id.as_str()) == event.str("challenge") =>
             {
                 self.slot = self.freed.take();
+            }
+            Kind::Wake => {
+                if let Some(w) = event.parse::<Wake>()
+                    && w.outcome.accepted()
+                    && w.trigger != "blocked"
+                    && w.ends >= self.ends
+                {
+                    self.seen.insert(w.watcher);
+                }
             }
             _ => {}
         }
@@ -409,7 +437,8 @@ impl Challenges {
 
     /// The Concern to auto-Challenge after this wake's changes are committed, if any: the slot is
     /// free (V19), `auto_challenge` holds (V23), normal wakes still run, and the oldest open
-    /// verified Concern never Challenged before (V22; a finished Debate is not reopened) wins.
+    /// verified Concern never Challenged before (V22; a finished Debate is not reopened) wins,
+    /// once its owner has seen the last closed Debate (V105).
     /// It waits unless what is left covers its whole Debate at `wake_usd(owner)`, its owner
     /// Watcher's last wake cost (V24). An owner with no known cost (non-finite or negative: muted,
     /// not waking) cannot argue a Debate (V39), so its Concerns are passed over. The winner's
@@ -430,6 +459,7 @@ impl Challenges {
             .all()
             .iter()
             .filter(|c| c.state == State::Open && c.challenge && c.verified && !self.count.contains_key(&c.id))
+            .filter(|c| self.owner_saw(c))
             .map(|c| (c, wake_usd(c)))
             .find(|(_, usd)| usd.is_finite() && *usd >= 0.0)?;
         if budget.left() < DEBATE_WAKES * usd {

@@ -12,6 +12,7 @@ use pair_watcher::outbox::{self as ob, Gate, ItemKind, LEASE_MS, Outbox};
 use pair_watcher::output;
 use pair_watcher::repo::Repo;
 use pair_watcher::snapshot::Store;
+use pair_watcher::status::{Outcome, Wake};
 use pair_watcher::tailer::{Entry, Item};
 use tempfile::TempDir;
 
@@ -155,6 +156,20 @@ impl Fx {
 
     fn end_debate(&self, list: &mut ConcernList, ch: &mut Challenges, id: &str) {
         self.log(list, ch, Event::new(Kind::Debate).with("op", "end").with("challenge", id));
+    }
+
+    /// `watcher`'s wake in a round that began after `ends` Debates had closed (V105).
+    fn wake(
+        &self,
+        list: &mut ConcernList,
+        ch: &mut Challenges,
+        watcher: &str,
+        trigger: &str,
+        outcome: Outcome,
+        ends: u64,
+    ) {
+        let w = Wake { watcher: watcher.into(), trigger: trigger.into(), outcome, ends, ..Default::default() };
+        self.log(list, ch, w.event());
     }
 
     /// The event log folds to the same state as the incremental applies.
@@ -387,7 +402,59 @@ fn slot_oldest_wins_then_waits() {
     assert_eq!(f.pick(&ch, &list), None);
 
     f.end_debate(&mut list, &mut ch, "c1");
+    assert_eq!(f.pick(&ch, &list), None, "the owner has not seen the closed Debate (V105)");
+    f.wake(&mut list, &mut ch, "companion", "turn-end", Outcome::Silent, 1);
     assert_eq!(f.pick(&ch, &list).as_deref(), Some("c2"));
+    f.assert_rebuilds(&list, &ch);
+}
+
+/// V105 (B6): in Swarm, a waiting Concern takes the freed slot only after its owner's accepted
+/// normal wake that began after the Debate closed, never in the round that closed it; there the
+/// owner may withdraw the flag instead.
+#[test]
+fn freed_slot_waits_for_owner_to_see_closed_debate() {
+    let f = fx();
+    let (mut list, mut ch) = (ConcernList::default(), Challenges::default());
+    let (mut c2, mut c3) = (ready("c2"), ready("c3"));
+    (c2.focus, c3.focus) = ("correctness".into(), "security".into());
+    f.raise(&mut list, &mut ch, vec![add(&ready("c1")), add(&c2), add(&c3)]);
+    ch.queue(&f.log, &f.outbox, list.get("c1").unwrap(), Origin::Auto, None, 1).unwrap();
+
+    // The round whose sibling Debate ended unresolved: its wakes began before the end.
+    f.end_debate(&mut list, &mut ch, "c1");
+    for w in ["approach", "correctness", "security"] {
+        f.wake(&mut list, &mut ch, w, "turn-end", Outcome::Silent, 0);
+    }
+    assert_eq!(f.pick(&ch, &list), None, "never queued in the round that ended the Debate");
+
+    // Not the owner's sight: another Focus, a blocked wake, an output not taken.
+    f.wake(&mut list, &mut ch, "approach", "turn-end", Outcome::Silent, 1);
+    f.wake(&mut list, &mut ch, "correctness", "blocked", Outcome::Silent, 1);
+    f.wake(&mut list, &mut ch, "correctness", "checkpoint", Outcome::Failed, 1);
+    f.wake(&mut list, &mut ch, "correctness", "checkpoint", Outcome::Skipped, 1);
+    assert_eq!(f.pick(&ch, &list), None);
+
+    // Next round: c2's owner withdraws the flag; c3's keeps it and its Concern takes the slot.
+    let mut withdrawn = c2.clone();
+    withdrawn.challenge = false;
+    f.raise(&mut list, &mut ch, vec![Change::Update { watcher: "correctness".into(), concern: withdrawn }]);
+    f.wake(&mut list, &mut ch, "correctness", "turn-end", Outcome::Concern, 1);
+    assert_eq!(f.pick(&ch, &list), None, "c3's owner has not seen it yet");
+    f.wake(&mut list, &mut ch, "security", "turn-end", Outcome::Silent, 1);
+    assert_eq!(f.pick(&ch, &list).as_deref(), Some("c3"));
+    f.assert_rebuilds(&list, &ch);
+
+    // Another Debate closing makes every owner see again.
+    ch.queue(&f.log, &f.outbox, list.get("c3").unwrap(), Origin::Auto, None, 2).unwrap();
+    f.end_debate(&mut list, &mut ch, "c3");
+    let mut c4 = ready("c4");
+    c4.focus = "security".into();
+    f.raise(&mut list, &mut ch, vec![add(&c4)]);
+    assert_eq!(f.pick(&ch, &list), None);
+    f.wake(&mut list, &mut ch, "security", "turn-end", Outcome::Silent, 1);
+    assert_eq!(f.pick(&ch, &list), None, "began before the second end");
+    f.wake(&mut list, &mut ch, "security", "catch-up", Outcome::Silent, 2);
+    assert_eq!(f.pick(&ch, &list).as_deref(), Some("c4"));
     f.assert_rebuilds(&list, &ch);
 }
 
@@ -423,6 +490,7 @@ fn one_auto_per_concern() {
     f.raise(&mut list, &mut ch, vec![add(&ready("c1")), add(&ready("c2"))]);
     ch.queue(&f.log, &f.outbox, list.get("c1").unwrap(), Origin::Auto, None, 1).unwrap();
     f.end_debate(&mut list, &mut ch, "c1");
+    f.wake(&mut list, &mut ch, "companion", "turn-end", Outcome::Silent, 1);
     assert_eq!(f.pick(&ch, &list).as_deref(), Some("c2"));
 
     // c2 was promoted first: once its Debate ends it is not auto-Challenged either.

@@ -962,6 +962,8 @@ impl Watch {
         if !blocked {
             self.last_wake = now;
         }
+        // Debates this round closes are unseen by its wakes, whatever their input showed (V105).
+        let ends = self.board.challenges.ends();
 
         // Code observers read the live tail first (debate.rs order).
         let tree = self.store.as_ref().and_then(|s| s.take().ok());
@@ -1048,6 +1050,7 @@ impl Watch {
                 rulings: vec![],
                 prefilter: verdicts[i].clone(),
                 diff_bytes: built[i].sections.diff_bytes,
+                ends,
                 ..Default::default()
             };
             let tree = tree.as_deref().filter(|_| !blocked);
@@ -1195,7 +1198,7 @@ impl Watch {
                 )?;
                 self.refresh()?;
             }
-            if let Some(owner) = self.auto_challenge(&roster, spend, tree.as_deref(), &history, now)?
+            if let Some(owner) = self.auto_challenge(&roster, &wakes, spend, tree.as_deref(), &history, now)?
                 && let Some(i) = roster.iter().position(|w| w.name == owner)
             {
                 wakes[i].outcome = Outcome::Challenge;
@@ -1524,10 +1527,12 @@ impl Watch {
         roster.iter().filter(|w| w.focuses.contains(&c.focus)).map(|w| w.name.clone()).collect()
     }
 
-    /// The next auto-Challenge after this wake (V16, V19, V22–V24). Returns its owner Watcher.
+    /// The next auto-Challenge after this wake (V16, V19, V22–V24), counting this round's `wakes`
+    /// as seen (V105). Returns its owner Watcher.
     fn auto_challenge(
         &mut self,
         roster: &[Watcher],
+        wakes: &[Wake],
         spend: f64,
         tree: Option<&str>,
         history: &History,
@@ -1546,6 +1551,9 @@ impl Watch {
         };
         let sources = Sources { store, tree, transcript: &self.transcript, history };
         let mut ch = self.board.challenges.clone();
+        for w in wakes {
+            ch.apply(&w.event());
+        }
         match ch.next_auto(&self.board.concerns, auto, &budget, wake_usd, &sources) {
             Some(Auto::Ready(c)) => {
                 let c = c.clone();

@@ -334,7 +334,7 @@ pub struct Sample {
 pub fn samples(wakes: &[Wake]) -> Vec<Sample> {
     wakes
         .iter()
-        .filter(|w| matches!(w.outcome, Outcome::Silent | Outcome::Concern | Outcome::Challenge | Outcome::Escalation))
+        .filter(|w| w.outcome.accepted())
         .filter_map(|w| {
             let v = w.prefilter.as_ref().filter(|v| !v.skipped)?;
             Some(Sample { key: v.key.clone()?, score: v.score?, outcome: w.outcome })

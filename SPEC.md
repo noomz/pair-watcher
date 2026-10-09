@@ -215,7 +215,7 @@ T22|x|Trial: unproductive-repetition scenario end-to-end on Claude, Codex, pi (6
 T23|x|Packaging: `dist` release binaries macOS/Linux, shell installer, Homebrew tap, `cargo install`; adapters embedded via `include_str!`|C6
 T24|x|Blocked-path fixes from T21 live: guardian no-verdict re-arms timer; blocked wake runs alongside in-flight normal wake; keep child stdout/stderr tail on headless timeout for diagnosis|V56,V87,V101,V102
 T25|x|T22 live fixes: Debate-closed Concern entries in wake input + no-reraise prompt rule; hint count-monotone verify; prompt concede rule = constraint verified in transcript/Task (V32); `claude -p` expired OAuth → Key (V86); invalid wake record keeps input + raw output (I10)|V7,V13,V17,V19,V32,V86,V103,V104,I10
-T26|.|Slot admission after owner sees closed Debate (Swarm); test: sibling Debate ends unresolved → waiting Concern not queued same round, queued next round only if owner keeps flag|V19,V103,V105
+T26|x|Slot admission after owner sees closed Debate (Swarm); test: sibling Debate ends unresolved → waiting Concern not queued same round, queued next round only if owner keeps flag|V19,V103,V105
 T27|.|Per-harness config table `[harness.claude|codex|pi]` (`backend`, `model`, `fallback_model`): parse, precedence within layer, repo filter, env names, `config show --origin`, hash; tests per precedence case|V79,V80,V83,V84,V109,I18
 T28|.|`claude-session` backend: mailbox request/result records (Rust + TS), mod runner on `$.model.complete`, code-owned tool loop, failure mapping, 15 s unclaimed → BLIND/fallback, refusal on Codex/pi, pane notes, pricing from usage; live check on a real Claude session|V8,V11,V46,V47,V51,V52,V86,V106,V107,V108,I8,I15
 

@@ -731,6 +731,66 @@ fn codex_challenge_queued_after_settle() {
     assert!(fx.events().iter().any(|e| e.k == Kind::Challenge && e.str("op") == Some("sent")));
 }
 
+/// V105 (B6): in Swarm, a waiting challenge-ready Concern is not queued in the round whose
+/// sibling Debate ended unresolved; it takes the slot the next round, after its owner's wake saw
+/// the closed Debate and kept the flag.
+#[test]
+fn swarm_waits_a_round_after_closed_debate() {
+    let c1 = r#"{"op":"add","severity":"warn","focus":"approach","headline":"6th review round, 0 new findings","challenge":true,"evidence":[{"kind":"transcript","excerpt":"Starting the 6th review round with zero new findings."}],"alternative":"stop requesting reviews; ask the human to merge"}"#;
+    let c2 = r#"{"op":"add","severity":"warn","focus":"correctness","headline":"upload retried by hand, flake never fixed","challenge":true,"evidence":[{"kind":"transcript","excerpt":"Retrying the flaky upload by hand again."}],"alternative":"fix the upload retry before the next round"}"#;
+    let escalate =
+        r#"{"op":"debate","decision":"escalate","text":"the policy is not in the task; the human should confirm"}"#;
+    let round = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+    let r = Arc::clone(&round);
+    let server = Server::start(move |b| {
+        let input = input_of(b);
+        let focus = |f: &str| input.contains(&format!("## Focus: {f}"));
+        match r.load(Ordering::Relaxed) {
+            1 if focus("approach") => reply(c1),
+            1 if focus("correctness") => reply(c2),
+            2 if focus("approach") => reply(escalate),
+            _ => reply(""),
+        }
+    });
+    let fx = Fx::new("swarm", &server);
+    let mut w = fx.open();
+    fx.start();
+    let queued = || -> Vec<String> {
+        fx.events()
+            .iter()
+            .filter(|e| e.k == Kind::Challenge && e.str("op") == Some("queued"))
+            .map(|e| e.str("concern").unwrap().to_owned())
+            .collect()
+    };
+
+    fx.turn(1, "Starting the 6th review round with zero new findings. Retrying the flaky upload by hand again.");
+    fx.stop();
+    w.step(now()).unwrap();
+    assert_eq!(queued(), ["c1"], "oldest wins; c2 waits");
+    let outbox = fx.mb.outbox();
+    let claim = outbox.claim("stop", now(), |_| pair_watcher::outbox::Gate::Deliver).unwrap().unwrap();
+    assert!(outbox.ack(&claim, now()).unwrap());
+
+    round.store(2, Ordering::Relaxed);
+    fx.turn(2, "Challenge c1: defend — the reviews are required by policy.");
+    fx.stop();
+    w.step(now()).unwrap();
+    let ended = fx
+        .events()
+        .iter()
+        .any(|e| e.k == Kind::Debate && e.str("op") == Some("end") && e.str("outcome") == Some("unresolved"));
+    assert!(ended, "{:#?}", fx.events());
+    assert_eq!(queued(), ["c1"], "never queued in the round that ended the Debate");
+
+    round.store(3, Ordering::Relaxed);
+    fx.turn(3, "Done.");
+    fx.stop();
+    w.step(now()).unwrap();
+    assert_eq!(queued(), ["c1", "c2"]);
+    let last = fx.wakes().into_iter().rev().find(|w| w.watcher == "correctness").unwrap();
+    assert_eq!((last.ends, last.outcome), (1, Outcome::Challenge));
+}
+
 trait BodyText {
     fn body_text(&self) -> String;
 }
