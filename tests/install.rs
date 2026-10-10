@@ -195,7 +195,7 @@ fn claude_install_is_idempotent_and_uninstall_keeps_user_edits() {
     let once = fs::read(settings).unwrap();
     w.install(Harness::Claude).unwrap();
     assert_eq!(fs::read(settings).unwrap(), once, "V59: idempotent");
-    assert!(install::installed(&w.home, Harness::Claude).is_some());
+    assert!(install::installed(&w.home, &w.paths, Harness::Claude).is_some());
 
     // The user edits after install; uninstall keeps it.
     let mut edited = read_json(settings);
@@ -205,7 +205,7 @@ fn claude_install_is_idempotent_and_uninstall_keeps_user_edits() {
     let mut expected = before;
     expected["model"] = json!("opus");
     assert_eq!(read_json(settings), expected);
-    assert!(install::installed(&w.home, Harness::Claude).is_none());
+    assert!(install::installed(&w.home, &w.paths, Harness::Claude).is_none());
     assert_eq!(w.uninstall(Harness::Claude).unwrap(), Vec::<String>::new(), "nothing left to remove");
 }
 
@@ -254,7 +254,7 @@ fn codex_install_persists_trust_for_ours_only_and_uninstall_rekeys_user_hooks() 
     assert_eq!(trust[&format!("{file}:stop:0:0")], "sha256:userA", "user trust untouched");
     let ours_stop = &trust[&format!("{file}:stop:1:0")];
     assert!(w.ours(ours_stop.trim_start_matches("sha256:")), "V59: our hash from Codex: {ours_stop}");
-    assert_eq!(install::installed(&w.home, Harness::Codex).unwrap().trust.len(), CODEX_EVENTS.len());
+    assert_eq!(install::installed(&w.home, &w.paths, Harness::Codex).unwrap().trust.len(), CODEX_EVENTS.len());
 
     let once = (fs::read(hooks).unwrap(), fs::read(&w.paths.codex_config).unwrap());
     w.install(Harness::Codex).unwrap();
@@ -293,7 +293,7 @@ fn codex_install_rolls_back_when_trust_cannot_be_read() {
     assert!(err.contains("codex not found"), "{err}");
     assert_eq!(fs::read_to_string(&w.paths.codex_hooks).unwrap(), original, "V59: atomic");
     assert!(!w.paths.codex_config.exists());
-    assert!(install::installed(&w.home, Harness::Codex).is_none());
+    assert!(install::installed(&w.home, &w.paths, Harness::Codex).is_none());
 
     let err = w.install_with(Harness::Codex, &|| Ok(Vec::new())).unwrap_err();
     assert!(err.contains("listed 0 of our"), "{err}");
@@ -321,4 +321,45 @@ fn pi_install_writes_the_extension_and_uninstall_removes_it() {
     w.uninstall(Harness::Pi).unwrap();
     assert!(!w.paths.pi_extension.exists());
     assert!(w.paths.pi_extension.parent().unwrap().is_dir(), "the user's extensions dir stays");
+}
+
+/// V116, B12: two Claude config dirs (ccs instances) are two installs; neither replaces the other.
+#[test]
+fn each_claude_config_dir_is_its_own_install() {
+    let mut w = World::new();
+    let work = w.paths.clone();
+    w.install(Harness::Claude).unwrap();
+    let personal = Paths { claude_settings: w._dir.path().join("personal/settings.json"), ..work.clone() };
+    assert!(install::installed(&w.home, &personal, Harness::Claude).is_none(), "work's install is not personal's");
+    w.paths = personal.clone();
+    w.install(Harness::Claude).unwrap();
+    assert!(install::installed(&w.home, &work, Harness::Claude).is_some(), "personal kept work's record");
+    assert!(install::installed(&w.home, &personal, Harness::Claude).is_some());
+    assert_eq!(install::manifest(&w.home).unwrap().of(Harness::Claude).count(), 2);
+
+    w.uninstall(Harness::Claude).unwrap();
+    assert!(install::installed(&w.home, &personal, Harness::Claude).is_none());
+    assert!(w.ours(&fs::read_to_string(&work.claude_settings).unwrap()), "uninstall left work alone");
+    w.paths = work.clone();
+    w.uninstall(Harness::Claude).unwrap();
+    assert!(!w.ours(&fs::read_to_string(&work.claude_settings).unwrap()));
+    assert_eq!(install::manifest(&w.home).unwrap().of(Harness::Claude).count(), 0);
+}
+
+/// V116: a manifest from before the target key reads as the install of its first file.
+#[test]
+fn legacy_manifest_key_is_its_first_file() {
+    let w = World::new();
+    w.install(Harness::Claude).unwrap();
+    let path = w.home.root().join("install.json");
+    let mut m = read_json(&path);
+    let key = format!("claude:{}", w.paths.claude_settings.display());
+    let entry = m["installed"][&key].take();
+    m["installed"] = json!({ "claude": entry });
+    write(&path, &m.to_string());
+    assert!(install::installed(&w.home, &w.paths, Harness::Claude).is_some());
+    let other = Paths { claude_settings: w._dir.path().join("other/settings.json"), ..w.paths.clone() };
+    assert!(install::installed(&w.home, &other, Harness::Claude).is_none());
+    w.uninstall(Harness::Claude).unwrap();
+    assert_eq!(install::manifest(&w.home).unwrap().of(Harness::Claude).count(), 0);
 }

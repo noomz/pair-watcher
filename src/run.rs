@@ -134,7 +134,8 @@ fn wire(l: &Launch) -> io::Result<(Plan, Vec<String>)> {
     let adapters = adapters::write(home)?;
     let mut notes: Vec<String> = support.note(harness).into_iter().collect();
     // Installed hooks already route by the session env var; per-session ones would fire twice.
-    let installed = crate::install::installed(home, harness).is_some();
+    let installed =
+        crate::install::Paths::current().is_ok_and(|p| crate::install::installed(home, &p, harness).is_some());
 
     let ours = if !support.hooks() || installed {
         Vec::new()
@@ -373,7 +374,8 @@ pub fn attach_installed(home: &Home, id: &str, exe: &Path, hint: Option<(Harness
         (None, Some((harness, cwd))) => (harness, cwd, None),
         (None, None) => return Err(format!("no live session {id} and no Claude, Codex or pi transcript for it")),
     };
-    if crate::install::installed(home, harness).is_none() {
+    let paths = crate::install::Paths::current().map_err(|e| e.to_string())?;
+    if crate::install::installed(home, &paths, harness).is_none() {
         return Err(format!(
             "session {id} is a {0} session not started by `run`: `pair-watcher install {0}` first, then restart it",
             harness.name()
