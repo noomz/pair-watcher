@@ -1,0 +1,206 @@
+#![allow(dead_code)]
+
+use std::collections::HashMap;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+
+use pair_watcher::config::{self, Resolved, Sources};
+use pair_watcher::focus::{self, FocusSet};
+use pair_watcher::home::Home;
+use pair_watcher::problem::Unreadable;
+use pair_watcher::repo::Repo;
+use tempfile::TempDir;
+
+pub const ROOT_COMMIT: &str = "abc123";
+
+/// A scratch home + repo; files are written relative to each.
+pub struct World {
+    _dir: TempDir,
+    pub home: Home,
+    pub repo: Repo,
+    pub env: HashMap<String, String>,
+    pub flags: Vec<String>,
+}
+
+impl World {
+    pub fn new() -> Self {
+        let dir = TempDir::new().unwrap();
+        let home = Home::new(dir.path().join("home/.pair-watcher"));
+        home.ensure_layout().unwrap();
+        let root = dir.path().join("repo");
+        fs::create_dir_all(&root).unwrap();
+        let repo = Repo { root, root_commit: Some(ROOT_COMMIT.into()) };
+        World { _dir: dir, home, repo, env: HashMap::new(), flags: Vec::new() }
+    }
+
+    pub fn global(&self, toml: &str) -> &Self {
+        write(&self.home.config_file(), toml);
+        self
+    }
+
+    pub fn repo_file(&self, toml: &str) -> &Self {
+        write(&self.repo.config_file(), toml);
+        self
+    }
+
+    pub fn user_repo(&self, toml: &str) -> &Self {
+        write(&self.home.repo_config(ROOT_COMMIT), toml);
+        self
+    }
+
+    pub fn user_focus(&self, name: &str, text: &str) -> &Self {
+        write(&self.home.focus_dir().join(format!("{name}.md")), text);
+        self
+    }
+
+    pub fn repo_focus(&self, name: &str, text: &str) -> &Self {
+        write(&self.repo.focus_dir().join(format!("{name}.md")), text);
+        self
+    }
+
+    pub fn try_resolve(&self) -> Result<Resolved, Unreadable> {
+        let env = |var: &str| self.env.get(var).cloned();
+        config::resolve(&Sources { home: &self.home, repo: Some(&self.repo), env: &env, flags: &self.flags })
+    }
+
+    pub fn resolve(&self) -> Resolved {
+        self.try_resolve().unwrap()
+    }
+
+    pub fn focuses(&self, only: &[&str]) -> FocusSet {
+        let only: Vec<String> = only.iter().map(|s| s.to_string()).collect();
+        focus::resolve(&self.home, Some(&self.repo), &self.resolve(), &only).unwrap()
+    }
+}
+
+pub fn write(path: &Path, text: &str) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, text).unwrap();
+}
+
+pub fn names(set: &FocusSet) -> Vec<&str> {
+    set.enabled.iter().map(|f| f.name.as_str()).collect()
+}
+
+pub fn executable(path: &Path, text: &str) {
+    write(path, text);
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A `codex` stand-in whose `app-server` answers `initialize` then `hooks/list`, one hook per
+/// `-c hooks.<Event>=` flag it was given, and logs its argv.
+pub fn fake_codex(dir: &Path, list_reply: Option<&str>) -> PathBuf {
+    let reply = list_reply.map_or_else(
+        || {
+            r#"keys=""; for a in "$@"; do case "$a" in hooks.state=*) ;; hooks.*=*) ev=${a#hooks.}; ev=${ev%%=*}; keys="$keys{\"key\":\"/<session-flags>/config.toml:$ev:0:0\",\"source\":\"sessionFlags\",\"trustStatus\":\"untrusted\",\"currentHash\":\"sha256:$ev\",\"command\":\"x\"},";; esac; done; keys=${keys%,}
+  printf '{"id":2,"result":{"data":[{"cwd":"x","hooks":[%s,{"key":"u","source":"user","trustStatus":"trusted","currentHash":"sha256:u","command":"y"}],"warnings":[],"errors":[]}]}}\n' "$keys""#
+                .to_owned()
+        },
+        |r| format!("printf '%s\\n' '{r}'"),
+    );
+    let script = format!(
+        r#"#!/bin/sh
+log="$(dirname "$0")/codex.argv"
+printf '%s\n' "$*" >> "$log"
+if [ "$1" = "--version" ]; then echo "codex-cli 0.160.0"; exit 0; fi
+if [ "$1" = "app-server" ]; then
+  shift
+  read -r init
+  printf '{{"id":1,"result":{{}}}}\n'
+  read -r initialized
+  read -r list
+  {reply}
+  read -r _ || exit 0
+fi
+"#
+    );
+    let path = dir.join("codex");
+    executable(&path, &script);
+    path
+}
+
+/// Mock model server: answers every request with `handler(body)`, recording bodies.
+pub struct Server {
+    pub url: String,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Server {
+    pub fn start(handler: impl Fn(&serde_json::Value) -> (u16, serde_json::Value) + Send + Sync + 'static) -> Server {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (log, halt) = (Arc::clone(&seen), Arc::clone(&stop));
+        let handler = Arc::new(handler);
+        std::thread::spawn(move || {
+            while !halt.load(Ordering::Relaxed) {
+                let Ok((stream, _)) = listener.accept() else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                };
+                stream.set_nonblocking(false).unwrap();
+                let (log, handler) = (Arc::clone(&log), Arc::clone(&handler));
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut len = 0;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                            len = v.trim().parse().unwrap();
+                        }
+                    }
+                    let mut buf = vec![0; len];
+                    reader.read_exact(&mut buf).unwrap();
+                    let body: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+                    let (status, reply) = handler(&body);
+                    log.lock().unwrap().push(body);
+                    let text = reply.to_string();
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{text}",
+                        text.len()
+                    );
+                });
+            }
+        });
+        Server { url, seen, stop }
+    }
+
+    pub fn requests(&self) -> Vec<serde_json::Value> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// An Anthropic Messages reply with `text`, 1000 in / 100 out tokens.
+pub fn anthropic_reply(text: &str) -> (u16, serde_json::Value) {
+    (
+        200,
+        serde_json::json!({
+            "content": [{"type": "text", "text": text}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1000, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "output_tokens": 100}
+        }),
+    )
+}
+
+/// The first user message text of a recorded request.
+pub fn input_of(body: &serde_json::Value) -> String {
+    body["messages"][0]["content"][0]["text"].as_str().unwrap().to_owned()
+}

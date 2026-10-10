@@ -1,0 +1,29 @@
+[package]
+name = "pair-watcher"
+version = "0.1.0"
+edition = "2024"
+description = "A second agent that watches a coding agent while it works"
+license = "MIT"
+repository = "https://github.com/noomz/pair-watcher"
+homepage = "https://github.com/noomz/pair-watcher"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+libc = "0.2.190"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+sha2 = "0.11.0"
+strsim = "0.11.1"
+toml = "1.1.6"
+toml_edit = "0.25.15"
+unicode-width = "0.2.2"
+ureq = { version = "3.4.2", features = ["json"] }
+zstd = "0.14.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

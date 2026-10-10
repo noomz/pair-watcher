@@ -1,0 +1,698 @@
+//! Challenge (V16–V24, I11): an existing Concern sent on to the Worker (V18). The Watcher judges
+//! approach-level; code checks the rest of the bar and verifies every cited item verbatim (V17).
+//! One open Challenge per Worker (V19); one that went stale before delivery never reaches the
+//! Worker (V21). State is a fold over the session event log, like the Concern list (V93).
+
+use std::collections::{HashMap, HashSet};
+use std::io;
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+use crate::action::{self, SHELL_TOOLS};
+use crate::budget::{Budget, Need};
+use crate::clip;
+use crate::concern::{Change, Concern, ConcernList, Evidence, State};
+use crate::event::{Event, EventLog, Kind};
+use crate::history::{self, History};
+use crate::human::Act;
+use crate::outbox::{Gate, Item, ItemKind, Outbox, Withdraw};
+use crate::output;
+use crate::ruling::{Live, Standing};
+use crate::snapshot::Store;
+use crate::status::Wake;
+use crate::tailer::{self, Entry};
+
+/// Watcher decisions a Debate can still owe once its Challenge is out: one per verdict (V31).
+pub const DEBATE_WAKES: f64 = 2.0;
+/// Letters and digits a quoted excerpt needs to point at something (`}` points at every file).
+const EXCERPT_MIN: usize = 4;
+/// Same for a command's output; outcome words are short (`ok`, `exit 1`).
+const OUTPUT_MIN: usize = 2;
+/// Excerpt length quoted in a failing-item line.
+const QUOTE: usize = 60;
+
+/// Where cited evidence must exist verbatim (V17).
+pub struct Sources<'a> {
+    /// Snapshot of the wake that raised or updated the Concern.
+    pub store: &'a Store,
+    pub tree: &'a str,
+    /// The session's transcript entries so far.
+    pub transcript: &'a [Entry],
+    /// History after this wake's entries: digest actions + repeat hints (V4).
+    pub history: &'a History,
+}
+
+/// Marks each add/update `verified` when it is challenge-flagged and passes the bar (V16, V17).
+/// Run on the arbiter's changes before committing them; commit the returned
+/// `challenge-ready-unverifiable` lines right after. Only a verified Concern is challenge-ready.
+pub fn verify(changes: &mut [Change], sources: &Sources) -> Vec<Change> {
+    let mut out = Vec::new();
+    for change in changes {
+        let (Change::Add { watcher, concern } | Change::Update { watcher, concern }) = change else { continue };
+        concern.verified = false;
+        if !concern.challenge {
+            continue;
+        }
+        let failing = failing(concern, sources);
+        concern.verified = failing.is_empty();
+        if !failing.is_empty() {
+            out.push(Change::Unverifiable { watcher: watcher.clone(), id: concern.id.clone(), failing });
+        }
+    }
+    out
+}
+
+/// What keeps `c` from the auto-Challenge bar: missing evidence or alternative (V16), cited items
+/// not found verbatim (V17). Empty = verified.
+pub fn failing(c: &Concern, s: &Sources) -> Vec<String> {
+    let mut out = Vec::new();
+    if c.evidence.is_empty() {
+        out.push("no evidence".to_owned());
+    }
+    if c.alternative.as_deref().is_none_or(|a| a.trim().is_empty()) {
+        out.push("no alternative".to_owned());
+    }
+    out.extend(c.evidence.iter().filter_map(|e| check(e, s).err()));
+    out
+}
+
+/// V19: the slot winner's evidence re-verified against the current wake before it is queued.
+/// `Some` = the `challenge-ready-unverifiable` change to commit instead.
+fn recheck(c: &Concern, sources: &Sources) -> Option<Change> {
+    let failing = failing(c, sources);
+    (!failing.is_empty()).then(|| Change::Unverifiable { watcher: "arbiter".to_owned(), id: c.id.clone(), failing })
+}
+
+fn check(e: &Evidence, s: &Sources) -> Result<(), String> {
+    let items = || s.transcript.iter().flat_map(|e| &e.items);
+    match e {
+        Evidence::File { at, excerpt } => {
+            let want = norm(excerpt);
+            substantive(&want, EXCERPT_MIN).ok_or_else(|| format!("{at}: excerpt too short"))?;
+            let (path, start, end) = output::parse_ref(at).ok_or_else(|| format!("{at}: not file:line"))?;
+            let bytes = s.store.read(s.tree, path).map_err(|_| format!("{at}: not in the snapshot"))?;
+            let text = String::from_utf8_lossy(&bytes);
+            let window: Option<Vec<&str>> = start
+                .checked_add(want.lines().count() - 1)
+                .map(|last| text.lines().skip(start - 1).take(last.max(end) - start + 1).collect());
+            window
+                .filter(|w| found(&norm(&w.join("\n")), &want))
+                .map(drop)
+                .ok_or_else(|| format!("{at}: excerpt not at that line"))
+        }
+        Evidence::Command { command, output } => {
+            let (cmd, out) = (norm(command), norm(output));
+            let fail = || format!("command {}: no such call with that output", quote(command));
+            // Empty output matches only a call whose result was empty.
+            substantive(&cmd, OUTPUT_MIN).ok_or_else(fail)?;
+            if !out.is_empty() {
+                substantive(&out, OUTPUT_MIN).ok_or_else(fail)?;
+            }
+            let shows = |o: &str| if out.is_empty() { norm(o).is_empty() } else { found(&norm(o), &out) };
+            let ran = items().any(|i| match i {
+                tailer::Item::ToolCall { id, name, input }
+                    if SHELL_TOOLS.contains(&name.as_str()) && same(&action::command(input), &cmd) =>
+                {
+                    items().any(|r| {
+                        matches!(r, tailer::Item::ToolResult { id: rid, output, .. }
+                            if rid == id && shows(output))
+                    })
+                }
+                _ => false,
+            });
+            // Older turns as the digest holds them: the cited command signed the same way (ids,
+            // hashes, temp paths stripped; clipped) must equal one action's signature, and its
+            // outcome the cited output.
+            let digested = s.history.actions().any(|(tool, sig, outcome)| {
+                let cited = action::signature(tool, &json!({ "command": cmd }).to_string());
+                let arg = |sig: &str| sig.strip_prefix(tool).map(str::to_owned).unwrap_or_default();
+                SHELL_TOOLS.contains(&tool)
+                    && same(&arg(sig), &arg(&cited))
+                    && outcome.is_some_and(|o| o.to_string() == out)
+            });
+            (ran || digested).then_some(()).ok_or_else(fail)
+        }
+        Evidence::Transcript { excerpt } => {
+            let want = norm(excerpt);
+            let fail = || format!("transcript {}: not found", quote(excerpt));
+            substantive(&want, EXCERPT_MIN).ok_or_else(fail)?;
+            let seen = items().any(|i| match i {
+                // Challenges and Rulings the adapters delivered are not the Worker's words.
+                tailer::Item::Prompt(t) => !history::is_own(t) && found(&norm(t), &want),
+                tailer::Item::Text(t) | tailer::Item::ToolResult { output: t, .. } => found(&norm(t), &want),
+                tailer::Item::ToolCall { input, .. } => strings(input).iter().any(|t| found(&norm(t), &want)),
+                _ => false,
+            });
+            seen.then_some(()).ok_or_else(fail)
+        }
+        // A repeat-hint line as code wrote it; its count only grows while the repeat goes on, so a
+        // hint for the same signature seen at least as often still backs it (V104).
+        Evidence::Hint { excerpt } => {
+            let want = norm(excerpt);
+            let cited = history::parse_hint(&want);
+            s.history
+                .hints()
+                .iter()
+                .any(|l| match (cited, history::parse_hint(l)) {
+                    (Some((sig, n)), Some((now, m))) => sig == now && m >= n,
+                    _ => *l == want || l.strip_prefix("hint:").map(str::trim) == Some(want.as_str()),
+                })
+                .then_some(())
+                .ok_or_else(|| format!("hint {}: not in this wake's history", quote(excerpt)))
+        }
+    }
+}
+
+/// A tool call input's string values (the tailer keeps it as JSON text), else the text itself.
+fn strings(input: &str) -> Vec<String> {
+    fn walk(v: &Value, out: &mut Vec<String>) {
+        match v {
+            Value::String(s) => out.push(s.clone()),
+            Value::Array(a) => a.iter().for_each(|v| walk(v, out)),
+            Value::Object(m) => m.values().for_each(|v| walk(v, out)),
+            _ => {}
+        }
+    }
+    match serde_json::from_str::<Value>(input) {
+        Ok(v) => {
+            let mut out = Vec::new();
+            walk(&v, &mut out);
+            out
+        }
+        Err(_) => vec![input.to_owned()],
+    }
+}
+
+/// The whole command, whitespace aside: a fragment (`cargo`, the tool name) never stands for it.
+/// A shell wrapper (`bash -lc <script>`, as Codex records `shell` calls) counts as its script.
+fn same(a: &str, b: &str) -> bool {
+    let (a, b) = (script(a), script(b));
+    !a.is_empty() && a.split_whitespace().eq(b.split_whitespace())
+}
+
+/// `<sh|bash|zsh> -c|-lc <script>` → `<script>` without surrounding quotes; anything else as is.
+fn script(cmd: &str) -> &str {
+    let mut words = cmd.trim().splitn(3, char::is_whitespace);
+    let (Some(shell), Some(flag), Some(rest)) = (words.next(), words.next(), words.next()) else {
+        return cmd.trim();
+    };
+    let shell = shell.rsplit('/').next().unwrap_or(shell);
+    if !matches!(shell, "sh" | "bash" | "zsh") || !matches!(flag, "-c" | "-lc") {
+        return cmd.trim();
+    }
+    let rest = rest.trim();
+    ['"', '\''].iter().find_map(|q| rest.strip_prefix(*q).and_then(|r| r.strip_suffix(*q))).unwrap_or(rest)
+}
+
+/// Each line trimmed, blank edges dropped: indentation and trailing space are not content.
+fn norm(s: &str) -> String {
+    s.lines().map(str::trim).collect::<Vec<_>>().join("\n").trim().to_owned()
+}
+
+fn substantive(s: &str, min: usize) -> Option<()> {
+    (s.chars().filter(|c| c.is_alphanumeric()).count() >= min).then_some(())
+}
+
+fn found(hay: &str, needle: &str) -> bool {
+    !needle.is_empty() && hay.contains(needle)
+}
+
+fn quote(s: &str) -> String {
+    format!("\"{}\"", clip::head(&norm(s).replace('\n', " "), QUOTE))
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Origin {
+    /// The arbiter sent a challenge-ready Concern on (V16).
+    Auto,
+    /// The human's `P` / `p` (V20).
+    Promoted,
+}
+
+/// Payload of a `challenge` event (V94).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(tag = "op", rename_all = "kebab-case")]
+pub enum Op {
+    Queued {
+        id: String,
+        concern: String,
+        focus: String,
+        origin: Origin,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remark: Option<String>,
+    },
+    /// Delivered by `route` (`delivery::Route`); the Debate is on.
+    Sent {
+        id: String,
+        route: String,
+    },
+    /// Its Concern changed or closed before delivery (V21).
+    StaleDropped {
+        id: String,
+        concern: String,
+    },
+    PromotionRefused {
+        concern: String,
+        reason: String,
+    },
+}
+
+impl Op {
+    pub fn event(&self) -> Event {
+        Event::typed(Kind::Challenge, self)
+    }
+}
+
+/// What [`Challenges::next_auto`] found.
+#[derive(Debug, PartialEq)]
+pub enum Auto<'l> {
+    /// Queue it.
+    Ready(&'l Concern),
+    /// The re-check failed: commit this `challenge-ready-unverifiable`; it stays a Concern until
+    /// its owner updates it.
+    Unverifiable(Box<Change>),
+}
+
+/// The one open Challenge per Worker (V19): queued, or sent and in Debate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Slot {
+    pub id: String,
+    pub concern: String,
+    pub origin: Origin,
+    pub sent: bool,
+    /// Its Concern was updated, resolved or dismissed while it waited for delivery (V21).
+    pub stale: bool,
+    /// The human ruled on it before delivery (V73): dropped like a stale one, unless undone (V75).
+    pub ruled: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Challenges {
+    slot: Option<Slot>,
+    /// Challenges so far per Concern: ids, and no auto-Challenge after any earlier one (V22).
+    count: HashMap<String, usize>,
+    /// The human's `promote` requests not yet answered, oldest first: (Concern, remark) (V43).
+    requests: Vec<(String, Option<String>)>,
+    /// The slot a `debate end` freed, until the next Challenge is queued: `debate reopened`
+    /// takes it back (V75).
+    freed: Option<Slot>,
+    rulings: Live,
+    /// `debate end`s so far (V105).
+    ends: u64,
+    /// Watchers whose accepted normal wake began after the last `debate end`: they saw the closed
+    /// Debate, so their Concerns may take the freed slot (V105).
+    seen: HashSet<String>,
+}
+
+impl Challenges {
+    pub fn rebuild<'a>(events: impl IntoIterator<Item = &'a Event>) -> Challenges {
+        let mut c = Challenges::default();
+        for e in events {
+            c.apply(e);
+        }
+        c
+    }
+
+    pub fn slot(&self) -> Option<&Slot> {
+        self.slot.as_ref()
+    }
+
+    /// `debate end`s folded so far; a round stamps the count it began with on its wakes (V105).
+    pub fn ends(&self) -> u64 {
+        self.ends
+    }
+
+    /// `c`'s owner saw every closed Debate (V103 entry) in a later wake (V105). A Swarm Watcher is
+    /// named for its Focus; Companion's wake sees them all.
+    fn owner_saw(&self, c: &Concern) -> bool {
+        self.ends == 0 || self.seen.contains("companion") || self.seen.contains(&c.focus)
+    }
+
+    /// Folds `challenge` and `concern` events, `human dismiss` and `promote`, and the Debate
+    /// engine's `debate {op: end, challenge}`, which frees the slot. A `queued` while the slot is
+    /// held is ignored (`queue` never writes one).
+    pub fn apply(&mut self, event: &Event) {
+        // A ruling before delivery drops the waiting Challenge; undone, it waits again (V73, V75).
+        let (concern, ruled) = match self.rulings.apply(event) {
+            Some(Standing::Ruled { concern: Some(c), .. }) => (Some(c), true),
+            Some(Standing::Undone { concern: Some(c), .. }) => (Some(c), false),
+            _ => (None, false),
+        };
+        if let Some(s) = self.slot.as_mut().filter(|s| !s.sent && concern.as_deref() == Some(s.concern.as_str())) {
+            s.ruled = ruled;
+        }
+        if event.k == Kind::Challenge
+            && let Some(Op::Queued { concern, origin: Origin::Promoted, .. } | Op::PromotionRefused { concern, .. }) =
+                event.parse::<Op>()
+        {
+            self.answered(&concern);
+        }
+        match event.k {
+            Kind::Challenge => match event.parse::<Op>() {
+                Some(Op::Queued { id, concern, origin, .. }) if self.slot.is_none() => {
+                    *self.count.entry(concern.clone()).or_default() += 1;
+                    self.freed = None;
+                    self.slot = Some(Slot { id, concern, origin, sent: false, stale: false, ruled: false });
+                }
+                // Delivered: the Debate owns it now, whatever changed while it was claimed.
+                Some(Op::Sent { id, .. }) => {
+                    if let Some(s) = self.slot.as_mut().filter(|s| s.id == id) {
+                        (s.sent, s.stale) = (true, false);
+                    }
+                }
+                Some(Op::StaleDropped { id, .. }) => self.free(&id),
+                Some(Op::Queued { .. } | Op::PromotionRefused { .. }) | None => {}
+            },
+            Kind::Concern => match event.parse::<Change>() {
+                Some(Change::Update { concern, .. }) => self.changed(&concern.id),
+                Some(Change::Resolve { id, .. } | Change::Duplicate { id, .. }) => self.changed(&id),
+                _ => {}
+            },
+            Kind::Human => match event.parse::<Act>() {
+                Some(Act::Dismiss { id }) => self.changed(&id),
+                Some(Act::Promote { id, remark }) => self.requests.push((id, remark)),
+                _ => {}
+            },
+            Kind::Debate if event.str("op") == Some("end") => {
+                self.ends += 1;
+                self.seen.clear();
+                if let Some(id) = event.str("challenge")
+                    && self.slot.as_ref().is_some_and(|s| s.id == id)
+                {
+                    self.freed = self.slot.take();
+                }
+            }
+            Kind::Debate
+                if event.str("op") == Some("reopened")
+                    && self.slot.is_none()
+                    && self.freed.as_ref().map(|s| s.id.as_str()) == event.str("challenge") =>
+            {
+                self.slot = self.freed.take();
+            }
+            Kind::Wake => {
+                if let Some(w) = event.parse::<Wake>()
+                    && w.outcome.accepted()
+                    && w.trigger != "blocked"
+                    && w.ends >= self.ends
+                {
+                    self.seen.insert(w.watcher);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Answers each `human promote` request, oldest first, as [`Challenges::promote`] (V20):
+    /// queued, or refused and logged. The arbiter runs this every loop, not only on wakes; the
+    /// human surfaces only ask (V43). Returns the ticker lines of refusals.
+    pub fn answer_requests(
+        &mut self,
+        log: &EventLog,
+        outbox: &Outbox,
+        list: &ConcernList,
+        now: u64,
+    ) -> io::Result<Vec<String>> {
+        let mut ticker = Vec::new();
+        while let Some((id, remark)) = self.requests.first().cloned() {
+            let before = self.requests.len();
+            if let Err(refused) = self.promote(log, outbox, list, &id, remark.as_deref(), now)? {
+                ticker.push(refused);
+            }
+            if self.requests.len() == before {
+                // Answered by nothing it logged (cannot happen): never loop on it.
+                self.requests.remove(0);
+            }
+        }
+        Ok(ticker)
+    }
+
+    /// The first open request for `concern` is answered.
+    fn answered(&mut self, concern: &str) {
+        if let Some(i) = self.requests.iter().position(|(c, _)| c == concern) {
+            self.requests.remove(i);
+        }
+    }
+
+    /// The Concern to auto-Challenge after this wake's changes are committed, if any: the slot is
+    /// free (V19), `auto_challenge` holds (V23), normal wakes still run, and the oldest open
+    /// verified Concern never Challenged before (V22; a finished Debate is not reopened) wins,
+    /// once its owner has seen the last closed Debate (V105).
+    /// It waits unless what is left covers its whole Debate at `wake_usd(owner)`, its owner
+    /// Watcher's last wake cost (V24). An owner with no known cost (non-finite or negative: muted,
+    /// not waking) cannot argue a Debate (V39), so its Concerns are passed over. The winner's
+    /// evidence is re-verified against the current wake (V19): failing, nothing is queued and
+    /// the returned change is committed instead.
+    pub fn next_auto<'l>(
+        &self,
+        list: &'l ConcernList,
+        auto: bool,
+        budget: &Budget,
+        wake_usd: impl Fn(&Concern) -> f64,
+        sources: &Sources,
+    ) -> Option<Auto<'l>> {
+        if !auto || self.slot.is_some() || !budget.admits(Need::Normal) {
+            return None;
+        }
+        let (c, usd) = list
+            .all()
+            .iter()
+            .filter(|c| c.state == State::Open && c.challenge && c.verified && !self.count.contains_key(&c.id))
+            .filter(|c| self.owner_saw(c))
+            .map(|c| (c, wake_usd(c)))
+            .find(|(_, usd)| usd.is_finite() && *usd >= 0.0)?;
+        if budget.left() < DEBATE_WAKES * usd {
+            return None;
+        }
+        Some(match recheck(c, sources) {
+            None => Auto::Ready(c),
+            Some(change) => Auto::Unverifiable(Box::new(change)),
+        })
+    }
+
+    /// Queues `concern` as a Challenge: the outbox item, then `challenge queued` (V18, V28).
+    /// Refused while the slot is held (V19). An undelivered item left under the id by a crash is
+    /// withdrawn first; a delivered one burns the id. If the event cannot be logged the item is
+    /// withdrawn, so nothing is delivered outside the slot.
+    pub fn queue(
+        &mut self,
+        log: &EventLog,
+        outbox: &Outbox,
+        concern: &Concern,
+        origin: Origin,
+        remark: Option<&str>,
+        now: u64,
+    ) -> io::Result<Item> {
+        if let Some(s) = &self.slot {
+            return Err(io::Error::other(format!("Challenge {} is open", s.id)));
+        }
+        let mut n = self.count.get(&concern.id).copied().unwrap_or(0);
+        let id = loop {
+            let id = if n == 0 { concern.id.clone() } else { format!("{}-{}", concern.id, n + 1) };
+            match outbox.withdraw(&id, "orphan", now)? {
+                Withdraw::Acked => n += 1,
+                Withdraw::Claimed => return Err(io::Error::other(format!("{id} is being delivered outside the slot"))),
+                Withdraw::Withdrawn | Withdraw::AlreadyDropped | Withdraw::Missing => break id,
+            }
+        };
+        let item = Item { id: id.clone(), kind: ItemKind::Challenge, text: text(&id, concern, remark) };
+        let op = Op::Queued {
+            id,
+            concern: concern.id.clone(),
+            focus: concern.focus.clone(),
+            origin,
+            remark: remark.map(str::to_owned),
+        };
+        if !outbox.queue(item.clone(), now)? {
+            return Err(io::Error::other(format!("outbox already holds {}", item.id)));
+        }
+        if let Err(e) = self.commit(log, &op) {
+            let _ = outbox.withdraw(&item.id, "unlogged", now);
+            return Err(e);
+        }
+        Ok(item)
+    }
+
+    /// Human promotion of any open Concern, no bar, with an optional one-line remark (V20).
+    /// `Ok(Err(ticker))` = refused and logged: a Challenge is open (named), or the Concern is
+    /// dismissed or not open.
+    pub fn promote(
+        &mut self,
+        log: &EventLog,
+        outbox: &Outbox,
+        list: &ConcernList,
+        id: &str,
+        remark: Option<&str>,
+        now: u64,
+    ) -> io::Result<Result<Item, String>> {
+        let remark = remark.map(str::trim).filter(|r| !r.is_empty());
+        let refusal = match (&self.slot, list.get(id)) {
+            (Some(s), _) => Some(format!("Challenge {} is open", s.id)),
+            (_, None) => Some(format!("no Concern {id}")),
+            (_, Some(c)) if c.state == State::Dismissed => Some(format!("{id} is dismissed")),
+            (_, Some(c)) if c.state != State::Open => Some(format!("{id} is {}", c.state.name())),
+            _ if remark.is_some_and(|r| r.chars().any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))) => {
+                Some("remark must be one line".to_owned())
+            }
+            _ => None,
+        };
+        if let Some(reason) = refusal {
+            self.commit(log, &Op::PromotionRefused { concern: id.to_owned(), reason: reason.clone() })?;
+            return Ok(Err(format!("promotion refused: {reason}")));
+        }
+        let concern = list.get(id).expect("checked above").clone();
+        self.queue(log, outbox, &concern, Origin::Promoted, remark, now).map(Ok)
+    }
+
+    /// The outbox claim's gate: a Challenge goes out only as the slot's live Challenge (V19); the
+    /// slot's stale one is dropped (V21). Any other Challenge item is skipped, not dropped: this
+    /// view of the log may be behind a `queue` in flight; orphans are withdrawn by `queue`. Other
+    /// kinds are not this module's.
+    pub fn gate(&self, item: &Item) -> Gate {
+        match &self.slot {
+            _ if item.kind != ItemKind::Challenge => Gate::Deliver,
+            Some(s) if s.id == item.id && s.stale => Gate::Drop,
+            // Held while a ruling stands: the arbiter withdraws it, unless the ruling is undone
+            // first (V73, V75).
+            Some(s) if s.id == item.id && s.ruled => Gate::Skip,
+            Some(s) if s.id == item.id => Gate::Deliver,
+            _ => Gate::Skip,
+        }
+    }
+
+    /// Drops the waiting Challenge whose Concern changed or closed (V21): outbox item withdrawn,
+    /// `challenge stale-dropped`, slot freed. Run after each wake commits, before delivery.
+    /// Returns the ticker line. An item delivered or under a live claim stays: its `sent` may be
+    /// due and the Debate would own it; a later call settles it once the lease runs out.
+    pub fn drop_stale(&mut self, log: &EventLog, outbox: &Outbox, now: u64) -> io::Result<Option<String>> {
+        let Some(Slot { id, concern, .. }) = self.slot.clone().filter(|s| (s.stale || s.ruled) && !s.sent) else {
+            return Ok(None);
+        };
+        match outbox.withdraw(&id, "stale", now)? {
+            Withdraw::Acked | Withdraw::Claimed => return Ok(None),
+            Withdraw::Withdrawn | Withdraw::AlreadyDropped | Withdraw::Missing => {}
+        }
+        self.commit(log, &Op::StaleDropped { id: id.clone(), concern: concern.clone() })?;
+        Ok(Some(format!("Challenge {id} dropped: {concern} changed before delivery")))
+    }
+
+    /// Logs `challenge sent {route}` once the outbox has the slot's Challenge acked (V28, V94):
+    /// the Debate is on. Deliverers write only the outbox; the log is the arbiter's (V43). Returns
+    /// the route it logged.
+    pub fn sync_sent(&mut self, log: &EventLog, outbox: &Outbox) -> io::Result<Option<String>> {
+        let Some(id) = self.slot.as_ref().filter(|s| !s.sent).map(|s| s.id.clone()) else { return Ok(None) };
+        let delivered = outbox.delivered()?;
+        let Some(d) = delivered.into_iter().find(|d| d.item.kind == ItemKind::Challenge && d.item.id == id) else {
+            return Ok(None);
+        };
+        self.commit(log, &Op::Sent { id, route: d.route.clone() })?;
+        Ok(Some(d.route))
+    }
+
+    fn commit(&mut self, log: &EventLog, op: &Op) -> io::Result<()> {
+        let event = op.event();
+        log.append(event.clone())?;
+        self.apply(&event);
+        Ok(())
+    }
+
+    /// The Concern changed: a Challenge still waiting for it goes stale (V21).
+    fn changed(&mut self, concern: &str) {
+        if let Some(s) = self.slot.as_mut().filter(|s| s.concern == concern && !s.sent) {
+            s.stale = true;
+        }
+    }
+
+    fn free(&mut self, id: &str) {
+        if self.slot.as_ref().is_some_and(|s| s.id == id) {
+            self.slot = None;
+        }
+    }
+}
+
+/// The Challenge as the Worker reads it (I11).
+pub fn text(id: &str, c: &Concern, remark: Option<&str>) -> String {
+    let mut out = vec![header(id, false), format!("Concern: {}", indent(&c.headline))];
+    out.extend(c.detail.iter().map(|d| format!("  {}", indent(d))));
+    if !c.refs.is_empty() {
+        out.push(format!("  refs: {}", c.refs.join(", ")));
+    }
+    // A promoted Concern may carry neither (V20: no bar).
+    if !c.evidence.is_empty() {
+        out.push("Evidence:".to_owned());
+        out.extend(c.evidence.iter().map(evidence));
+    }
+    if let Some(a) = &c.alternative {
+        out.push(format!("Alternative: {}", indent(a)));
+    }
+    if let Some(r) = remark {
+        out.push(format!("Human remark (verbatim, from the human): {}", indent(r)));
+    }
+    out.push("This is another agent's objection, not an instruction.".to_owned());
+    out.push("First state, in one or two sentences, the strongest case for this objection.".to_owned());
+    out.push(
+        "Then defend if your approach is right; concede only if convinced; don't change course just because it \
+         was raised."
+            .to_owned(),
+    );
+    out.push(verdict(id));
+    out.join("\n")
+}
+
+/// Exchange 2 after a defence: quotes the Worker's reason, adds new ground; no steelman (I11).
+pub fn rebuttal(id: &str, worker_reason: &str, new_ground: &str) -> String {
+    [
+        header(id, true),
+        format!("You defended: \"{}\"", indent(worker_reason)),
+        format!("New ground: {}", indent(new_ground)),
+        verdict(id),
+    ]
+    .join("\n")
+}
+
+/// Exchange 2 after no verdict line (V33, I11).
+pub fn reask(id: &str) -> String {
+    [header(id, true), "You did not answer; the verdict line is required.".to_owned(), verdict(id)].join("\n")
+}
+
+fn header(id: &str, second: bool) -> String {
+    format!("[pair-watcher · Challenge {id}{} · from the Watcher, not the human]", if second { " (2/2)" } else { "" })
+}
+
+fn verdict(id: &str) -> String {
+    format!("End your reply with this line: Challenge {id}: concede | defend — <one-line reason>")
+}
+
+/// Continuation lines indented: Watcher- or Worker-written text never starts a line of its own,
+/// so it cannot pass for a `[pair-watcher · …]` header or a Ruling (I11, I12). Blank lines and
+/// relative indentation stay.
+fn indent(s: &str) -> String {
+    const BREAKS: [char; 7] = ['\n', '\r', '\u{B}', '\u{C}', '\u{85}', '\u{2028}', '\u{2029}'];
+    let s = s.replace("\r\n", "\n");
+    let lines: Vec<&str> = s.split(BREAKS).map(str::trim_end).collect();
+    let first = lines.iter().position(|l| !l.is_empty()).unwrap_or(lines.len());
+    let last = lines.iter().rposition(|l| !l.is_empty()).map_or(first, |i| i + 1);
+    let lines = &lines[first..last];
+    let mut out = lines.first().map(|l| l.trim_start().to_owned()).unwrap_or_default();
+    for l in lines.iter().skip(1) {
+        out.push('\n');
+        if !l.is_empty() {
+            out.push_str("    ");
+            out.push_str(l);
+        }
+    }
+    out
+}
+
+fn evidence(e: &Evidence) -> String {
+    match e {
+        Evidence::File { at, excerpt } => format!("- {at}: {}", indent(excerpt)),
+        Evidence::Command { command, output } if output.trim().is_empty() => {
+            format!("- `{}` → (no output)", indent(command))
+        }
+        Evidence::Command { command, output } => format!("- `{}` → {}", indent(command), indent(output)),
+        Evidence::Transcript { excerpt } => format!("- transcript: {}", indent(excerpt)),
+        Evidence::Hint { excerpt } => format!("- {}", indent(excerpt)),
+    }
+}
