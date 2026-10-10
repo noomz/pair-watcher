@@ -313,3 +313,19 @@ fn subscription_backend_is_probed_with_a_real_call() {
     let _ = w.check();
     assert_eq!(*w.probed.borrow(), [(Kind::ClaudeP, "claude-sonnet-5-5".to_owned())]);
 }
+
+/// V116: each Claude config dir's install is checked on its own, named by its settings file.
+#[test]
+fn stale_adapters_named_per_config_dir() {
+    let mut w = World::new();
+    w.home.ensure_layout().unwrap();
+    w.versions = [Some(Version(2, 1, 289)), None, None];
+    let m = format!(
+        r#"{{"installed": {{"claude:/i/work/settings.json": {{"version": "0.0.1", "at": 0, "files": []}}, "claude:/i/personal/settings.json": {{"version": "{}", "at": 0, "files": []}}}}}}"#,
+        env!("CARGO_PKG_VERSION")
+    );
+    common::write(&w.home.root().join("install.json"), &m);
+    let lines = w.check();
+    assert!(has(&lines, Level::Warn, "pair-watcher install claude (/i/work/settings.json)"), "{lines:#?}");
+    assert!(!lines.iter().any(|l| l.text.contains("/i/personal")), "current one: no line");
+}

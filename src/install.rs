@@ -52,6 +52,25 @@ impl Paths {
             pi_extension: dir("PI_CODING_AGENT_DIR", ".pi/agent").join("extensions").join("pair-watcher.ts"),
         })
     }
+
+    /// This process's env.
+    pub fn current() -> io::Result<Paths> {
+        Paths::from_env(&|k| std::env::var(k).ok())
+    }
+
+    /// The file an install of `harness` is known by (V116): one Claude config dir, Codex home or
+    /// pi agent dir among several.
+    pub fn target(&self, harness: Harness) -> &Path {
+        match harness {
+            Harness::Claude => &self.claude_settings,
+            Harness::Codex => &self.codex_hooks,
+            Harness::Pi => &self.pi_extension,
+        }
+    }
+
+    fn key(&self, harness: Harness) -> String {
+        format!("{}:{}", harness.name(), self.target(harness).display())
+    }
 }
 
 /// The tag (V59): a command or path under `~/.pair-watcher/`, or naming a `pair-watcher` file.
@@ -240,7 +259,7 @@ fn prefix_of(keys: &BTreeMap<String, String>, hooks_json: &Path) -> String {
     reported.unwrap_or_else(|| hooks_json.to_string_lossy().into_owned())
 }
 
-/// `install.json`: what `install` wrote, per harness.
+/// `install.json`: what `install` wrote, per harness and target (`claude:<settings.json>`, V116).
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct Manifest {
     #[serde(default)]
@@ -262,10 +281,36 @@ pub struct Installed {
 }
 
 pub fn manifest(home: &Home) -> io::Result<Manifest> {
-    match fs::read(home.root().join(MANIFEST)) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| invalid(&format!("{MANIFEST}: {e}"))),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Manifest::default()),
-        Err(e) => Err(e),
+    let mut m: Manifest = match fs::read(home.root().join(MANIFEST)) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| invalid(&format!("{MANIFEST}: {e}")))?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Manifest::default()),
+        Err(e) => return Err(e),
+    };
+    // Before V116 the key was the bare harness name: its first file is the target. With no
+    // file recorded it stays bare and stands for any target.
+    let legacy: Vec<String> = m.installed.keys().filter(|k| !k.contains(':')).cloned().collect();
+    for name in legacy {
+        let Some(first) = m.installed[&name].files.first() else { continue };
+        let key = format!("{name}:{}", first.display());
+        let entry = m.installed.remove(&name).expect("listed key");
+        m.installed.entry(key).or_insert(entry);
+    }
+    Ok(m)
+}
+
+impl Manifest {
+    fn key_for(&self, paths: &Paths, harness: Harness) -> Option<String> {
+        let key = paths.key(harness);
+        if self.installed.contains_key(&key) {
+            return Some(key);
+        }
+        self.installed.contains_key(harness.name()).then(|| harness.name().to_owned())
+    }
+
+    /// Every recorded install of `harness`, whatever its target, keyed as stored.
+    pub fn of(&self, harness: Harness) -> impl Iterator<Item = (&String, &Installed)> {
+        let prefix = format!("{}:", harness.name());
+        self.installed.iter().filter(move |(k, _)| *k == harness.name() || k.starts_with(&prefix))
     }
 }
 
@@ -273,9 +318,12 @@ fn save(home: &Home, m: &Manifest) -> io::Result<()> {
     write_atomic(&home.root().join(MANIFEST), &serde_json::to_vec_pretty(m)?)
 }
 
-/// `install` recorded this harness: `run` adds no per-session hooks then, or they would fire twice.
-pub fn installed(home: &Home, harness: Harness) -> Option<Installed> {
-    manifest(home).ok()?.installed.remove(harness.name())
+/// `install` recorded this harness for this env's target: `run` adds no per-session hooks then,
+/// or they would fire twice. Another config dir's install does not count (V116).
+pub fn installed(home: &Home, paths: &Paths, harness: Harness) -> Option<Installed> {
+    let mut m = manifest(home).ok()?;
+    let key = m.key_for(paths, harness)?;
+    m.installed.remove(&key)
 }
 
 /// Files touched by one harness's install or uninstall, restored together on failure.
@@ -372,7 +420,9 @@ pub fn install(cx: &Ctx, harness: Harness) -> Result<Vec<String>, String> {
     let shim = hook::write_shim(cx.home, cx.exe).map_err(|e| e.to_string())?;
     let adapters = adapters::write(cx.home).map_err(|e| e.to_string())?;
     let mut m = manifest(cx.home).map_err(|e| e.to_string())?;
-    let previous = m.installed.get(harness.name()).cloned();
+    let legacy = m.key_for(cx.paths, harness).filter(|k| k == harness.name());
+    let previous =
+        legacy.as_ref().map_or_else(|| m.installed.get(&cx.paths.key(harness)), |k| m.installed.get(k)).cloned();
     let mut txn = Txn::default();
     let result = wire(cx, harness, &shim, &adapters, previous.as_ref(), &mut txn);
     let entry = match result {
@@ -383,7 +433,10 @@ pub fn install(cx: &Ctx, harness: Harness) -> Result<Vec<String>, String> {
         }
     };
     let lines = entry.files.iter().map(|f| format!("{}: wrote {}", harness.name(), tilde(f))).collect();
-    m.installed.insert(harness.name().into(), entry);
+    if let Some(k) = legacy {
+        m.installed.remove(&k);
+    }
+    m.installed.insert(cx.paths.key(harness), entry);
     if let Err(e) = save(cx.home, &m) {
         txn.rollback();
         return Err(format!("{}: {e}", tilde(&cx.home.root().join(MANIFEST))));
@@ -481,14 +534,17 @@ fn count_ours(doc: &Value, ours: &dyn Fn(&str) -> bool) -> usize {
 /// hooks, then checks nothing of ours remains. Returns one line per file changed.
 pub fn uninstall(home: &Home, paths: &Paths, harness: Harness) -> Result<Vec<String>, String> {
     let mut m = manifest(home).map_err(|e| e.to_string())?;
-    let previous = m.installed.get(harness.name()).cloned();
+    let key = m.key_for(paths, harness);
+    let previous = key.as_ref().and_then(|k| m.installed.get(k)).cloned();
     let mut txn = Txn::default();
     match unwire(home, paths, harness, previous.as_ref(), &mut txn).and_then(|lines| {
         verify_gone(home, paths, harness, previous.as_ref())?;
         Ok(lines)
     }) {
         Ok(lines) => {
-            m.installed.remove(harness.name());
+            if let Some(k) = key {
+                m.installed.remove(&k);
+            }
             if let Err(e) = save(home, &m) {
                 txn.rollback();
                 return Err(e.to_string());

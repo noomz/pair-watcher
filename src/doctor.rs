@@ -167,9 +167,11 @@ pub fn check(home: &Home, cwd: &Path, p: &Probes) -> Vec<Line> {
 
     // Harnesses vs the compat table (V60), installed adapters, Codex trust (V59).
     for h in Harness::ALL {
-        let installed = install::installed(home, h);
+        // Every recorded install, one per config dir (V116).
+        let recorded: Vec<(String, install::Installed)> =
+            install::manifest(home).map(|m| m.of(h).map(|(k, i)| (k.clone(), i.clone())).collect()).unwrap_or_default();
         let Some(v) = (p.version)(h) else {
-            if installed.is_some() {
+            if !recorded.is_empty() {
                 push(Level::Warn, format!("{}: installed but not on PATH", h.name()));
             }
             continue;
@@ -182,12 +184,16 @@ pub fn check(home: &Home, cwd: &Path, p: &Probes) -> Vec<Line> {
             }
             Support::Untested(_) => push(Level::Warn, format!("{} {v} untested (last tested {tested})", h.name())),
         }
-        let Some(installed) = installed else { continue };
-        if installed.version != env!("CARGO_PKG_VERSION") {
+        if recorded.is_empty() {
+            continue;
+        }
+        for (key, installed) in recorded.iter().filter(|(_, i)| i.version != env!("CARGO_PKG_VERSION")) {
+            // Which config dir, when the record names one: each is reinstalled from its own env.
+            let target = key.split_once(':').map(|(_, t)| format!(" ({})", tilde(Path::new(t)))).unwrap_or_default();
             push(
                 Level::Warn,
                 format!(
-                    "{} adapters installed by {} (binary {}): pair-watcher install {}",
+                    "{} adapters installed by {} (binary {}): pair-watcher install {}{target}",
                     h.name(),
                     installed.version,
                     env!("CARGO_PKG_VERSION"),

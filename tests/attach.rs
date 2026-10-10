@@ -140,6 +140,12 @@ fn attach_registers_an_installed_worker_and_its_hook_names_the_pid() {
     assert!(err.contains("pair-watcher install claude"), "V58: refused until installed: {err}");
     assert!(Mailbox::open(&w.home, ID).is_none());
 
+    // Another Claude config dir's install has no hooks in this session's settings (V116, B12).
+    let other = w.dir.path().join("other-claude");
+    let out = w.cmd(&["install", "claude"]).env("CLAUDE_CONFIG_DIR", &other).stdin(Stdio::null()).output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(!w.run(&["attach", ID]).status.success(), "V116: installed elsewhere is not installed here");
+
     assert!(w.run(&["install", "claude"]).status.success());
     let out = w.run(&["attach", ID]);
     assert!(out.status.success(), "{out:?}");
