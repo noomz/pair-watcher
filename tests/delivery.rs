@@ -300,19 +300,21 @@ fn adapter_poll_and_ack_over_the_cli() {
 fn adapter_pw_runs_only_session_commands() {
     let w = world("claude", false);
     let rule = w.cmd(&["hook", "adapter", "pw", "--session", "s1", "--", "rule", "c1", "watcher"], "", false);
-    assert!(rule.status.success() && stdout(&rule).contains("c1 sided with the Watcher"), "{rule:?}");
+    assert!(rule.status.success() && stdout(&rule).starts_with("c1 sided with the Watcher"), "{rule:?}");
     let ruled = w.events().into_iter().find(|e| e.k == Kind::Ruled).expect("ruled logged");
     assert_eq!(
         (ruled.str("via"), ruled.str("surface"), ruled.str("stage")),
         (Some("command"), Some("mod"), Some("debate"))
     );
     let undo = w.cmd(&["hook", "adapter", "pw", "--session", "s1", "--", "undo"], "", false);
-    assert!(undo.status.success() && stdout(&undo).contains("ruling on c1 undone"), "{undo:?}");
+    assert!(undo.status.success() && stdout(&undo).starts_with("ruling on c1 undone"), "{undo:?}");
     let keep = w.cmd(&["hook", "adapter", "pw", "--session", "s1", "--", "keep"], "", false);
     assert!(!keep.status.success() && String::from_utf8_lossy(&keep.stderr).contains("no ruling or dismissal"));
+    // The status line and notification name pair-watcher already: no prefix, no session id.
+    assert!(!String::from_utf8_lossy(&keep.stderr).starts_with("pair-watcher:"), "{keep:?}");
     let refused = w.cmd(&["hook", "adapter", "pw", "--session", "s1", "--", "run", "--", "claude"], "", false);
     assert!(!refused.status.success());
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("/pw takes rule|undo|keep|mute|nochallenge|pause"));
+    assert!(String::from_utf8_lossy(&refused.stderr).starts_with("/pw takes rule|undo|keep|mute|nochallenge|pause"));
 }
 
 #[test]

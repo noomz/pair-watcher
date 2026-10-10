@@ -314,17 +314,17 @@ fn dispatch(command: Command, via: Via) -> ExitCode {
         Command::Attach { session } => attach(&session),
         Command::Watch { session } => watch(&session),
         Command::Pane(arg) => pane(arg),
-        Command::Mute { focus, session } => session_fact(&session, |m| mute(m, &focus)),
-        Command::Nochallenge(session) => session_fact(&session, |m| {
+        Command::Mute { focus, session } => session_fact(&session, via, |m| mute(m, &focus)),
+        Command::Nochallenge(session) => session_fact(&session, via, |m| {
             m.log().append(Act::Nochallenge.event()).map(|()| "no auto-Challenge".to_owned())
         }),
-        Command::Pause(session) => session_fact(&session, pause),
-        Command::Primary(session) => session_fact(&session, |m| {
+        Command::Pause(session) => session_fact(&session, via, pause),
+        Command::Primary(session) => session_fact(&session, via, |m| {
             m.log().append(Act::Primary.event()).map(|()| "primary model requested".to_owned())
         }),
-        Command::Rule { id, side, session } => session_fact(&session, |m| rule(m, &id, side, via)),
-        Command::Undo(session) => session_fact(&session, |m| undo(m, via)),
-        Command::Keep(session) => session_fact(&session, |m| keep(m, via)),
+        Command::Rule { id, side, session } => session_fact(&session, via, |m| rule(m, &id, side, via)),
+        Command::Undo(session) => session_fact(&session, via, |m| undo(m, via)),
+        Command::Keep(session) => session_fact(&session, via, |m| keep(m, via)),
         Command::Rulings { action } => rulings(action),
         Command::Install { target } => install_cmd(target, true),
         Command::Uninstall { target } => install_cmd(target, false),
@@ -571,12 +571,12 @@ fn adapter(args: &[String]) -> ExitCode {
         },
         AdapterCmd::Pw { session, args, .. } => {
             if !args.first().is_some_and(|c| PW_COMMANDS.contains(&c.as_str())) {
-                return fail(&format!("/pw takes {}", PW_COMMANDS.join("|")));
+                return pw_fail(&format!("/pw takes {}", PW_COMMANDS.join("|")));
             }
             let argv = std::iter::once("pair-watcher".to_owned()).chain(args).chain(["--session".to_owned(), session]);
             return match Cli::try_parse_from(argv) {
                 Ok(cli) => dispatch(cli.command, Via::Command),
-                Err(e) => fail(e.to_string().lines().next().unwrap_or("bad /pw command")),
+                Err(e) => pw_fail(e.to_string().lines().next().unwrap_or("bad /pw command")),
             };
         }
     };
@@ -602,11 +602,14 @@ fn pw_watch(session: &str, watch: bool, hint: Option<(Harness, PathBuf)>) -> Exi
             println!("{msg}");
             ExitCode::SUCCESS
         }
-        Err(e) => {
-            eprintln!("{e}");
-            ExitCode::FAILURE
-        }
+        Err(e) => pw_fail(&e),
     }
+}
+
+/// A `/pw` refusal: bare, like its answers.
+fn pw_fail(msg: &str) -> ExitCode {
+    eprintln!("{msg}");
+    ExitCode::FAILURE
 }
 
 /// What the Claude mod draws this poll (I8).
@@ -649,16 +652,21 @@ fn pane(arg: SessionArg) -> ExitCode {
 }
 
 /// A human fact for a live session (V43); prints what it did.
-fn session_fact(arg: &SessionArg, write: impl FnOnce(&Mailbox) -> std::io::Result<String>) -> ExitCode {
-    match session(arg, false) {
-        Ok(m) => match write(&m) {
-            Ok(done) => {
-                println!("pair-watcher: {done} (session {})", m.id());
-                ExitCode::SUCCESS
-            }
-            Err(e) => fail(&e.to_string()),
-        },
-        Err(e) => fail(&e),
+/// In the session (`/pw`), the status line or notification names pair-watcher and the session
+/// already: the answer is the bare line.
+fn session_fact(arg: &SessionArg, via: Via, write: impl FnOnce(&Mailbox) -> std::io::Result<String>) -> ExitCode {
+    let result = session(arg, false).and_then(|m| write(&m).map(|done| (done, m)).map_err(|e| e.to_string()));
+    match (result, via) {
+        (Ok((done, _)), Via::Command) => {
+            println!("{done}");
+            ExitCode::SUCCESS
+        }
+        (Ok((done, m)), _) => {
+            println!("pair-watcher: {done} (session {})", m.id());
+            ExitCode::SUCCESS
+        }
+        (Err(e), Via::Command) => pw_fail(&e),
+        (Err(e), _) => fail(&e),
     }
 }
 

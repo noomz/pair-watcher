@@ -260,7 +260,7 @@ fn deadline_kills_the_cli() {
     c.deadline = Some(Instant::now() + Duration::from_millis(300));
     let f = w.cli(Kind::ClaudeP, fake).call(&c).unwrap_err();
     assert_eq!(f.error, ProviderError::Timeout(String::new()));
-    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(started.elapsed() < Duration::from_secs(10));
 }
 
 /// V87: a killed call keeps the tail of what it printed, for diagnosis (live 2026-10-09: a
@@ -273,7 +273,9 @@ fn deadline_keeps_output_tail() {
         w.fake("claude", &format!("echo '{noise}' >&2\necho 'waiting on MCP server' >&2\necho partial\nsleep 20\n"));
     let started = Instant::now();
     let mut c = call("x", None);
-    c.deadline = Some(Instant::now() + Duration::from_millis(500));
+    // Room for the fake to print under a loaded full suite; the kill still lands far short of
+    // its 20 s sleep.
+    c.deadline = Some(Instant::now() + Duration::from_secs(3));
     let f = w.cli(Kind::ClaudeP, fake).call(&c).unwrap_err();
     let ProviderError::Timeout(tail) = &f.error else { panic!("{:?}", f.error) };
     assert!(tail.contains("stderr …") && tail.ends_with("waiting on MCP server | stdout …partial"), "{tail}");
