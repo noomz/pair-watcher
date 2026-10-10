@@ -381,10 +381,15 @@ impl Board {
                     self.tick(t, note, Tone::Plain);
                 }
             }
+            Some("rewatch") => {
+                self.ended = false;
+                self.tick(t, "watching again from now".to_owned(), Tone::Plain);
+            }
             Some("end") => {
                 self.ended = true;
                 let open = self.concerns.all().iter().filter(|c| c.state == State::Open).count();
-                self.tick(t, format!("session ended; {open} open Concerns closed"), Tone::Plain);
+                let how = if e.str("reason") == Some(crate::supervisor::STOPPED) { "stopped" } else { "ended" };
+                self.tick(t, format!("session {how}; {open} open Concerns closed"), Tone::Plain);
             }
             _ => {}
         }

@@ -14,9 +14,12 @@ use pair_watcher::event::Kind;
 use pair_watcher::harness::Harness;
 use pair_watcher::home::Home;
 use pair_watcher::hook::{self, GUARD_ENV, SESSION_ENV};
+use pair_watcher::jsonl::now_ms;
 use pair_watcher::mailbox::Mailbox;
+use pair_watcher::outbox::{Item, ItemKind};
+use pair_watcher::pane::Board;
 use pair_watcher::run::{self, ATTACH_EVENT, Found};
-use pair_watcher::supervisor;
+use pair_watcher::{supervisor, watch};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -182,4 +185,136 @@ fn a_launched_session_hook_does_not_guess_the_worker() {
     child.stdin.take().unwrap().write_all(b"{}").unwrap();
     assert!(child.wait().unwrap().success());
     assert!(!mb.dir().join(supervisor::WORKER_PID_FILE).exists(), "`run` already knows it");
+}
+
+fn pw(w: &World, verb: &str) -> Output {
+    // A key so the Watcher runs; nothing here wakes it, so no call is made.
+    w.cmd(&["hook", "adapter", "pw", "--session", ID, "--", verb])
+        .env("ANTHROPIC_API_KEY", "test")
+        .env("ANTHROPIC_BASE_URL", "http://127.0.0.1:9")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
+}
+
+fn ends(mb: &Mailbox) -> Vec<Value> {
+    let records = mb.log().read_from(0).unwrap().records;
+    let ended = records.into_iter().filter(|r| r.body.k == Kind::Session && r.body.str("phase") == Some("end"));
+    ended.map(|r| serde_json::to_value(&r.body).unwrap()).collect()
+}
+
+fn focus_cursor_ids(dir: &Path) -> Vec<Option<String>> {
+    let state: Option<watch::Committed> = watch::read_json(&dir.join(watch::STATE_FILE)).unwrap();
+    state.map(|s| s.focus.values().map(|p| p.cursor.id.clone()).collect()).unwrap_or_default()
+}
+
+/// §T30 `/pw watch|stop` (V112): `attach` of the session itself from inside it, a stop that drops
+/// what is queued and silences hooks, and a re-watch of the same session dir from now on.
+#[test]
+fn pw_watch_and_stop_from_inside_the_session() {
+    let w = World::new();
+    let transcript = w.transcript();
+    let stdout = |o: &Output| String::from_utf8_lossy(&o.stdout).into_owned();
+
+    let out = pw(&w, "watch");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("pair-watcher install claude"), "{out:?}");
+    assert!(Mailbox::open(&w.home, ID).is_none(), "not installed: starts nothing");
+    assert!(stdout(&pw(&w, "stop")).contains("not watched"));
+
+    assert!(w.run(&["install", "claude"]).status.success());
+    let out = pw(&w, "watch");
+    assert!(out.status.success() && stdout(&out).contains("watching claude session"), "{out:?}");
+    let mb = Mailbox::open_registered(&w.home, ID).unwrap();
+    let dir = mb.dir().to_path_buf();
+    wait("supervisor", || supervisor::running(&mb, now_ms()));
+    assert!(stdout(&pw(&w, "watch")).contains("already watched"), "no second Watcher");
+    wait("Watcher at the transcript end", || focus_cursor_ids(&dir).iter().any(|c| c.as_deref() == Some("u1")));
+
+    let item = Item { id: "c1".into(), kind: ItemKind::Challenge, text: "Challenge".into() };
+    assert!(mb.outbox().queue(item, now_ms()).unwrap());
+    let out = pw(&w, "stop");
+    assert!(out.status.success() && stdout(&out).contains("stopped watching"), "{out:?}");
+    wait("session end", || !ends(&mb).is_empty());
+    let end = &ends(&mb)[0];
+    assert_eq!(end["reason"], supervisor::STOPPED);
+    assert_eq!(end["dropped"], json!(["c1"]), "queued Challenge dropped and logged");
+    assert!(mb.outbox().pending().unwrap().is_empty());
+    assert!(!mb.is_live());
+    wait("supervisor exit", || !dir.join(supervisor::PID_FILE).exists());
+
+    // Hooks are silent again while stopped; the Worker goes on.
+    let hooks = mb.read_hooks(0).unwrap().records.len();
+    let line = json!({"type": "user", "uuid": "u2", "cwd": w.repo, "message": {"role": "user", "content": "more"}});
+    fs::OpenOptions::new().append(true).open(&transcript).unwrap().write_all(format!("{line}\n").as_bytes()).unwrap();
+    assert!(w.hook("Stop", &json!({"session_id": ID})).status.success());
+    assert_eq!(mb.read_hooks(0).unwrap().records.len(), hooks);
+
+    let out = pw(&w, "watch");
+    assert!(out.status.success() && stdout(&out).contains("watching again"), "{out:?}");
+    assert_eq!(Mailbox::open_registered(&w.home, ID).unwrap().dir(), dir, "same session dir");
+    assert!(!dir.join(supervisor::STOPPED_FILE).exists());
+    let board = Board::rebuild(0, &mb.log().read_from(0).unwrap().records);
+    assert!(!board.ended);
+    let last = mb.read_hooks(0).unwrap().records.pop().unwrap();
+    assert_eq!(last.body.event, ATTACH_EVENT);
+    assert_eq!(last.body.payload["transcript_path"], json!(transcript));
+    wait("cursor = now", || focus_cursor_ids(&dir).iter().all(|c| c.as_deref() == Some("u2")));
+
+    assert!(stdout(&pw(&w, "stop")).contains("stopped watching"));
+    wait("second end", || ends(&mb).len() == 2);
+}
+
+/// V82 late-attach path: `/pw watch` asks nothing; an unapproved repo Focus waits on the ticker.
+#[test]
+fn late_watch_names_an_unapproved_repo_focus_on_the_ticker() {
+    let w = World::new();
+    w.transcript();
+    let git =
+        |args: &[&str]| assert!(Command::new("git").args(args).current_dir(&w.repo).output().unwrap().status.success());
+    git(&["init", "-q"]);
+    git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "root"]);
+    common::write(&w.repo.join(".pair-watcher/focus/perf.md"), "Attend to: slow loops.\n");
+    assert!(w.run(&["install", "claude"]).status.success());
+    assert!(pw(&w, "watch").status.success());
+    let mb = Mailbox::open(&w.home, ID).unwrap();
+    let start = mb.log().read_from(0).unwrap().records.into_iter().find(|r| r.body.k == Kind::Session).unwrap();
+    let notes = serde_json::to_string(&start.body.fields["notes"]).unwrap();
+    assert!(notes.contains("repo Focus `perf` not approved — pair-watcher focus approve perf"), "{notes}");
+    assert!(!start.body.fields["focuses"].to_string().contains("perf"), "unapproved does not run");
+    assert!(pw(&w, "stop").status.success());
+}
+
+/// V113: `/pw watch` as the first act of a fresh session, before the Worker has a transcript, is
+/// watched from the harness and cwd the adapter passes; the first hook names the transcript.
+#[test]
+fn fresh_session_is_watched_from_the_adapter_hint() {
+    let w = World::new();
+    assert!(w.run(&["install", "claude"]).status.success());
+    let out = pw(&w, "watch");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no Claude, Codex or pi transcript"), "{out:?}");
+    assert!(Mailbox::open(&w.home, ID).is_none());
+
+    let repo = w.repo.to_str().unwrap();
+    let out = w
+        .cmd(&["hook", "adapter", "pw", "--session", ID, "--harness", "claude", "--cwd", repo, "--", "watch"])
+        .env("ANTHROPIC_API_KEY", "test")
+        .env("ANTHROPIC_BASE_URL", "http://127.0.0.1:9")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("watching claude session"), "{out:?}");
+    let mb = Mailbox::open_registered(&w.home, ID).unwrap();
+    let start = mb.log().read_from(0).unwrap().records.into_iter().find(|r| r.body.k == Kind::Session).unwrap();
+    assert_eq!(start.body.str("repo"), Some(repo));
+    assert!(mb.read_hooks(0).unwrap().records.is_empty(), "no transcript to adopt yet");
+
+    let transcript = w.transcript();
+    assert!(w.hook("UserPromptSubmit", &json!({"session_id": ID, "transcript_path": transcript})).status.success());
+    let dir = mb.dir().to_path_buf();
+    wait("transcript adopted", || {
+        let state: Option<watch::Committed> = watch::read_json(&dir.join(watch::STATE_FILE)).unwrap();
+        state.is_some_and(|s| s.transcript.as_ref() == Some(&transcript))
+    });
+    assert!(pw(&w, "stop").status.success());
 }

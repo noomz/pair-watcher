@@ -1,6 +1,7 @@
 import type { EngineInterface, Register } from 'claude-code'
 
-// pair-watcher Claude mod (I8): idle delivery, status-line field, /commentary, /pw, the band
+// pair-watcher Claude mod (I8): idle delivery, status-line field, /commentary, /pw (watch and
+// stop included, V112), the band
 // (mini line + Buttons 1/2/3) and the mod pane (the Board as Button rows, keys p b h y n d s u).
 // Thin: the Watcher is its own process; this module asks the session mailbox through the hook
 // shim, hands claimed items to the Worker and forwards keys. The Board is drawn by the binary;
@@ -68,6 +69,8 @@ const TEXT: Record<Style, object> = {
 
 let session: string | undefined
 let shim: string | undefined
+// The Worker's cwd: `/pw watch` names it, with the harness, for a session with no transcript yet.
+let cwd: string | undefined
 let started = false
 let running = false
 // A prompt is entering: its `prompt.submit` chain resolves once its turn started or it was queued
@@ -147,7 +150,9 @@ async function tick($: EngineInterface) {
     const hasDraft = await draft($)
     const worker = busy() ? 'busy' : hasDraft ? 'draft' : 'idle'
     const r = await adapter($, pollArgs(worker))
-    if (r.exitCode !== 0 || !r.stdout.trim()) return
+    if (r.exitCode !== 0) return
+    // Not watched (never, stopped, or ended): nothing of an earlier Watcher stays up (V112).
+    if (!r.stdout.trim()) return void (await unwatched($))
     const poll = JSON.parse(r.stdout) as Poll
     for (const c of poll.completions ?? []) void complete($, c)
     const changed =
@@ -171,6 +176,15 @@ async function tick($: EngineInterface) {
   } finally {
     polling = false
   }
+}
+
+async function unwatched($: EngineInterface) {
+  if (status === undefined && !board && !commentary.length) return
+  status = undefined
+  board = undefined
+  commentary = []
+  await showStatus($)
+  await $.ui.invalidate('ui.render')
 }
 
 /** Runs one claimed request; its result, whatever it is, goes back to the Watcher (V108). */
@@ -210,6 +224,7 @@ export const register: Register = on => {
     if (await $.env.get('PAIR_WATCHER_GUARD')) return next(e)
     // `/clear` and resume start the session again: an attached session's id changes with them.
     session = (await $.env.get('PAIR_WATCHER_SESSION')) || (await $.session.id())
+    cwd = e.cwd
     if (started) return next(e)
     started = true
     const home = await $.env.get('HOME')
@@ -217,7 +232,7 @@ export const register: Register = on => {
     await $.command.register({ name: 'commentary', description: 'Open the pair-watcher Commentary pane', immediate: true })
     await $.command.register({
       name: 'pw',
-      description: 'pair-watcher: rule <id> watcher|worker|dismiss, undo, keep, mute <focus>, nochallenge, pause, primary',
+      description: 'pair-watcher: watch, stop, rule <id> watcher|worker|dismiss, undo, keep, mute <focus>, nochallenge, pause, primary',
       immediate: true,
     })
     $.clock.every(POLL_MS, () => tick($))
@@ -293,14 +308,17 @@ export const register: Register = on => {
     return Box({ flexDirection: 'column', children })
   })
 
-  // The reply shows on the status line for a few seconds, never in the transcript.
+  // The reply shows on the status line for a few seconds, never in the transcript. `/pw watch`
+  // starts a Watcher on this very session (`attach <own id>`), `/pw stop` ends it (V112).
   on('command.run', { command: 'pw' }, async ($, e) => {
     if (!session || !shim) return {}
     const args = e.args.trim().split(/\s+/).filter(Boolean)
-    const r = await adapter($, ['pw', '--session', session, '--', ...args]).catch(() => undefined)
+    const hint = args[0] === 'watch' && cwd ? ['--harness', 'claude', '--cwd', cwd] : []
+    const r = await adapter($, ['pw', '--session', session, ...hint, '--', ...args]).catch(() => undefined)
     const text = (r?.stdout.trim() || r?.stderr.trim() || '').split('\n')[0]
     if (text) note = { text, until: (await $.clock.now()) + NOTE_MS }
     await showStatus($)
+    await tick($)
     return {}
   })
 

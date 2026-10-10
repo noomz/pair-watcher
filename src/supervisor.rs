@@ -19,6 +19,7 @@ use crate::home::{Home, write_atomic};
 use crate::hook::{GUARD_ENV, SESSION_ENV};
 use crate::jsonl::now_ms;
 use crate::mailbox::Mailbox;
+use crate::outbox::Withdraw;
 use crate::pane::Board;
 use crate::status::{Op, WatcherOp};
 use crate::watch::{
@@ -41,6 +42,12 @@ pub const RESTART_MAX: usize = 3;
 /// Past the drain wake's clock, the Watcher is killed.
 const DRAIN_GRACE: Duration = Duration::from_secs(15);
 pub const CRASHED: &str = "watcher crashed";
+/// Present once `/pw stop` ended the session (V112): `/pw watch` may watch it again.
+pub const STOPPED_FILE: &str = "stopped";
+/// Session end reason and outbox drop reason for `/pw stop` (V112).
+pub const STOPPED: &str = "stopped";
+/// `session` phase: watched again after a stop, same session (V112).
+pub const REWATCH: &str = "rewatch";
 pub const GONE: &str = "supervisor gone";
 
 /// Starts `<exe> supervise <session>` in its own session, double-forked so it is reparented to
@@ -179,32 +186,109 @@ pub fn supervise(home: &Home, session: &str, worker_pid: i32) -> io::Result<()> 
         }
         thread::sleep(POLL);
     }
+    // `/pw stop`: the human wants it off now, so no final wake.
+    let stopped = dir.join(STOPPED_FILE).is_file();
     if let Some(c) = child.as_mut() {
-        drain(&mailbox, c)?;
+        if stopped {
+            let _ = c.kill();
+            let _ = c.wait();
+        } else {
+            drain(&mailbox, c)?;
+        }
     }
-    log.append(Event::new(Kind::Session).with("phase", "end"))?;
+    end(&mailbox, stopped)
+}
+
+/// Session end: logged, unregistered so later hooks no-op. A stop drops what is still queued
+/// for the Worker (V112).
+fn end(mailbox: &Mailbox, stopped: bool) -> io::Result<()> {
+    let mut event = Event::new(Kind::Session).with("phase", "end");
+    if stopped {
+        let (outbox, now) = (mailbox.outbox(), now_ms());
+        let mut dropped = Vec::new();
+        for item in outbox.pending()? {
+            if outbox.withdraw(&item.id, STOPPED, now)? == Withdraw::Withdrawn {
+                dropped.push(item.id);
+            }
+        }
+        event = event.with("reason", STOPPED).with("dropped", dropped);
+    }
+    mailbox.log().append(event)?;
     mailbox.unregister()?;
     for f in [PID_FILE, WATCHER_PID_FILE, HEARTBEAT_FILE_SUPERVISOR] {
-        let _ = fs::remove_file(dir.join(f));
+        let _ = fs::remove_file(mailbox.dir().join(f));
     }
     Ok(())
+}
+
+/// `/pw stop` (V112): ends the Watcher for the session. A running supervisor sees the session
+/// unregistered and ends it; with none, the session ends here.
+pub fn stop(home: &Home, session: &str) -> Result<String, String> {
+    let Some(mailbox) = Mailbox::open_registered(home, session) else {
+        return Ok("not watched".into());
+    };
+    let result = (|| -> io::Result<()> {
+        write_atomic(&mailbox.dir().join(STOPPED_FILE), b"")?;
+        let supervised = running(&mailbox, now_ms());
+        mailbox.unregister()?;
+        if !supervised {
+            kill_orphan(&mailbox);
+            end(&mailbox, true)?;
+        }
+        Ok(())
+    })();
+    result.map(|()| "stopped watching; /pw watch to resume".into()).map_err(|e| e.to_string())
+}
+
+/// `/pw watch` after `/pw stop` (V112): the same session dir, watched again from now on. The
+/// `attach` hook re-reads the transcript from its end; the turns since the stop stay unread.
+fn rewatch(home: &Home, mailbox: &Mailbox, exe: &Path) -> Result<String, String> {
+    let (id, dir) = (mailbox.id(), mailbox.dir());
+    let worker = read_pid(&dir.join(WORKER_PID_FILE)).unwrap_or(0);
+    if worker > 0 && !alive(worker) {
+        return Err(format!("session {id}: its Worker is gone"));
+    }
+    let result = (|| -> io::Result<()> {
+        let hooks = mailbox.read_hooks(0)?.records;
+        let transcript = hooks.iter().rev().find_map(|r| {
+            ["transcript_path", "session_file"].iter().find_map(|k| r.body.payload.get(*k)?.as_str().map(str::to_owned))
+        });
+        Mailbox::register(home, &id)?;
+        let _ = fs::remove_file(dir.join(STOPPED_FILE));
+        mailbox.log().append(Event::new(Kind::Session).with("phase", REWATCH))?;
+        if let Some(path) = transcript {
+            let payload = serde_json::json!({"session_id": id, "transcript_path": path, "source": "resume"});
+            mailbox.append_hook(&crate::mailbox::Hook { event: crate::run::ATTACH_EVENT.into(), payload })?;
+        }
+        spawn(exe, mailbox, &id, worker.max(0) as u32)
+    })();
+    if let Err(e) = result {
+        let _ = mailbox.unregister();
+        return Err(e.to_string());
+    }
+    Ok("watching again from now".into())
 }
 
 /// Re-adopting a session (`attach`, V90): an orphaned Watcher from a dead supervisor is stopped,
 /// and a `supervisor gone` BLIND ends.
 fn adopt(mailbox: &Mailbox) -> io::Result<()> {
-    if let Some(pid) = read_pid(&mailbox.dir().join(WATCHER_PID_FILE))
-        && alive(pid)
-    {
-        // SAFETY: plain kill(2) on a pid this session recorded.
-        unsafe { libc::kill(pid, libc::SIGKILL) };
-    }
+    kill_orphan(mailbox);
     let log = mailbox.log();
     let board = Board::rebuild(0, &log.read_from(0)?.records);
     if board.blind.get(&None).is_some_and(|(_, r)| r == GONE) {
         log.append(Op::BlindEnd { focus: None }.event())?;
     }
     Ok(())
+}
+
+/// A Watcher left by a dead supervisor.
+fn kill_orphan(mailbox: &Mailbox) {
+    if let Some(pid) = read_pid(&mailbox.dir().join(WATCHER_PID_FILE))
+        && alive(pid)
+    {
+        // SAFETY: plain kill(2) on a pid this session recorded.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
 }
 
 fn start(exe: &Path, mailbox: &Mailbox) -> io::Result<Child> {
@@ -267,12 +351,19 @@ pub fn running(mailbox: &Mailbox, now: u64) -> bool {
 
 /// `attach <session>` (V90): re-adopts a live session whose supervisor is gone and lifts Focus
 /// crash-loop BLIND. Returns what it did.
-pub fn attach(home: &Home, session: &str, exe: &Path) -> Result<String, String> {
+/// `hint`: harness and cwd from an in-session `/pw watch` (V113).
+pub fn attach(
+    home: &Home,
+    session: &str,
+    exe: &Path,
+    hint: Option<(crate::harness::Harness, std::path::PathBuf)>,
+) -> Result<String, String> {
     let Some(mailbox) = Mailbox::open_registered(home, session) else {
-        if Mailbox::open(home, session).is_some() {
-            return Err(format!("session {session} has ended"));
-        }
-        return crate::run::attach_installed(home, session, exe);
+        return match Mailbox::open(home, session) {
+            Some(m) if m.dir().join(STOPPED_FILE).is_file() => rewatch(home, &m, exe),
+            Some(_) => Err(format!("session {session} has ended")),
+            None => crate::run::attach_installed(home, session, exe, hint),
+        };
     };
     let lifted = fs::remove_file(mailbox.dir().join(watch::CRASHES_FILE)).is_ok();
     if lifted {

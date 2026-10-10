@@ -164,9 +164,9 @@ fn attach_lifts_crash_loop() {
     let crashes = watch::Crashes { looped: vec!["security".into()], ..Default::default() };
     watch::write_json(&fx.mb.dir().join(watch::CRASHES_FILE), &crashes).unwrap();
     let exe = Path::new(env!("CARGO_BIN_EXE_pair-watcher"));
-    let msg = supervisor::attach(&fx.home, "s1", exe).unwrap();
+    let msg = supervisor::attach(&fx.home, "s1", exe, None).unwrap();
     assert_eq!(msg, "crash-looped Watchers resume");
     assert!(!fx.mb.dir().join(watch::CRASHES_FILE).exists());
-    assert_eq!(supervisor::attach(&fx.home, "s1", exe).unwrap(), "already watched");
-    assert!(supervisor::attach(&fx.home, "nope", exe).unwrap_err().contains("no live session"));
+    assert_eq!(supervisor::attach(&fx.home, "s1", exe, None).unwrap(), "already watched");
+    assert!(supervisor::attach(&fx.home, "nope", exe, None).unwrap_err().contains("no live session"));
 }

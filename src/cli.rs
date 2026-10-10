@@ -469,6 +469,11 @@ enum AdapterCmd {
     Pw {
         #[arg(long)]
         session: String,
+        /// The Worker's harness and cwd, for `/pw watch` before its transcript exists (V113)
+        #[arg(long, requires = "cwd")]
+        harness: Option<String>,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -487,8 +492,8 @@ enum AdapterWorker {
     Draft,
 }
 
-/// Session commands `/pw` may run (I8).
-const PW_COMMANDS: [&str; 7] = ["rule", "undo", "keep", "mute", "nochallenge", "pause", "primary"];
+/// Session commands `/pw` may run (I8, V112).
+const PW_COMMANDS: [&str; 9] = ["rule", "undo", "keep", "mute", "nochallenge", "pause", "primary", "watch", "stop"];
 
 /// Fail-silent like a hook: a no-op under the Watcher guard or for an unregistered session.
 fn adapter(args: &[String]) -> ExitCode {
@@ -507,6 +512,13 @@ fn adapter(args: &[String]) -> ExitCode {
         | AdapterCmd::CompleteResult { session, .. }
         | AdapterCmd::Pw { session, .. } => session,
     };
+    // `/pw watch|stop` (V112) act on a session whether or not it is watched.
+    if let AdapterCmd::Pw { session, args, harness, cwd } = &cmd
+        && let Some(verb @ ("watch" | "stop")) = args.first().map(String::as_str)
+    {
+        let hint = harness.as_deref().and_then(|h| Harness::from_program(h.as_ref())).zip(cwd.clone());
+        return pw_watch(session, verb == "watch", hint);
+    }
     let Some((home, mailbox)) =
         Home::from_env().ok().and_then(|home| Mailbox::open_registered(&home, session).map(|m| (home, m)))
     else {
@@ -557,7 +569,7 @@ fn adapter(args: &[String]) -> ExitCode {
             Ok(result) => Completions::new(mailbox.dir()).result(&id, result, now).map(drop),
             Err(e) => return fail(&format!("result: {e}")),
         },
-        AdapterCmd::Pw { session, args } => {
+        AdapterCmd::Pw { session, args, .. } => {
             if !args.first().is_some_and(|c| PW_COMMANDS.contains(&c.as_str())) {
                 return fail(&format!("/pw takes {}", PW_COMMANDS.join("|")));
             }
@@ -571,6 +583,29 @@ fn adapter(args: &[String]) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => fail(&e.to_string()),
+    }
+}
+
+/// `/pw watch` = `attach <own session id>`; `/pw stop` ends its Watcher (V112). The answer is
+/// one line for the status line or notification, which name pair-watcher already.
+fn pw_watch(session: &str, watch: bool, hint: Option<(Harness, PathBuf)>) -> ExitCode {
+    let result = Home::from_env().map_err(|e| e.to_string()).and_then(|home| {
+        if watch {
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            supervisor::attach(&home, session, &exe, hint)
+        } else {
+            supervisor::stop(&home, session)
+        }
+    });
+    match result {
+        Ok(msg) => {
+            println!("{msg}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -1170,7 +1205,7 @@ fn confirm(question: &str) -> bool {
 fn attach(session: &str) -> ExitCode {
     let result = Home::from_env().map_err(|e| e.to_string()).and_then(|home| {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        supervisor::attach(&home, session, &exe)
+        supervisor::attach(&home, session, &exe, None)
     });
     match result {
         Ok(msg) => {

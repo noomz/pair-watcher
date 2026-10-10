@@ -363,11 +363,16 @@ fn first_cwd(path: &Path, pointer: &str) -> Option<PathBuf> {
 /// its hooks route by payload session id. Registers the mailbox under the Worker session id, logs
 /// the session start, adopts the transcript from its end (earlier content predates the session)
 /// and starts the supervisor; the next hook tells it the Worker's pid.
-pub fn attach_installed(home: &Home, id: &str, exe: &Path) -> Result<String, String> {
+/// `hint`: the Worker's harness and cwd as an in-session `/pw watch` knows them (V113). A Worker
+/// with no transcript yet (Claude writes it at the first prompt) is watched from them; its first
+/// hook names the transcript, read from its start since nothing predates the watch.
+pub fn attach_installed(home: &Home, id: &str, exe: &Path, hint: Option<(Harness, PathBuf)>) -> Result<String, String> {
     let env = |k: &str| std::env::var(k).ok();
-    let found = find_transcript(&env, id)
-        .ok_or_else(|| format!("no live session {id} and no Claude, Codex or pi transcript for it"))?;
-    let harness = found.harness;
+    let (harness, cwd, transcript) = match (find_transcript(&env, id), hint) {
+        (Some(f), _) => (f.harness, f.cwd, Some(f.transcript)),
+        (None, Some((harness, cwd))) => (harness, cwd, None),
+        (None, None) => return Err(format!("no live session {id} and no Claude, Codex or pi transcript for it")),
+    };
     if crate::install::installed(home, harness).is_none() {
         return Err(format!(
             "session {id} is a {0} session not started by `run`: `pair-watcher install {0}` first, then restart it",
@@ -375,32 +380,35 @@ pub fn attach_installed(home: &Home, id: &str, exe: &Path) -> Result<String, Str
         ));
     }
     home.ensure_layout().map_err(|e| e.to_string())?;
-    let loaded = load(home, &found.cwd, &[], &[]).map_err(|u| u.to_string())?;
+    let loaded = load(home, &cwd, &[], &[]).map_err(|u| u.to_string())?;
     let mailbox = Mailbox::register(home, id).map_err(|e| e.to_string())?;
     let result = (|| -> io::Result<()> {
         crate::watch::write_json(&mailbox.dir().join(crate::watch::LAUNCH_FILE), &crate::watch::Launch::default())?;
         let version = harness::probe(std::ffi::OsStr::new(harness.name()));
         let mut notes: Vec<String> = Support::of(harness, version).note(harness).into_iter().collect();
-        let rulings = standing::start(&standing::path(home, &standing::key(&found.cwd))).unwrap_or_else(|e| {
+        // Late attach asks nothing: an unapproved repo Focus waits for `focus approve` (V82).
+        notes.extend(loaded.focuses.pending.iter().map(approval::ticker_line));
+        let rulings = standing::start(&standing::path(home, &standing::key(&cwd))).unwrap_or_else(|e| {
             standing::Start { notes: vec![format!("rulings unavailable: {e}")], ..standing::Start::default() }
         });
         notes.extend(rulings.notes.iter().cloned());
         let observe_only = !Support::of(harness, version).hooks();
-        let start = Start { cwd: &found.cwd, harness, version, observe_only, notes: &notes, rulings: &rulings };
+        let start = Start { cwd: &cwd, harness, version, observe_only, notes: &notes, rulings: &rulings };
         mailbox.log().append(session_start(&loaded, &start))?;
         if let Some(edited) = &rulings.edited {
             mailbox.log().append(edited.event())?;
         }
-        let payload =
-            json!({"session_id": id, "transcript_path": found.transcript, "cwd": found.cwd, "source": "resume"});
-        mailbox.append_hook(&crate::mailbox::Hook { event: ATTACH_EVENT.into(), payload })?;
+        if let Some(transcript) = &transcript {
+            let payload = json!({"session_id": id, "transcript_path": transcript, "cwd": cwd, "source": "resume"});
+            mailbox.append_hook(&crate::mailbox::Hook { event: ATTACH_EVENT.into(), payload })?;
+        }
         supervisor::spawn(exe, &mailbox, id, 0)
     })();
     if let Err(e) = result {
         let _ = mailbox.unregister();
         return Err(e.to_string());
     }
-    Ok(format!("watching {} session in {}", harness.name(), found.cwd.display()))
+    Ok(format!("watching {} session in {}", harness.name(), cwd.display()))
 }
 
 /// The hook record `attach` writes: the transcript to tail, from its end. It never wakes.

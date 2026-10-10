@@ -5,9 +5,10 @@ const ITEM = { id: 'c1', text: '[pair-watcher · Challenge c1 · from the Watche
 
 type Run = { argv: readonly string[] }
 
-// A Worker session: the env `run` sets, the mailbox answering `poll` with `answer`.
+// A Worker session: the env `run` sets, the mailbox answering `poll` with `answer` (`null`: the
+// session is not watched, the poll prints nothing; `unwatch` switches to that).
 // `box`: the prompt box, or what successive reads find in it (the last one stays).
-function world(on: any, answer: object, box: string | string[] = '', stderr = '', env: Record<string, string> = {}) {
+function world(on: any, answer: object | null, box: string | string[] = '', stderr = '', env: Record<string, string> = {}) {
   const boxes = Array.isArray(box) ? [...box] : [box]
   mock.env(on, { HOME: '/h', PAIR_WATCHER_SESSION: 's1', ...env })
   const clock = mock.clock(on)
@@ -17,7 +18,8 @@ function world(on: any, answer: object, box: string | string[] = '', stderr = ''
   on('process.run', (_$: any, e: Run) => {
     runs.push({ argv: e.argv })
     // `press` answers with `answer.press`: a refusal line, or nothing.
-    const stdout = e.argv[2] === 'poll' ? JSON.stringify(answer) : e.argv[2] === 'press' ? ((answer as any).press ?? '') : ''
+    const poll = answer ? JSON.stringify(answer) : ''
+    const stdout = e.argv[2] === 'poll' ? poll : e.argv[2] === 'press' ? ((answer as any).press ?? '') : ''
     return { value: { exitCode: stderr ? 2 : 0, stdout, stderr, isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('prompt.read', () => {
@@ -49,6 +51,7 @@ function world(on: any, answer: object, box: string | string[] = '', stderr = ''
     submits,
     statuses,
     tick,
+    unwatch: () => (answer = null),
     clock,
     slowSubmit: (ms: number) => (delay = ms),
     engineSubmit: (fire: (text: string) => Promise<unknown>) => (startTurn = fire),
@@ -174,8 +177,25 @@ describe('commands return {} (I8)', () => {
     await start($)
     const r = await $.command.run({ command: 'pw', args: 'rule c1 watcher' })
     expect(r).toEqual({})
-    expect(w.runs.at(-1)?.argv.slice(1)).toEqual(['adapter', 'pw', '--session', 's1', '--', 'rule', 'c1', 'watcher'])
+    expect(w.runs.find(r => r.argv[2] === 'pw')?.argv.slice(1)).toEqual(['adapter', 'pw', '--session', 's1', '--', 'rule', 'c1', 'watcher'])
     expect(w.statuses.at(-1)).toBe('pair-watcher: not implemented yet (T13)')
+  })
+
+  test('/pw watch and /pw stop act on this session; an unwatched poll clears the status (V112)', async ($, on) => {
+    const w = world(on, { status: '1 open', commentary: ['warn c2 [correctness] off-by-one'], item: null })
+    await start($)
+    expect(await $.command.run({ command: 'pw', args: 'watch' })).toEqual({})
+    // The harness and cwd let a session with no transcript yet be watched (V113).
+    expect(w.runs.find(r => r.argv[2] === 'pw')?.argv.slice(1)).toEqual(
+      ['adapter', 'pw', '--session', 's1', '--harness', 'claude', '--cwd', '/repo', '--', 'watch'],
+    )
+    await w.clock.advance(6000)
+    expect(w.statuses.at(-1)).toBe('1 open')
+    expect(await $.command.run({ command: 'pw', args: 'stop' })).toEqual({})
+    w.unwatch()
+    await w.clock.advance(6000)
+    expect(w.statuses.at(-1)).toBeUndefined()
+    expect(w.submits).toEqual([])
   })
 
   test('/commentary opens the pane, which draws the open Concerns', async ($, on) => {

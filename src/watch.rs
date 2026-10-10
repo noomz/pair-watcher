@@ -706,8 +706,10 @@ impl Watch {
             self.input(now)?;
             let p = &r.body.payload;
             let path = ["transcript_path", "session_file"].iter().find_map(|k| p.get(*k)?.as_str()).map(PathBuf::from);
+            // `attach` reads from now even on the same transcript: a re-watch skips the turns since
+            // its stop (V112).
             if let Some(path) = path
-                && self.state.transcript.as_ref() != Some(&path)
+                && (self.state.transcript.as_ref() != Some(&path) || r.body.event == run::ATTACH_EVENT)
             {
                 let resumed = p.get("source").and_then(Value::as_str) == Some("resume");
                 if self.mid_wake {

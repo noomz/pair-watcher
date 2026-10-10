@@ -1,5 +1,6 @@
-// pair-watcher pi adapter (I9): forwards wake events to the hook shim (I5, V58) and delivers
-// Challenges as follow-ups at idle (V27). Fail-silent; never blocks pi.
+// pair-watcher pi adapter (I9): forwards wake events to the hook shim (I5, V58), delivers
+// Challenges as follow-ups at idle (V27) and runs `/pw` (`watch`/`stop` this session, V112).
+// Fail-silent; never blocks pi.
 import { execFile, spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -31,11 +32,17 @@ function forward(event: string, ctx: any, extra: Record<string, unknown> = {}): 
 }
 
 function adapter(args: string[]): Promise<string> {
+  return run(args).then((r) => (r.ok ? r.stdout : ""));
+}
+
+function run(args: string[]): Promise<{ ok: boolean; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
     try {
-      execFile(shim, ["adapter", ...args], { timeout: 10_000 }, (err, stdout) => resolve(err ? "" : String(stdout)));
+      execFile(shim, ["adapter", ...args], { timeout: 10_000 }, (err, stdout, stderr) =>
+        resolve({ ok: !err, stdout: String(stdout ?? ""), stderr: String(stderr ?? "") }),
+      );
     } catch {
-      resolve("");
+      resolve({ ok: false, stdout: "", stderr: "pair-watcher not installed" });
     }
   });
 }
@@ -87,6 +94,21 @@ export default function (pi: any) {
     const at = starts;
     await forward("agent_settled", ctx ?? last);
     if (starts === at) running = false;
+  });
+  // The answer is a notification for the human; nothing reaches the Worker.
+  pi.registerCommand?.("pw", {
+    description: "pair-watcher: watch, stop, rule <id> watcher|worker|dismiss, undo, keep, mute <focus>, nochallenge, pause, primary",
+    handler: async (args: string, ctx: any) => {
+      last = ctx ?? last;
+      const id = session();
+      if (!id) return;
+      const words = args.trim().split(/\s+/).filter(Boolean);
+      // A session with no file yet is watched from its harness and cwd (V113).
+      const hint = words[0] === "watch" ? ["--harness", "pi", "--cwd", ctx?.cwd ?? process.cwd()] : [];
+      const r = await run(["pw", "--session", id, ...hint, "--", ...words]);
+      const text = (r.stdout.trim() || r.stderr.trim()).split("\n")[0];
+      if (text) ctx?.ui?.notify?.(`pair-watcher: ${text}`, r.ok ? "info" : "warning");
+    },
   });
   pi.events?.on?.("herdr:blocked", (data: any) => forward("herdr:blocked", last, { blocked: data }));
 }
