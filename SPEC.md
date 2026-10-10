@@ -226,7 +226,7 @@ T27|x|Per-harness config table `[harness.claude|codex|pi]` (`backend`, `model`, 
 T28|x|`claude-session` backend: mailbox request/result records (Rust + TS), mod runner on `$.model.complete`, code-owned tool loop, failure mapping, 15 s unclaimed → BLIND/fallback, refusal on Codex/pi, pane notes, pricing from usage; live check on a real Claude session|V8,V11,V46,V47,V51,V52,V86,V106,V107,V108,I8,I15
 T29|x|`codex-exec` provider carry-over (V110) + Key reason from CLI auth cause + `doctor` live probe (V111); tests: args carry provider only, no secret on argv, stderr `refresh_token_expired` → clear reason; live check through CCS cliproxy|V86,V110,V111,I15
 T30|x|`/pw watch|stop` in Claude mod + pi extension: spawn `attach` for own session id, already-watched + not-installed answers, stop path (supervisor shutdown, end event, drop queued), re-watch reuses session dir; tests; live check in a plain `claude` session after `install claude`|V82,V112,V113,I1,I8,I9
-T31|.|Watcher prompt rule: no Concern on Worker reply wording / disclosure of defect (V114); `output::parse` tag-only answer = silent (V115); tests + live recheck tail.py scenario on claude-session|V12,V86,V108,V114,V115,I10
+T31|x|Watcher prompt rule: no Concern on Worker reply wording / disclosure of defect (V114); `output::parse` tag-only answer = silent (V115); tests + live recheck tail.py scenario on claude-session|V12,V86,V108,V114,V115,I10
 
 ## §B
 

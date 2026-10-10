@@ -38,6 +38,17 @@ fn empty_output_is_a_silent_wake() {
 }
 
 #[test]
+fn markup_only_output_is_a_silent_wake() {
+    // B11: a bare `<br>` cost a V86 re-ask; tags and whitespace alone are silence (V115).
+    assert_eq!(output::parse("<br>").unwrap(), vec![], "V115");
+    assert_eq!(output::parse(" <p></p>\n<br/> ").unwrap(), vec![]);
+    assert!(output::parse("<br> nothing to add").is_err(), "other text stays invalid (I10)");
+    assert!(output::parse("<br>\n{\"op\":\"resolve\",\"id\":\"c1\",\"reason\":\"fixed\"}").is_err());
+    assert!(output::parse("<{\"op\":\"add\"}>").is_err());
+    assert!(output::parse("<br").is_err());
+}
+
+#[test]
 fn add_defaults_optional_fields() {
     let lines = output::parse(r#"{"op":"add","severity":"note","headline":"h"}"#).unwrap();
     assert_eq!(
@@ -102,4 +113,10 @@ fn refs_and_empty_command_output() {
     assert!(output::parse(line).is_ok());
     let line = r#"{"op":"add","severity":"warn","headline":"h","refs":["src/a.rs:0"]}"#;
     assert!(output::parse(line).unwrap_err().contains("not file:line"));
+}
+
+#[test]
+fn prompt_keeps_concerns_on_the_work() {
+    // B10: the Worker flagging a real bug past "reply only done" drew a Concern on its wording.
+    assert!(pair_watcher::watch::PROMPT.contains("never the Worker's wording or reply format"), "V114");
 }

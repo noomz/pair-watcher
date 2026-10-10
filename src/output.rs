@@ -106,6 +106,9 @@ impl Reason {
 /// Lines in order, or the first problem as `line <n>: <why>`.
 pub fn parse(text: &str) -> Result<Vec<Line>, String> {
     let mut lines = Vec::new();
+    if markup_only(text) {
+        return Ok(lines);
+    }
     for (i, raw) in text.lines().enumerate() {
         if raw.trim().is_empty() {
             continue;
@@ -117,6 +120,19 @@ pub fn parse(text: &str) -> Result<Vec<Line>, String> {
         lines.push(line);
     }
     Ok(lines)
+}
+
+/// V115: no JSON object, only markup tags (`<br>`) and whitespace — a silent wake, not invalid.
+fn markup_only(text: &str) -> bool {
+    let mut rest = text;
+    loop {
+        rest = rest.trim_start();
+        let Some(tag) = rest.strip_prefix('<') else { return rest.is_empty() };
+        match tag.split_once('>') {
+            Some((inner, after)) if !inner.contains(['{', '<']) => rest = after,
+            _ => return false,
+        }
+    }
 }
 
 fn check(line: &Line) -> Result<(), String> {
