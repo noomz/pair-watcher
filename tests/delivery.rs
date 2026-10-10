@@ -516,3 +516,19 @@ fn adapter_poll_draws_the_mod_band_and_pane_and_press_rules() {
     fs::write(w.mb.dir().join("launch.json"), r#"{"flags":["band_digits=false"],"only":[]}"#).unwrap();
     assert_eq!(poll(&["--band", "60"])["board"]["band"].get("ask"), None);
 }
+
+/// V117, B13: a live Claude mod is the session's Commentary surface; the Watcher opens no split
+/// beside it. A mod gone quiet (or none: Codex, pi) leaves the split to open.
+#[test]
+fn a_live_mod_pane_stands_in_for_the_split() {
+    let w = world("claude", false);
+    let dir = w.mb.dir().to_path_buf();
+    assert!(!pair_watcher::watch::mod_live(&dir), "no mod yet");
+    w.cmd(&["hook", "adapter", "poll", "--session", "s1", "--route", "pi", "--worker", "idle"], "", false);
+    assert!(!pair_watcher::watch::mod_live(&dir), "pi's poll is not the mod");
+    w.cmd(&["hook", "adapter", "poll", "--session", "s1", "--route", "mod", "--worker", "idle"], "", false);
+    assert!(pair_watcher::watch::mod_live(&dir), "V117");
+    let stale = std::time::SystemTime::now() - std::time::Duration::from_secs(30);
+    fs::File::options().write(true).open(dir.join(pair_watcher::watch::MOD_SEEN)).unwrap().set_modified(stale).unwrap();
+    assert!(!pair_watcher::watch::mod_live(&dir), "mod gone quiet");
+}

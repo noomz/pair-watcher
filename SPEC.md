@@ -230,7 +230,7 @@ T29|x|`codex-exec` provider carry-over (V110) + Key reason from CLI auth cause +
 T30|x|`/pw watch|stop` in Claude mod + pi extension: spawn `attach` for own session id, already-watched + not-installed answers, stop path (supervisor shutdown, end event, drop queued), re-watch reuses session dir; tests; live check in a plain `claude` session after `install claude`|V82,V112,V113,I1,I8,I9
 T31|x|Watcher prompt rule: no Concern on Worker reply wording / disclosure of defect (V114); `output::parse` tag-only answer = silent (V115); tests + live recheck tail.py scenario on claude-session|V12,V86,V108,V114,V115,I10
 T32|x|Manifest keyed per harness target (V116): install/uninstall/installed()/doctor take current Paths; legacy key read; tests: two Claude dirs install/uninstall independently, run under un-installed dir adds per-session flags, legacy manifest; reinstall work + personal|V58,V59,V116,I1
-T33|~|Mod poll touches `mod.seen`; Watcher `open_pane` skips split while mod live; tests: mod live → no split, stale/absent → split|V61,V67,V117,I8
+T33|x|Mod poll touches `mod.seen`; Watcher `open_pane` skips split while mod live; tests: mod live → no split, stale/absent → split|V61,V67,V117,I8
 
 ## §B
 

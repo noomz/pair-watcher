@@ -529,7 +529,10 @@ fn adapter(args: &[String]) -> ExitCode {
     let result = match cmd {
         AdapterCmd::Poll { route, worker, band, pane, selected, expanded, completions, .. } => {
             let route = match route {
-                AdapterRoute::Mod => Route::Mod,
+                AdapterRoute::Mod => {
+                    let _ = std::fs::write(mailbox.dir().join(crate::watch::MOD_SEEN), b"");
+                    Route::Mod
+                }
                 AdapterRoute::Pi => Route::PiFollowUp,
             };
             let worker = match worker {
