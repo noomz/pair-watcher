@@ -69,6 +69,16 @@ pub const DRAIN_FILE: &str = "drain";
 /// `run`'s config flags and `--focus` list, which the Watcher loads with (I1).
 pub const LAUNCH_FILE: &str = "launch.json";
 const PANE_OPENED: &str = "pane.opened";
+/// Touched by each Claude mod poll: the mod pane is this session's surface (V117).
+pub const MOD_SEEN: &str = "mod.seen";
+const MOD_LIVE: Duration = Duration::from_secs(10);
+
+/// V117: a mod that polled within 10 s opens its own pane; a split beside it would repeat it.
+pub fn mod_live(dir: &Path) -> bool {
+    fs::metadata(dir.join(MOD_SEEN))
+        .and_then(|m| m.modified())
+        .is_ok_and(|t| t.elapsed().is_ok_and(|age| age < MOD_LIVE))
+}
 
 pub const HEARTBEAT: Duration = Duration::from_secs(30);
 pub const CRASH_WINDOW_MS: u64 = 10 * 60_000;
@@ -683,6 +693,7 @@ impl Watch {
         self.pane_opened = true;
         let _ = fs::write(self.mailbox.dir().join(PANE_OPENED), b"");
         if self.placement != Placement::Print
+            && !mod_live(self.mailbox.dir())
             && let Err(e) = self.placement.open(&pane_command(&self.exe, &self.mailbox.id()))
         {
             eprintln!("pair-watcher: pane: {e}");
